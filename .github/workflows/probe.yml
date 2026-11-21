@@ -1,0 +1,86 @@
+name: PhotoCraft probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add iOS target
+        continue-on-error: true
+        run: |
+          rustup show
+          rustup target add aarch64-apple-ios
+
+      - name: Recon
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p out
+          { ls -la; echo; echo "== apps"; ls apps; echo; echo "== crates"; ls crates; echo; echo "== docs"; ls docs; } > out/layout.txt 2>&1
+          cat rust-toolchain* > out/toolchain.txt 2>&1
+          cp AGENTS.md out/AGENTS.md.txt 2>/dev/null
+          cp Cargo.toml out/Cargo.toml.txt
+          cp Cargo.lock out/Cargo.lock.txt
+          cp docs/releasing.md out/releasing.md.txt 2>/dev/null
+          cp docs/development.md out/development.md.txt 2>/dev/null
+          for f in apps/*/Cargo.toml; do echo "=== $f"; cat "$f"; done > out/apps-cargo-tomls.txt 2>&1
+          cargo metadata --format-version 1 --no-deps 2>out/metadata-err.txt | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          for p in sorted(d['packages'], key=lambda p:p['name']):
+              deps=[x['name'] for x in p['dependencies'] if x.get('path')]
+              print(p['name'], p['manifest_path'].split('/photocraft/')[-1], '->', ','.join(deps))
+          " > out/packages.txt 2>&1
+          grep -rn "struct Services" --include=*.rs . > out/services-grep.txt 2>&1
+          grep -rn "fn raw_input_hook\|fn logic\|pub fn ui(" --include=*.rs crates apps > out/app-entrypoints-grep.txt 2>&1
+          grep -rn "Event::Touch\|multi_touch\|zoom_delta\|touch_pan\|pressure\|tilt\|PenInput\|stylus\|force" --include=*.rs crates apps 2>/dev/null | head -400 > out/input-grep.txt 2>&1
+          grep -rn "cfg!(target_os\|cfg(target_os" --include=*.rs crates apps 2>/dev/null | head -300 > out/cfg-os-grep.txt 2>&1
+          grep -rn "rfd::\|arboard\|muda" --include=Cargo.toml . 2>/dev/null > out/native-deps-grep.txt 2>&1
+          WEBFILES=$(find apps -ipath '*web*' \( -name '*.rs' -o -name 'Cargo.toml' \) -not -path '*/target/*' | head -40)
+          tar czf out/web-host.tgz $WEBFILES 2>/dev/null
+          DESKTOP=$(find apps -maxdepth 3 -name main.rs -not -ipath '*web*' | head -5)
+          tar czf out/desktop-main.tgz $DESKTOP 2>/dev/null
+          true
+
+      - name: Build crates for iOS
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p out
+          : > out/RESULT.txt
+          NAMES=$(python3 -c "
+          import json,subprocess
+          d=json.loads(subprocess.check_output(['cargo','metadata','--format-version','1','--no-deps']))
+          for p in sorted(p['name'] for p in d['packages']):
+              if 'egui' in p or p.endswith('-ui') or 'engine' in p or p.endswith('-core'):
+                  print(p)
+          ")
+          echo "$NAMES" > out/tried-crates.txt
+          for p in $NAMES; do
+            echo "=== $p"
+            cargo build --release --target aarch64-apple-ios -p "$p" > "out/build-$p.log" 2>&1
+            if [ $? -eq 0 ]; then echo "$p OK" >> out/RESULT.txt; else echo "$p FAILED" >> out/RESULT.txt; fi
+          done
+          cat out/RESULT.txt
+
+      - name: Dependency tree of egui crates
+        continue-on-error: true
+        run: |
+          set +e
+          for p in $(cat out/tried-crates.txt); do
+            case "$p" in *egui*) cargo tree --target aarch64-apple-ios -p "$p" --depth 1 > "out/tree-$p.txt" 2>&1 ;; esac
+          done
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-results
+          path: out

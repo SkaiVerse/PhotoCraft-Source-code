@@ -1,0 +1,31 @@
+name: Dump sources for audit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect the sources
+        run: |
+          mkdir -p out
+          cp -r docs out/docs 2>/dev/null || true
+          cp AGENTS.md README.md out/ 2>/dev/null || true
+          for c in paint gpu raster compose doc engine ops algo; do
+            if [ -d "crates/$c" ]; then
+              tar czf "out/crate-$c.tgz" --exclude='*/target/*' --exclude='*.png' --exclude='*.ttf' --exclude='*.otf' "crates/$c"
+            fi
+          done
+          tar czf out/ui-egui-src.tgz --exclude='*.png' --exclude='*.ttf' --exclude='*.otf' crates/ui-egui/src
+          grep -rn "fn stamp\|spacing\|catmull\|smooth\|stabil\|dab\|predict\|coalesc" --include=*.rs crates/paint crates/gpu crates/ui-egui/src 2>/dev/null | head -600 > out/stroke-grep.txt || true
+          ls -R crates 2>/dev/null | grep -v target | head -3000 > out/tree.txt || true
+          du -sh out/* > out/sizes.txt
+          cat out/sizes.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audit-sources
+          path: out

@@ -1,0 +1,66 @@
+name: PhotoCraft probe 2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe2:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch dependencies
+        continue-on-error: true
+        run: |
+          rustup target add aarch64-apple-ios
+          cargo fetch 2>&1 | tail -20
+
+      - name: Dump app sources
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p out/ui out/egui out/misc
+          U=crates/ui-egui/src
+          ls -R $U | head -800 > out/ui/tree.txt
+          cp $U/app.rs out/ui/app.rs.txt
+          cp $U/services.rs out/ui/services.rs.txt
+          cp $U/lib.rs out/ui/lib.rs.txt
+          cp crates/ui-egui/Cargo.toml out/ui/Cargo.toml.txt
+          ls $U/app > out/ui/app-dir.txt
+          cp $U/app/frame.rs out/ui/frame.rs.txt
+          for f in $(find crates -iname 'touch_twins*' -name '*.rs'); do cp "$f" "out/ui/$(echo $f | tr / _).txt"; done
+          for f in $(find crates -iname '*stylus*' -name '*.rs'); do cp "$f" "out/ui/$(echo $f | tr / _).txt"; done
+          grep -rln "stylus" --include=*.rs crates apps > out/ui/stylus-files.txt
+          tar czf out/misc/tablet-crate-src.tgz crates/tablet/src
+          grep -rn "eframe::Frame\|_new_kittest\|wgpu_render_state\|frame\.info\|frame\.close\|frame\.set_\|frame\.storage" --include=*.rs crates apps | head -250 > out/misc/frame-uses.txt
+          grep -rn "RenderState\|set_wgpu\|start_compositor\|callback_resources" --include=*.rs crates apps | head -250 > out/misc/gpu-uses.txt
+          grep -rln "start_scan\|/System/Library/Fonts\|font_dirs" --include=*.rs crates > out/misc/font-files.txt
+          for f in $(cat out/misc/font-files.txt); do cp "$f" "out/misc/font_$(echo $f | tr / _).txt"; done
+          grep -rn 'target_os = "macos"' --include=*.rs crates | grep -v "tests" | grep -v "_tests" > out/misc/cfg-macos-nontest.txt
+          grep -rc 'target_os = "macos"' --include=*.rs crates | grep -v ":0" > out/misc/cfg-macos-counts.txt
+          grep -rn "fn os()\|\.os()\|set_os" --include=*.rs crates | head -80 > out/misc/os-uses.txt
+          grep -rli "ipad\|touch\|stylus\|pencil" docs book 2>/dev/null | head -50 > out/misc/docs-touch-files.txt
+          cp docs/architecture.md out/misc/architecture.md.txt 2>/dev/null
+          true
+
+      - name: Dump egui, eframe, egui-wgpu sources
+        continue-on-error: true
+        run: |
+          set +e
+          ls -d $HOME/.cargo/git/checkouts/*/* > out/egui/checkouts.txt 2>&1
+          EGUI=$(ls -d $HOME/.cargo/git/checkouts/egui-*/*/ | head -1)
+          echo "$EGUI" > out/egui/path.txt
+          tar czf out/egui/egui-wgpu-src.tgz -C "$EGUI/crates" egui-wgpu/src
+          tar czf out/egui/eframe-src.tgz -C "$EGUI/crates" eframe/src
+          cp "$EGUI/crates/egui/src/data/input.rs" out/egui/input.rs.txt
+          cp "$EGUI/crates/egui/src/os.rs" out/egui/os.rs.txt
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe2-results
+          path: out

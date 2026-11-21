@@ -1,0 +1,219 @@
+# Codemagic build for PhotoCraft (same steps as the GitHub workflow).
+# Generated from .github/workflows/build-native.yml.
+workflows:
+  photocraft-ipa:
+    name: PhotoCraft iPad IPA (unsigned)
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: latest
+      vars:
+        IPHONEOS_DEPLOYMENT_TARGET: "18.4"
+        CARGO_TERM_COLOR: "never"
+        CARGO_PROFILE_RELEASE_LTO: "off"
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      groups: []
+    scripts:
+      - name: Install Rust for iOS
+        script: |
+          set -eo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+          fi
+          . "$HOME/.cargo/env"
+          rustup default stable
+          rustup target add aarch64-apple-ios
+          rustc --version
+          echo "PATH=$HOME/.cargo/bin:$PATH" >> $CM_ENV
+      - name: Teach the app that an iPad uses Apple's shortcuts
+        script: |
+          set -eo pipefail
+          mkdir -p logs
+          python3 - <<'PYEOF'
+          import pathlib
+          report = []
+          def patch(path, pairs):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  report.append(f"{path}: FILE NOT FOUND")
+                  return
+              s = p.read_text()
+              for old, new in pairs:
+                  report.append(f"{path}: {s.count(old)} match(es) of {old[:70]!r}")
+                  s = s.replace(old, new)
+              p.write_text(s)
+          MAC = 'cfg!(target_os = "macos")'
+          IOS = 'cfg!(any(target_os = "macos", target_os = "ios"))'
+          for path in [
+              "crates/ui-egui/src/input/shortcuts.rs",
+              "crates/ui-egui/src/panels/panel_docking.rs",
+              "crates/ui-egui/src/app.rs",
+              "crates/ui-egui/src/panels/actions.rs",
+              "crates/ui-egui/src/tools/move_distance.rs",
+              "crates/ui-egui/src/tools/perspective_crop_ui.rs",
+              "crates/ui-egui/src/tools/retouch_ui.rs",
+              "crates/ui-egui/src/prefs/prefs_ui/shortcuts.rs",
+              "crates/engine/src/prefs/customize.rs",
+              "crates/engine/src/cmd/channel_cmds/targeting.rs",
+          ]:
+              patch(path, [(MAC, IOS)])
+          pathlib.Path("logs/cfg-patch-result.txt").write_text("\n".join(report) + "\n")
+          PYEOF
+          cat logs/cfg-patch-result.txt
+      - name: Save upstream source files for reading
+        script: |
+          mkdir -p logs/upstream
+          # Files the next round of fixes needs to read (names are searched, not guessed).
+          for pattern in 'services.rs' 'shortcut_dispatch.rs' 'tool_cursor.rs' 'status_bar*.rs' 'zoom_field.rs' \
+                         'type_tool.rs' 'state.rs' 'fonts.rs' 'menu_keys.rs' 'canvas_tool_menu.rs' \
+                         'brush_cursor*.rs' 'stroke*.rs' 'smoothing*.rs' 'pen_input*.rs' 'tablet*.rs' 'autosave*.rs' ; do
+            for f in $(find crates apps -name "$pattern" -not -path '*/target/*' 2>/dev/null | head -6); do
+              if [ "$(wc -c < "$f")" -lt 400000 ]; then cp "$f" "logs/upstream/$(echo $f | tr / _).txt"; fi
+            done
+          done
+          ls logs/upstream | head -80
+      - name: Build the Rust core
+        script: |
+          set -eo pipefail
+          set -o pipefail
+          mkdir -p logs ios/rust-lib
+          cargo rustc --release --target aarch64-apple-ios -p photocraft-ios -- --print native-static-libs 2>&1 | tee logs/rust-build.log
+          ls -la target/aarch64-apple-ios/release/ | head -20
+          test -f target/aarch64-apple-ios/release/libphotocraft_ios.a || { echo "RUST BUILD DID NOT PRODUCE THE LIBRARY"; exit 1; }
+          cp target/aarch64-apple-ios/release/libphotocraft_ios.a ios/rust-lib/
+          NATIVE=$(grep -o 'native-static-libs:.*' logs/rust-build.log | head -1 | sed 's/native-static-libs: //')
+          echo "System libraries: $NATIVE"
+          echo "NATIVE_LIBS=$NATIVE" >> "$CM_ENV"
+      - name: Save interface library sources for reading
+        script: |
+          mkdir -p logs/ui-libs
+          for d in $(ls -d $HOME/.cargo/git/checkouts/craft-*/*/ 2>/dev/null); do
+            name=$(basename $(dirname $d))
+            ls "$d" > "logs/ui-libs/$name-contents.txt" 2>&1
+            for c in $(find "$d" -maxdepth 2 -type d -name 'craft-ui*' 2>/dev/null | head -3); do
+              tar czf "logs/ui-libs/$name-$(basename $c).tgz" -C "$(dirname $c)" "$(basename $c)" --exclude='*/target/*' 2>/dev/null
+            done
+          done
+          for pattern in 'toolbar*.rs' 'tool_tray*.rs' 'tools_panel*.rs' 'workspace*.rs' 'dock*.rs' 'panel_docking.rs' 'options_bar*.rs' 'context_bar*.rs' 'menu_catalog.rs' 'tool_catalog*.rs' 'left_*.rs' 'right_*.rs'; do
+            for f in $(find crates -name "$pattern" -not -path '*/target/*' 2>/dev/null | head -6); do
+              if [ "$(wc -c < "$f")" -lt 400000 ]; then cp "$f" "logs/upstream/$(echo $f | tr / _).txt"; fi
+            done
+          done
+          ls -la logs/ui-libs logs/upstream | head -120
+      - name: Make the app icon
+        script: |
+          ICONSET=ios/App/Assets.xcassets/AppIcon.appiconset
+          mkdir -p "$ICONSET"
+          cat > ios/App/Assets.xcassets/Contents.json <<'JSONEOF'
+          {"info":{"author":"xcode","version":1}}
+          JSONEOF
+          cat > "$ICONSET/Contents.json" <<'JSONEOF'
+          {"images":[{"filename":"AppIcon-1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}
+          JSONEOF
+          cat > /tmp/make-icon.swift <<'SWIFTEOF'
+          import Foundation
+          import CoreGraphics
+          import ImageIO
+
+          // usage: swift make-icon.swift <input.png | none> <output.png> [plain]
+          let args = CommandLine.arguments
+          let outPath = args[2]
+          let plain = args.count > 3 && args[3] == "plain"
+          let size = 1024
+          let space = CGColorSpace(name: CGColorSpace.sRGB)!
+          guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0, space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { exit(1) }
+
+          func readImage(_ path: String) -> CGImage? {
+              guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
+              return CGImageSourceCreateImageAtIndex(src, 0, nil)
+          }
+
+          // The colour of one spot of the picture (fractions from the left and from the top).
+          func sample(_ img: CGImage, _ fx: Double, _ fy: Double) -> (Double, Double, Double) {
+              let one = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4, space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+              let w = Double(img.width), h = Double(img.height)
+              one.draw(img, in: CGRect(x: -fx * w, y: -(1 - fy) * h, width: w, height: h))
+              let p = one.data!.assumingMemoryBound(to: UInt8.self)
+              let a = max(Double(p[3]) / 255, 0.001)
+              return (min(Double(p[0]) / 255 / a, 1), min(Double(p[1]) / 255 / a, 1), min(Double(p[2]) / 255 / a, 1))
+          }
+
+          if args[1] != "none", let img = readImage(args[1]) {
+              // A desktop icon has transparent margins and rounded corners; iOS rounds the icon
+              // itself, so the picture is enlarged a little over a background of its own edge colour.
+              let bg = plain ? (1.0, 1.0, 1.0) : sample(img, 0.5, 0.14)
+              ctx.setFillColor(red: bg.0, green: bg.1, blue: bg.2, alpha: 1)
+              ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+              let scale = plain ? 1.0 : 1.24
+              let side = Double(size) * scale
+              let offset = -(side - Double(size)) / 2
+              ctx.interpolationQuality = .high
+              ctx.draw(img, in: CGRect(x: offset, y: offset, width: side, height: side))
+          } else {
+              ctx.setFillColor(red: 0.16, green: 0.36, blue: 0.80, alpha: 1)
+              ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+              ctx.setStrokeColor(red: 1, green: 1, blue: 1, alpha: 1)
+              ctx.setLineWidth(48)
+              ctx.strokeEllipse(in: CGRect(x: 250, y: 250, width: 524, height: 524))
+              ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+              ctx.fillEllipse(in: CGRect(x: 412, y: 412, width: 200, height: 200))
+          }
+
+          guard let result = ctx.makeImage(),
+                let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: outPath) as CFURL, "public.png" as CFString, 1, nil) else { exit(1) }
+          CGImageDestinationAddImage(dest, result, nil)
+          if !CGImageDestinationFinalize(dest) { exit(1) }
+          SWIFTEOF
+          OFFICIAL=$(find assets -iname '*macos*512*.png' 2>/dev/null | head -1)
+          if [ -f ios/AppIcon.png ]; then
+            echo "Using your own icon: ios/AppIcon.png"
+            swift /tmp/make-icon.swift ios/AppIcon.png "$ICONSET/AppIcon-1024.png" plain
+          elif [ -n "$OFFICIAL" ]; then
+            echo "Using the icon from the repo: $OFFICIAL"
+            swift /tmp/make-icon.swift "$OFFICIAL" "$ICONSET/AppIcon-1024.png"
+          else
+            echo "No icon picture found: using the plain fallback"
+            swift /tmp/make-icon.swift none "$ICONSET/AppIcon-1024.png"
+          fi
+          ls -la "$ICONSET"
+      - name: Stamp the version
+        script: |
+          python3 - <<'PYEOF'
+          import os, pathlib
+          build = os.environ["BUILD_NUMBER"]
+          p = pathlib.Path("ios/project.yml")
+          s = p.read_text().replace("__BUILD__", build)
+          p.write_text(s)
+          line = f"PhotoCraft version 0.5.0, build {build}"
+          pathlib.Path("logs/version.txt").write_text(line + "\n")
+          print(line)
+          PYEOF
+      - name: Install XcodeGen
+        script: |
+          brew install xcodegen
+      - name: Generate Xcode project
+        script: |
+          set -eo pipefail
+          cd ios && xcodegen generate
+      - name: Build the app (unsigned)
+        script: |
+          set -eo pipefail
+          set -o pipefail
+          cd ios
+          xcodebuild -project PhotoCraft.xcodeproj -scheme PhotoCraft \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            NATIVE_LIBS="$NATIVE_LIBS" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee ../logs/xcodebuild.log
+      - name: Package IPA
+        script: |
+          set -eo pipefail
+          cd ios
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/PhotoCraft.app Payload/
+          zip -qr ../PhotoCraft.ipa Payload
+    artifacts:
+      - PhotoCraft.ipa
+      - logs/**

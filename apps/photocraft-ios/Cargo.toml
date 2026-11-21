@@ -1,0 +1,23 @@
+[package]
+name = "photocraft-ios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "photocraft_ios"
+crate-type = ["staticlib"]
+
+[dependencies]
+photocraft-engine = { workspace = true }
+photocraft-io = { workspace = true }
+photocraft-codecs = { workspace = true }
+photocraft-doc = { workspace = true }
+photocraft-ui-egui = { workspace = true }
+egui = { workspace = true }
+eframe = { workspace = true }
+egui-wgpu = { version = "0.37", default-features = false }
+wgpu = { version = "30", default-features = false, features = ["metal", "wgsl"] }
+pollster = "1"
+log = { workspace = true }
