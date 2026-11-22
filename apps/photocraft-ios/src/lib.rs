@@ -274,13 +274,17 @@ fn touch_settings_path() -> Option<PathBuf> {
 
 /// How firmly the Pencil must press for full pressure, kept between launches.
 fn load_pressure_divisor() -> f32 {
-    let mut divisor = 2.5_f32;
+    let mut divisor = 1.0_f32;
     if let Some(text) = touch_settings_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         for line in text.lines() {
             if let Some(v) = line.strip_prefix("pressure_divisor=")
                 && let Ok(n) = v.trim().parse::<f32>()
             {
-                divisor = n.clamp(1.0, 5.0);
+                if (n - 2.5).abs() < 1e-3 {
+                    divisor = 1.0;
+                } else {
+                    divisor = n.clamp(0.5, 3.0);
+                }
             }
         }
     }
@@ -1019,11 +1023,11 @@ impl Host {
             TouchAction::Redo => self.key_tap(egui::Key::Z, to_mods(9)),
             TouchAction::Delete => self.key_tap(egui::Key::Backspace, egui::Modifiers::NONE),
             TouchAction::Softer => {
-                self.pressure_divisor = (self.pressure_divisor - 0.3).max(1.0);
+                self.pressure_divisor = (self.pressure_divisor - 0.15).max(0.5);
                 save_pressure_divisor(self.pressure_divisor);
             }
             TouchAction::Firmer => {
-                self.pressure_divisor = (self.pressure_divisor + 0.3).min(5.0);
+                self.pressure_divisor = (self.pressure_divisor + 0.15).min(3.0);
                 save_pressure_divisor(self.pressure_divisor);
             }
         }
@@ -1405,10 +1409,10 @@ pub unsafe extern "C" fn pc_pen(
         h.set_modifiers(to_mods(mods));
         let pos = h.pt(x, y);
         let m = h.modifiers;
-        // The shell sends the Pencil's force (1.0 is an average touch); full pressure is reached
+        // The shell sends the Pencil's normalized force (0.0009765625 to 1.0); full pressure is reached
         // at `pressure_divisor`.
         let sample = PenSample {
-            pressure: (pressure / h.pressure_divisor).clamp(0.0, 1.0),
+            pressure: (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0),
             tilt_x,
             tilt_y,
             rotation: rotation.rem_euclid(360.0),
@@ -1451,6 +1455,76 @@ pub unsafe extern "C" fn pc_pen(
             }
         }
     }
+}
+
+/// Forward iPadOS predicted touch points for low-latency live preview without baking them into stroke history.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_pen_predicted(
+    h: *mut c_void,
+    x: f32,
+    y: f32,
+    pressure: f32,
+    tilt_x: f32,
+    tilt_y: f32,
+    rotation: f32,
+) {
+    if let Some(h) = unsafe { host(h) } {
+        if h.pen_down {
+            let pos = h.pt(x, y);
+            let sample = PenSample {
+                pressure: (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0),
+                tilt_x,
+                tilt_y,
+                rotation: rotation.rem_euclid(360.0),
+                eraser: false,
+            };
+            h.feed.set_predicted(Some((sample, pos)));
+            h.ctx.request_repaint();
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_pen_predicted_clear(h: *mut c_void) {
+    if let Some(h) = unsafe { host(h) } {
+        h.feed.set_predicted(None);
+    }
+}
+
+/// Update latest pen sample with refined force from touchesEstimatedPropertiesUpdated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_pen_update_estimate(
+    h: *mut c_void,
+    pressure: f32,
+    tilt_x: f32,
+    tilt_y: f32,
+    rotation: f32,
+) {
+    if let Some(h) = unsafe { host(h) } {
+        if h.pen_down {
+            let sample = PenSample {
+                pressure: (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0),
+                tilt_x,
+                tilt_y,
+                rotation: rotation.rem_euclid(360.0),
+                eraser: false,
+            };
+            h.feed.update_latest(sample);
+        }
+    }
+}
+
+/// Current active document view camera rotation in degrees (clockwise).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_canvas_rotation(h: *mut c_void) -> f32 {
+    if let Some(h) = unsafe { host(h) } {
+        if let Some(i) = h.app.session.active_index() {
+            if let Some(v) = h.app.ui.views.get(i) {
+                return v.rotation;
+            }
+        }
+    }
+    0.0
 }
 
 /// Apple Pencil hovering above the screen: moves the pointer (the brush preview follows it) and

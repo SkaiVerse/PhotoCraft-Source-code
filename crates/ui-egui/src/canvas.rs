@@ -1818,8 +1818,9 @@ fn draw_canvas_tool_cursor(app: &mut PhotocraftApp, ui: &mut egui::Ui, input: &C
     let tool = input.tool;
     let panning = input.panning;
 
-    let current_p = response
-        .hover_pos()
+    let predicted_p = app.stylus.feed.predicted().map(|(_, pos)| pos).filter(|p| response.rect.contains(*p));
+    let current_p = predicted_p
+        .or_else(|| response.hover_pos())
         .or_else(|| response.interact_pointer_pos().filter(|p| response.rect.contains(*p)))
         .or_else(|| ui.input(|i| i.pointer.latest_pos()).filter(|p| response.rect.contains(*p)));
 

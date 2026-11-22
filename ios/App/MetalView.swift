@@ -624,7 +624,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 if fingerTouch != nil { cancelFinger() }
                 let alt = Double(g.altitudeAngle)
                 let az = g.azimuthUnitVector(in: self)
-                let (tx, ty) = MetalView.tilt(altitude: alt, azimuth: az)
+                let (tx, ty) = self.tilt(altitude: alt, azimuth: az)
                 var roll: Float = 0
                 if #available(iOS 17.5, *) { roll = Float(g.rollAngle * 180 / CGFloat.pi) }
                 pc_pen_hover(h, Float(p.x), Float(p.y), tx, ty, roll)
@@ -643,12 +643,23 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         }
     }
 
-    /// Tilt in degrees on both axes (like a browser's pen events), from the Pencil's altitude and azimuth.
-    private static func tilt(altitude: Double, azimuth: CGVector) -> (Float, Float) {
+    /// Tilt in degrees on both axes (like a browser's pen events), from the Pencil's altitude and azimuth,
+    /// transformed by canvas rotation (phi_canvas = phi_screen - theta_canvas) so brush tilt aligns with artwork.
+    private func tilt(altitude: Double, azimuth: CGVector) -> (Float, Float) {
+        var az = azimuth
+        if let h = handle {
+            let canvasRotDeg = Double(pc_canvas_rotation(h))
+            if canvasRotDeg != 0.0 {
+                let rotRad = canvasRotDeg * Double.pi / 180.0
+                let phiScreen = atan2(Double(azimuth.dy), Double(azimuth.dx))
+                let phiCanvas = phiScreen - rotRad
+                az = CGVector(dx: cos(phiCanvas), dy: sin(phiCanvas))
+            }
+        }
         let upright = max(sin(altitude), 0.0001)
         let flat = cos(altitude)
-        let tx = Float(atan2(Double(azimuth.dx) * flat, upright) * 180 / Double.pi)
-        let ty = Float(atan2(Double(azimuth.dy) * flat, upright) * 180 / Double.pi)
+        let tx = Float(atan2(Double(az.dx) * flat, upright) * 180 / Double.pi)
+        let ty = Float(atan2(Double(az.dy) * flat, upright) * 180 / Double.pi)
         return (tx, ty)
     }
 
@@ -666,6 +677,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     @objc private func twoFingerScroll(_ g: UIPanGestureRecognizer) {
         guard let h = handle else { return }
+        if g.state == .began {
+            cancelFinger()
+        }
         if g.state == .ended || g.state == .cancelled {
             pc_pointer_gone(h)
             return
@@ -686,6 +700,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         guard let h = handle else { return }
         switch g.state {
         case .began:
+            cancelFinger()
             twistEngaged = false
             twistSent = 0
         case .changed:
@@ -713,6 +728,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         guard let h = handle else { return }
         switch g.state {
         case .began:
+            cancelFinger()
             pinchTotal = 1
         case .changed:
             let p = g.location(in: self)
@@ -750,19 +766,20 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         fingerTouch = nil
     }
 
-    /// Adds a Pencil sample. It is sent once its true pressure has arrived (a few milliseconds).
+    /// Adds a Pencil sample. It is sent immediately without artificial delay.
     private func queuePen(_ touch: UITouch, phase: Int32, event: UIEvent?, mods: UInt32) {
         var samples: [UITouch] = [touch]
         if phase == 1, let more = event?.coalescedTouches(for: touch), !more.isEmpty { samples = more }
         for c in samples {
             let maxForce = c.maximumPossibleForce
+            let normForce = max(0.0009765625, min(1.0, maxForce > 0 ? (c.force / maxForce) : 0.5))
             let waiting = c.estimationUpdateIndex != nil && c.estimatedPropertiesExpectingUpdates.contains(.force)
             var roll: CGFloat = 0
             if #available(iOS 17.5, *) { roll = c.rollAngle }
             penQueue.append(PenItem(
                 phase: phase,
                 location: c.preciseLocation(in: self),
-                force: maxForce > 0 ? c.force : 1,
+                force: normForce,
                 altitude: c.altitudeAngle,
                 azimuth: c.azimuthUnitVector(in: self),
                 roll: roll,
@@ -772,26 +789,35 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 time: CACurrentMediaTime(),
                 stamp: c.timestamp))
         }
-        flushPen(all: false)
+        flushPen(all: true)
     }
 
     /// iPadOS refines the Pencil's pressure a few milliseconds after the touch. Matching the
     /// refined value to its sample gives an even, natural stroke.
     override func touchesEstimatedPropertiesUpdated(_ touches: Set<UITouch>) {
+        guard let h = handle else { return }
         for t in touches where t.type == .pencil {
-            guard let index = t.estimationUpdateIndex,
-                  let i = penQueue.firstIndex(where: { $0.index == index }) else { continue }
-            penQueue[i].force = t.force
-            penQueue[i].altitude = t.altitudeAngle
-            if !t.estimatedPropertiesExpectingUpdates.contains(.force) { penQueue[i].ready = true }
+            let maxForce = t.maximumPossibleForce
+            let normForce = max(0.0009765625, min(1.0, maxForce > 0 ? (t.force / maxForce) : 0.5))
+            if let index = t.estimationUpdateIndex,
+               let i = penQueue.firstIndex(where: { $0.index == index }) {
+                penQueue[i].force = normForce
+                penQueue[i].altitude = t.altitudeAngle
+                if !t.estimatedPropertiesExpectingUpdates.contains(.force) { penQueue[i].ready = true }
+            }
+            if t === pencilTouch {
+                let (tx, ty) = self.tilt(altitude: t.altitudeAngle, azimuth: t.azimuthUnitVector(in: self))
+                var roll: Float = 0
+                if #available(iOS 17.5, *) { roll = Float(t.rollAngle * 180 / CGFloat.pi) }
+                pc_pen_update_estimate(h, Float(normForce), tx, ty, roll)
+            }
         }
-        flushPen(all: false)
+        flushPen(all: true)
     }
 
     private func flushPen(all: Bool) {
         let now = CACurrentMediaTime()
-        // A sample waits at most a few milliseconds for its refined pressure: the ink keeps up with the tip.
-        while let first = penQueue.first, first.ready || all || now - first.time > 0.006 {
+        while let first = penQueue.first, first.ready || all || now - first.time > 0.004 {
             penQueue.removeFirst()
             sendPen(first)
         }
@@ -816,12 +842,12 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     private func sendPen(_ item: PenItem) {
         guard handle != nil else { return }
-        // The Pencil's force (1.0 is an average touch); the Rust side turns it into pressure.
-        var pressure = Float(max(0, min(4.5, item.force)))
-        // A little smoothing of the pressure only (never of the position) evens out the response.
-        if item.phase == 0 { smoothedPressure = pressure } else { smoothedPressure = smoothedPressure * 0.5 + pressure * 0.5 }
-        pressure = smoothedPressure
-        let (tx, ty) = MetalView.tilt(altitude: Double(item.altitude), azimuth: item.azimuth)
+        // The Pencil's normalized force (0.0009765625 to 1.0)
+        var pressure = Float(max(0.0009765625, min(1.0, item.force)))
+        // Responsive exponential moving average (alpha = 0.4)
+        if item.phase == 0 { smoothedPressure = pressure } else { smoothedPressure = smoothedPressure * 0.6 + pressure * 0.4 }
+        pressure = max(0.0009765625, min(1.0, smoothedPressure))
+        let (tx, ty) = self.tilt(altitude: Double(item.altitude), azimuth: item.azimuth)
         let point = PenPoint(x: Double(item.location.x), y: Double(item.location.y), pressure: pressure, tiltX: tx, tiltY: ty,
                              roll: Float(item.roll * 180 / CGFloat.pi))
 
@@ -968,7 +994,20 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             let p = t.location(in: self)
             switch t.type {
             case .pencil:
-                if t === pencilTouch { queuePen(t, phase: 1, event: event, mods: mods) }
+                if t === pencilTouch {
+                    queuePen(t, phase: 1, event: event, mods: mods)
+                    if let predicted = event?.predictedTouches(for: t), !predicted.isEmpty {
+                        for pt in predicted {
+                            let maxForce = pt.maximumPossibleForce
+                            let normForce = max(0.0009765625, min(1.0, maxForce > 0 ? (pt.force / maxForce) : 0.5))
+                            let loc = pt.preciseLocation(in: self)
+                            let (tx, ty) = self.tilt(altitude: pt.altitudeAngle, azimuth: pt.azimuthUnitVector(in: self))
+                            var roll: Float = 0
+                            if #available(iOS 17.5, *) { roll = Float(pt.rollAngle * 180 / CGFloat.pi) }
+                            pc_pen_predicted(h, Float(loc.x), Float(loc.y), Float(normForce), tx, ty, roll)
+                        }
+                    }
+                }
             case .indirectPointer:
                 pc_pointer_moved(h, Float(p.x), Float(p.y))
             default:
@@ -988,6 +1027,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             switch t.type {
             case .pencil:
                 if t === pencilTouch {
+                    pc_pen_predicted_clear(h)
                     queuePen(t, phase: cancelled ? 3 : 2, event: event, mods: mods)
                     pencilTouch = nil
                     pencilLastSeen = CACurrentMediaTime()

@@ -73,6 +73,8 @@ const FEED_QUEUE: usize = 1024;
 struct FeedState {
     /// The current sample (`None` = no pen down).
     latest: Option<PenSample>,
+    /// Forward predicted touch sample and screen position (`None` = no prediction).
+    predicted: Option<(PenSample, egui::Pos2)>,
     /// Every sample set since the canvas last drained them, oldest first.
     queue: VecDeque<PenSample>,
 }
@@ -94,6 +96,28 @@ impl StylusFeed {
                 g.queue.pop_front();
             }
             g.queue.push_back(s);
+        } else {
+            g.predicted = None;
+        }
+    }
+
+    /// Forward predicted touch sample and screen position for low-latency live preview.
+    pub fn set_predicted(&self, p: Option<(PenSample, egui::Pos2)>) {
+        let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        g.predicted = p.map(|(s, pos)| (s.sanitized(), pos));
+    }
+
+    pub fn predicted(&self) -> Option<(PenSample, egui::Pos2)> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).predicted
+    }
+
+    /// Update the latest pen sample with refined estimated properties without adding extra queue items.
+    pub fn update_latest(&self, s: PenSample) {
+        let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let s = s.sanitized();
+        g.latest = Some(s);
+        if let Some(last) = g.queue.back_mut() {
+            *last = s;
         }
     }
 

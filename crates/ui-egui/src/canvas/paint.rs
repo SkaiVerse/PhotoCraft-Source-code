@@ -600,6 +600,24 @@ pub(super) fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter
     if let Some(r) = marquee {
         draw_marquee_readout(app, painter.ctx(), xf.to_screen(last[0] as f32, last[1] as f32), size_readout(app, r));
     }
+    if let Some((sample, pred_screen_pos)) = app.stylus.feed.predicted() {
+        if d.tool.is_brushlike() || strokes_live(d.tool) {
+            let last_screen = xf.to_screen(last[0] as f32, last[1] as f32);
+            let dist = (pred_screen_pos - last_screen).length();
+            if dist > 0.5 && dist < 400.0 {
+                let fg = app.session.tools.foreground;
+                let stroke_col = egui::Color32::from_rgba_unmultiplied(
+                    (fg[0] * 255.0).clamp(0.0, 255.0) as u8,
+                    (fg[1] * 255.0).clamp(0.0, 255.0) as u8,
+                    (fg[2] * 255.0).clamp(0.0, 255.0) as u8,
+                    ((fg[3] * 255.0) * sample.pressure.clamp(0.15, 1.0)).clamp(0.0, 255.0) as u8,
+                );
+                let brush_radius = (app.session.tools.brush.size * xf.zoom / 2.0).max(1.0);
+                let line_width = (brush_radius * 2.0 * sample.pressure.clamp(0.1, 1.0)).clamp(1.5, (brush_radius * 2.0).max(1.5));
+                painter.line_segment([last_screen, pred_screen_pos], egui::Stroke::new(line_width, stroke_col));
+            }
+        }
+    }
     match d.tool {
         // The canvas shows the live stroke itself (`LiveStroke`); a stroke that couldn't start one
         // (Sample All Layers, say) keeps the trail.
