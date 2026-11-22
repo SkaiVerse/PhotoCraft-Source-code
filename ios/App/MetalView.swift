@@ -654,28 +654,36 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if t != .zero { pc_scroll(h, Float(t.x), Float(t.y), modBits(g.modifierFlags)) }
     }
 
-    @objc private func twoFingerScroll(_ g: UIPanGestureRecognizer) {
-        guard let h = handle else { return }
-        if g.state == .ended || g.state == .cancelled { pc_pointer_gone(h); return }
-        guard g.state != .failed else { return }
-        let t = g.translation(in: self)
-        g.setTranslation(.zero, in: self)
-        let c = g.location(in: self)
-        pc_pointer_moved(h, Float(c.x), Float(c.y))
-        if twistEngaged {
-            // Suppress/damp pan translation while rotating to prevent unwanted canvas drift
-            let dist = hypot(t.x, t.y)
-            if dist >= 6.0 {
-                pc_scroll(h, Float(t.x * 0.15), Float(t.y * 0.15), 0)
-            }
-        } else if t != .zero {
-            pc_scroll(h, Float(t.x), Float(t.y), 0)
-        }
-    }
-
     private var pinchTotal: CGFloat = 1
     private var twistEngaged = false
     private var twistSent: CGFloat = 0
+    private var cumulativeTwistPan: CGFloat = 0
+
+    @objc private func twoFingerScroll(_ g: UIPanGestureRecognizer) {
+        guard let h = handle else { return }
+        if g.state == .ended || g.state == .cancelled {
+            cumulativeTwistPan = 0
+            pc_pointer_gone(h)
+            return
+        }
+        guard g.state != .failed else { return }
+        let t = g.translation(in: self)
+        g.setTranslation(.zero, in: self)
+        if twistEngaged {
+            // Strictly zero out / lock pan translation during active rotation unless deliberate large pan (>45 pt)
+            cumulativeTwistPan += hypot(t.x, t.y)
+            if cumulativeTwistPan > 45.0 {
+                pc_scroll(h, Float(t.x), Float(t.y), 0)
+            }
+        } else {
+            cumulativeTwistPan = 0
+            let c = g.location(in: self)
+            pc_pointer_moved(h, Float(c.x), Float(c.y))
+            if t != .zero {
+                pc_scroll(h, Float(t.x), Float(t.y), 0)
+            }
+        }
+    }
 
     /// Two-finger twist turns the canvas view only. It starts after a small twist (a bigger one
     /// while the fingers are clearly pinching), so zooming does not turn the picture by accident.
@@ -683,6 +691,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         guard let h = handle else { return }
         switch g.state {
         case .began:
+            cumulativeTwistPan = 0
             twistEngaged = false
             twistSent = 0
         case .changed:
@@ -703,6 +712,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             let cy = Float(bounds.midY)
             pc_rotate(h, Float(delta), cx, cy)
         case .ended, .cancelled:
+            cumulativeTwistPan = 0
             twistEngaged = false
         default: break
         }
@@ -1016,16 +1026,16 @@ final class SqueezePaletteView: UIView {
     struct ToolItem {
         let id: String
         let name: String
-        let iconType: String
+        let systemIcon: String
     }
 
     private static let tools: [ToolItem] = [
-        ToolItem(id: "pathSelection", name: "Select", iconType: "select"),
-        ToolItem(id: "move", name: "Move", iconType: "move"),
-        ToolItem(id: "brush", name: "Brush", iconType: "brush"),
-        ToolItem(id: "eraser", name: "Eraser", iconType: "eraser"),
-        ToolItem(id: "eyedropper", name: "Picker", iconType: "pipette"),
-        ToolItem(id: "type", name: "Text", iconType: "type"),
+        ToolItem(id: "pathSelection", name: "Select", systemIcon: "arrow.up.left"),
+        ToolItem(id: "move", name: "Move", systemIcon: "arrow.up.and.down.and.arrow.left.and.right"),
+        ToolItem(id: "brush", name: "Brush", systemIcon: "paintbrush.pointed"),
+        ToolItem(id: "eraser", name: "Eraser", systemIcon: "eraser"),
+        ToolItem(id: "eyedropper", name: "Picker", systemIcon: "eyedropper.halffull"),
+        ToolItem(id: "type", name: "Text", systemIcon: "textformat"),
     ]
 
     private let platter = UIVisualEffectView(effect: UIBlurEffect(style: .systemMaterialDark))
@@ -1040,11 +1050,11 @@ final class SqueezePaletteView: UIView {
         autoresizingMask = [.flexibleWidth, .flexibleHeight]
         backgroundColor = .clear
 
-        let midRadius: CGFloat = 145.0
-        let thickness: CGFloat = 58.0
+        let midRadius: CGFloat = 160.0
+        let thickness: CGFloat = 66.0
         let rIn: CGFloat = midRadius - thickness / 2.0
         let rOut: CGFloat = midRadius + thickness / 2.0
-        let spanDeg: CGFloat = 88.0
+        let spanDeg: CGFloat = 120.0
         let spanRad = spanDeg * .pi / 180.0
         let startAngle: CGFloat = -(.pi / 2.0) - (spanRad / 2.0)
         let endAngle: CGFloat = -(.pi / 2.0) + (spanRad / 2.0)
@@ -1083,11 +1093,14 @@ final class SqueezePaletteView: UIView {
         layer.shadowRadius = 16
         layer.shadowOffset = CGSize(width: 0, height: 6)
 
-        let btnSize: CGFloat = 40.0
+        let btnSize: CGFloat = 38.0
         let count = SqueezePaletteView.tools.count
+        let marginRad: CGFloat = 0.14
+        let usableStart = startAngle + marginRad
+        let usableEnd = endAngle - marginRad
         for (i, tool) in SqueezePaletteView.tools.enumerated() {
-            let frac = (CGFloat(i) + 0.5) / CGFloat(count)
-            let angle = startAngle + (endAngle - startAngle) * frac
+            let frac = CGFloat(i) / CGFloat(max(1, count - 1))
+            let angle = usableStart + (usableEnd - usableStart) * frac
             let bx = curCenter.x + midRadius * cos(angle) - (btnSize / 2.0)
             let by = curCenter.y + midRadius * sin(angle) - (btnSize / 2.0)
 
@@ -1096,11 +1109,11 @@ final class SqueezePaletteView: UIView {
             btn.layer.cornerRadius = btnSize / 2.0
             btn.backgroundColor = UIColor.white.withAlphaComponent(0.12)
             btn.tintColor = .white
-            btn.layer.borderColor = UIColor.white.withAlphaComponent(0.15).cgColor
+            btn.layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
             btn.layer.borderWidth = 0.8
 
-            let iconImg = SqueezePaletteView.toolIcon(tool.iconType)
-            btn.setImage(iconImg, for: .normal)
+            let img = UIImage(systemName: tool.systemIcon, withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .medium))
+            btn.setImage(img, for: .normal)
             btn.accessibilityLabel = tool.name
             btn.tag = i
             btn.addTarget(self, action: #selector(toolTapped(_:)), for: .touchUpInside)
@@ -1131,88 +1144,6 @@ final class SqueezePaletteView: UIView {
 
         path.close()
         return path
-    }
-
-    private static func toolIcon(_ type: String) -> UIImage {
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 24, height: 24))
-        return renderer.image { ctx in
-            let c = ctx.cgContext
-            c.setStrokeColor(UIColor.white.cgColor)
-            c.setLineWidth(1.8)
-            c.setLineCap(.round)
-            c.setLineJoin(.round)
-
-            switch type {
-            case "select":
-                let p = UIBezierPath()
-                p.move(to: CGPoint(x: 4.5, y: 4.5))
-                p.addLine(to: CGPoint(x: 20.0, y: 11.0))
-                p.addLine(to: CGPoint(x: 14.0, y: 12.5))
-                p.addLine(to: CGPoint(x: 12.5, y: 18.5))
-                p.close()
-                p.lineWidth = 1.8
-                p.lineCapStyle = .round
-                p.lineJoinStyle = .round
-                UIColor.white.setStroke()
-                p.stroke()
-
-            case "move":
-                c.move(to: CGPoint(x: 12, y: 3)); c.addLine(to: CGPoint(x: 12, y: 21))
-                c.move(to: CGPoint(x: 9, y: 6)); c.addLine(to: CGPoint(x: 12, y: 3)); c.addLine(to: CGPoint(x: 15, y: 6))
-                c.move(to: CGPoint(x: 9, y: 18)); c.addLine(to: CGPoint(x: 12, y: 21)); c.addLine(to: CGPoint(x: 15, y: 18))
-                c.move(to: CGPoint(x: 3, y: 12)); c.addLine(to: CGPoint(x: 21, y: 12))
-                c.move(to: CGPoint(x: 6, y: 9)); c.addLine(to: CGPoint(x: 3, y: 12)); c.addLine(to: CGPoint(x: 6, y: 15))
-                c.move(to: CGPoint(x: 18, y: 9)); c.addLine(to: CGPoint(x: 21, y: 12)); c.addLine(to: CGPoint(x: 18, y: 15))
-                c.strokePath()
-
-            case "brush":
-                c.move(to: CGPoint(x: 11, y: 10)); c.addLine(to: CGPoint(x: 14, y: 13))
-                c.move(to: CGPoint(x: 10.0, y: 17.0)); c.addLine(to: CGPoint(x: 21.0, y: 6.0))
-                c.addLine(to: CGPoint(x: 18.0, y: 3.0)); c.addLine(to: CGPoint(x: 7.0, y: 14.0))
-                c.strokePath()
-                c.addEllipse(in: CGRect(x: 3.5, y: 14.5, width: 6.5, height: 6.5))
-                c.strokePath()
-
-            case "eraser":
-                let p = UIBezierPath()
-                p.move(to: CGPoint(x: 7.5, y: 20.5))
-                p.addLine(to: CGPoint(x: 3.0, y: 16.0))
-                p.addLine(to: CGPoint(x: 12.8, y: 6.2))
-                p.addLine(to: CGPoint(x: 18.5, y: 12.0))
-                p.addLine(to: CGPoint(x: 13.0, y: 20.5))
-                p.close()
-                p.move(to: CGPoint(x: 5.5, y: 11.5))
-                p.addLine(to: CGPoint(x: 14.2, y: 19.8))
-                p.lineWidth = 1.8
-                p.lineCapStyle = .round
-                p.lineJoinStyle = .round
-                UIColor.white.setStroke()
-                p.stroke()
-
-            case "pipette":
-                c.move(to: CGPoint(x: 3.5, y: 20.5))
-                c.addLine(to: CGPoint(x: 3.5, y: 18.5))
-                c.addLine(to: CGPoint(x: 12.0, y: 10.0))
-                c.addLine(to: CGPoint(x: 14.5, y: 12.5))
-                c.addLine(to: CGPoint(x: 6.0, y: 21.0))
-                c.closePath()
-                c.move(to: CGPoint(x: 15.0, y: 7.5))
-                c.addLine(to: CGPoint(x: 17.5, y: 10.0))
-                c.addLine(to: CGPoint(x: 20.5, y: 7.0))
-                c.addLine(to: CGPoint(x: 18.0, y: 4.5))
-                c.closePath()
-                c.strokePath()
-
-            case "type":
-                c.move(to: CGPoint(x: 12, y: 5)); c.addLine(to: CGPoint(x: 12, y: 19))
-                c.move(to: CGPoint(x: 5, y: 8)); c.addLine(to: CGPoint(x: 5, y: 5))
-                c.addLine(to: CGPoint(x: 19, y: 5)); c.addLine(to: CGPoint(x: 19, y: 8))
-                c.move(to: CGPoint(x: 9, y: 19)); c.addLine(to: CGPoint(x: 15, y: 19))
-                c.strokePath()
-
-            default: break
-            }
-        }.withRenderingMode(.alwaysOriginal)
     }
 
     func animateIn() {

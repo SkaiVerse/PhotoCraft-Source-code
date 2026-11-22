@@ -20,4 +20,5 @@ eframe = { workspace = true }
 egui-wgpu = { version = "0.37", default-features = false }
 wgpu = { version = "30", default-features = false, features = ["metal", "wgsl"] }
 pollster = "1"
+serde_json = { workspace = true }
 log = { workspace = true }

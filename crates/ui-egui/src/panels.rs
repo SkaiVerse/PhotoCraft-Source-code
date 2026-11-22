@@ -50,7 +50,7 @@ pub(super) mod mask_props_ui;
 pub mod mask_thumbs_ui;
 mod navigator;
 pub(crate) mod options_bar;
-pub(super) mod panel_docking;
+pub mod panel_docking;
 mod panel_state;
 pub mod preset_panels;
 mod properties;

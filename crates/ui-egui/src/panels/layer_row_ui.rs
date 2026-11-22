@@ -362,6 +362,11 @@ pub fn recorded(ctx: &egui::Context) -> Vec<RowRects> {
     ctx.data(|d| d.get_temp::<Vec<RowRects>>(rects_id())).unwrap_or_default()
 }
 
+/// The key tracking layers selected via swipe gesture.
+pub fn swipe_select_key() -> egui::Id {
+    egui::Id::unique("layer-swipe-selected")
+}
+
 // ------------------------------------------------------------------ in-place rename (#314)
 
 /// The Layers panel's in-place rename. One at a time, like Photoshop: Enter, Tab or a click

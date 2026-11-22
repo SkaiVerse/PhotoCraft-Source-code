@@ -872,8 +872,8 @@ fn show_layout(app: &mut PhotocraftApp, ui: &mut egui::Ui, dock_only: bool) {
     let mut divider_zones = Vec::new();
     for (hit, r) in &hits {
         if let craft_ui::docking::Hit::Divider(craft_ui::docking::Divider::Group(first)) = hit {
-            // Expand hit target to 20 pt height (10 pt above and below the divider line)
-            let expanded = egui::Rect::from_x_y_ranges(r.x_range(), (r.center().y - 10.0)..=(r.center().y + 10.0));
+            // Expand hit target to 28 pt height (14 pt above and below the divider line for touch)
+            let expanded = egui::Rect::from_x_y_ranges(r.x_range(), (r.center().y - 14.0)..=(r.center().y + 14.0));
             divider_zones.push((first.clone(), expanded, r.center().y));
         }
     }
@@ -887,9 +887,10 @@ fn show_layout(app: &mut PhotocraftApp, ui: &mut egui::Ui, dock_only: bool) {
         craft_ui::docking::cancel_drag::<String>(ui.ctx(), area);
     }
 
+    let mut divider_resized = false;
     for (first, zone, center_y) in &divider_zones {
-        let div_id = ui.scope_id().with(("overlay-group-divider", first));
-        let resp = ui.interact(*zone, div_id, egui::Sense::click_and_drag());
+        let handle_id = area.with(("group-resize", Some(first)));
+        let resp = ui.interact(*zone, handle_id, egui::Sense::drag());
 
         let is_active = resp.dragged() || resp.is_pointer_button_down_on();
         let is_hovered = resp.hovered();
@@ -912,10 +913,15 @@ fn show_layout(app: &mut PhotocraftApp, ui: &mut egui::Ui, dock_only: bool) {
                 .reduce(f32::min)
                 .map(|top| center_y - top);
             if let Some(h) = current_h {
-                let new_h = (h + resp.drag_delta().y).max(60.0);
+                let total_delta = ui.input(|i| i.pointer.interact_pos()).map_or(resp.drag_delta().y, |curr| curr.y - *center_y);
+                let new_h = (h + total_delta).max(60.0);
                 actions.push(Action::ResizeGroup { panel: first.clone(), height: Some(new_h) });
+                divider_resized = true;
             }
         }
+    }
+    if divider_resized {
+        pin_group_heights(ui.ctx(), &layout, &mut actions);
     }
     for action in actions {
         let result = match action {
@@ -1727,4 +1733,18 @@ fn panel_active(layout: &Layout<String>, panel: &str) -> bool {
         .flat_map(tree_groups)
         .find(|group| group.panels.iter().any(|id| id == panel))
         .is_some_and(|group| group.panels.get(group.active).is_some_and(|id| id == panel))
+}
+
+/// The expanded touch hit-rects of all panel docking group dividers for touch gesture routing.
+pub fn dock_divider_rects(ctx: &egui::Context) -> Vec<egui::Rect> {
+    craft_ui::docking::DockArea::<String>::hit_rects(ctx, area_id())
+        .into_iter()
+        .filter_map(|(hit, r)| {
+            if let craft_ui::docking::Hit::Divider(craft_ui::docking::Divider::Group(_)) = hit {
+                Some(egui::Rect::from_x_y_ranges(r.x_range(), (r.center().y - 14.0)..=(r.center().y + 14.0)))
+            } else {
+                None
+            }
+        })
+        .collect()
 }

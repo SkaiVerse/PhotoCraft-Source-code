@@ -594,7 +594,56 @@ pub fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 let _ = crate::menus::invoke(app, &ctx, "edit.redo", json!({}));
             }
             if icons::button_with_icon_size_tip(ui, "trash", btn_size, (btn_size * 0.55).round(), false, tl!("Delete  (⌫)"), tool_tips).clicked() {
-                let _ = crate::menus::invoke(app, &ctx, "edit.clear", json!({}));
+                // Delete active selection, vector anchors/path, or active layer (matching Backspace/Delete shortcut)
+                let vector_deleted = if let Some((target, cmd, mut params)) = crate::vector_ui::delete_key_deletes_anchor(app)
+                    .map(|(target, [s, k])| (target, "path.deleteAnchor", json!({"subpath": s, "knot": k, "segments": true})))
+                    .or_else(|| {
+                        crate::vector_ui::delete_key_deletes_segment(app).map(|(target, [s, k])| (target, "path.deleteSegment", json!({"subpath": s, "knot": k})))
+                    })
+                {
+                    if let (Some(p), Some(t)) = (params.as_object_mut(), target.params(app).as_object()) {
+                        p.extend(t.clone());
+                    }
+                    match app.run(cmd, params) {
+                        Ok(_) => app.ui.direct_selection = crate::direct_select::DirectSelection::default(),
+                        Err(e) => {
+                            app.ui.status = e;
+                            app.ui.status_error = true;
+                        }
+                    }
+                    true
+                } else if let Some((cmd, params)) = crate::vector_ui::delete_key_deletes_path(app) {
+                    if let Err(e) = app.run(cmd, params) {
+                        app.ui.status = e;
+                        app.ui.status_error = true;
+                    }
+                    true
+                } else {
+                    false
+                };
+
+                if !vector_deleted {
+                    let cmd = crate::shortcut_dispatch::delete_key_command(app, "edit.clear".into());
+                    let _ = crate::menus::invoke(app, &ctx, &cmd, json!({}));
+                }
+
+                // Also inject Backspace event into egui so focused text edits or modal tools receive it
+                ui.ctx().input_mut(|i| {
+                    i.events.push(egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        physical_key: Some(egui::Key::Backspace),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    i.events.push(egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        physical_key: Some(egui::Key::Backspace),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                });
             }
         });
     });

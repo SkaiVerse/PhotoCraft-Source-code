@@ -322,6 +322,7 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 if empty.height() > 0.0 {
                     let response = ui.interact(empty, ui.scope_id().with("layers-empty-space"), Sense::click());
                     if response.clicked() && !selection.is_empty() {
+                        ui.ctx().data_mut(|d| d.remove::<Vec<u64>>(crate::layer_row_ui::swipe_select_key()));
                         actions.push(("select.deselectLayers".into(), json!({})));
                     }
                     // A right-click there opens the thumbnail size and clipping choices (#11404).

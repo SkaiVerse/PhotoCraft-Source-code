@@ -250,7 +250,11 @@ pub(super) fn layer_row(
     if resp.hovered() {
         app.hover_layer = Some(l.id);
     }
-    paint_row_background(&painter, &t, l, rect, selected, is_hovered);
+    let is_swipe_sel = ctx.data(|d| d.get_temp::<Vec<u64>>(crate::layer_row_ui::swipe_select_key())).is_some_and(|s| s.contains(&l.id.0));
+    paint_row_background(&painter, &t, l, rect, selected, row.multi || is_swipe_sel, is_hovered);
+    if ctx.data(|d| d.get_temp::<u64>(egui::Id::unique("layer-drag"))).is_some_and(|id| id == l.id.0) {
+        painter.rect_stroke(rect, if t.pro { 0.0 } else { t.radius }, Stroke::new(2.0, Color32::from_rgb(30, 145, 255)), StrokeKind::Inside);
+    }
     let eye_resp = eye_column(app, ui, l, row, rect, actions);
     let (mut x, ts) = triangle_x_and_thumb_size(l, depth, rect, base);
     let toggled = crate::layer_tree_ui::disclosure(ui, rect, &mut x, l, actions);
@@ -367,8 +371,13 @@ fn eye_cell(rect: Rect) -> Rect {
 }
 
 /// The row's fill (selection / hover), the label colour behind the eye column and the pro dividers.
-fn paint_row_background(painter: &egui::Painter, t: &Tokens, l: &Layer, rect: Rect, selected: bool, is_hovered: bool) {
-    if t.pro {
+fn paint_row_background(painter: &egui::Painter, t: &Tokens, l: &Layer, rect: Rect, selected: bool, multi: bool, is_hovered: bool) {
+    if selected && multi {
+        let blue_tint = Color32::from_rgba_unmultiplied(24, 110, 240, 160);
+        painter.rect_filled(rect, if t.pro { 0.0 } else { t.radius }, blue_tint);
+        let bar = Rect::from_min_max(rect.left_top(), pos2(rect.left() + 4.0, rect.bottom()));
+        painter.rect_filled(bar, 0.0, Color32::from_rgb(30, 145, 255));
+    } else if t.pro {
         if selected {
             painter.rect_filled(rect, 0.0, t.row_selected);
         } else if is_hovered {
@@ -509,6 +518,9 @@ fn select_row_on_click(app: &mut PhotocraftApp, ui: &egui::Ui, rc: &RowCtx<'_>, 
     // ⌘-click on the Background thumbnail stands in for the plain click (there is no
     // transparency to load): it selects the Background alone, not toggled into the set.
     let mode = if m.command && on_thumb && doc.is_background(l.id) { "replace" } else { select_mode(m) };
+    if mode == "replace" {
+        ctx.data_mut(|d| d.remove::<Vec<u64>>(crate::layer_row_ui::swipe_select_key()));
+    }
     actions.push(("layer.select".into(), json!({"layer": l.id.0, "mode": mode})));
     crate::smart_ui::deselect(ctx, doc.id);
     // A thumbnail explicitly selects content or a mask. Selecting an adjustment/fill row

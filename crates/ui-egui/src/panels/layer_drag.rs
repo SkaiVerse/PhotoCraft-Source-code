@@ -175,15 +175,20 @@ pub(super) fn layer_drag_and_drop(
         return;
     }
     let painter = ui.painter();
+    let drop_color = egui::Color32::from_rgb(30, 145, 255);
     match position {
         "into" => {
-            painter.rect_stroke(rect.shrink(1.0), t.radius_sm, Stroke::new(2.0, t.accent), StrokeKind::Inside);
+            painter.rect_stroke(rect.shrink(1.0), t.radius_sm, Stroke::new(2.5, drop_color), StrokeKind::Inside);
         }
         "above" => {
-            painter.line_segment([rect.left_top(), rect.right_top()], Stroke::new(2.0, t.accent));
+            painter.line_segment([rect.left_top(), rect.right_top()], Stroke::new(2.5, drop_color));
+            painter.circle_filled(rect.left_top(), 3.5, drop_color);
+            painter.circle_filled(rect.right_top(), 3.5, drop_color);
         }
         _ => {
-            painter.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(2.0, t.accent));
+            painter.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(2.5, drop_color));
+            painter.circle_filled(rect.left_bottom(), 3.5, drop_color);
+            painter.circle_filled(rect.right_bottom(), 3.5, drop_color);
         }
     }
     if copy && let Some(o) = payload.as_object_mut() {
@@ -220,9 +225,11 @@ pub(super) fn layer_drop_zone(
     if !zone.contains(p) {
         return;
     }
-    let t = Tokens::get(ctx);
+    let drop_color = egui::Color32::from_rgb(30, 145, 255);
     let line = if position == "above" { [target.1.left_top(), target.1.right_top()] } else { [target.1.left_bottom(), target.1.right_bottom()] };
-    ui.painter().line_segment(line, Stroke::new(2.0, t.accent));
+    ui.painter().line_segment(line, Stroke::new(2.5, drop_color));
+    ui.painter().circle_filled(line[0], 3.5, drop_color);
+    ui.painter().circle_filled(line[1], 3.5, drop_color);
     let mut payload = layer_drop_payload(dragged, target.0, position, &selected);
     if ctx.input(|i| i.modifiers.alt)
         && let Some(o) = payload.as_object_mut()

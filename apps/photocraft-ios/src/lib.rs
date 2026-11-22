@@ -500,7 +500,8 @@ fn touch_ui(
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         for (i, label) in ["Cmd", "Shift", "Opt", "Ctrl"].iter().enumerate() {
-                            if ui.add_sized([62.0, 44.0], egui::Button::new(*label).selected(st.sticky[i])).clicked() {
+                            let resp = ui.add_sized([62.0, 44.0], egui::Button::new(*label).selected(st.sticky[i]));
+                            if resp.clicked() || resp.secondary_clicked() {
                                 st.sticky[i] = !st.sticky[i];
                             }
                         }
@@ -524,8 +525,10 @@ fn touch_ui(
                     });
                 });
             });
-        st.rects.push(panel.response.rect);
+        st.rects.push(panel.response.rect.expand(14.0));
     }
+    // Also include dock divider rects so touches on splitters are recognized as host handles
+    st.rects.extend(photocraft_ui_egui::dock_divider_rects(ctx));
 }
 
 struct Host {
@@ -571,6 +574,13 @@ enum GMode {
     Pan,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct LayerRowTouch {
+    layer: u64,
+    row: egui::Rect,
+    is_thumb: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Gesture {
     start: (f32, f32),
@@ -582,6 +592,8 @@ struct Gesture {
     on_canvas: bool,
     /// Started on one of the host's own buttons (assist button, undo column): always a plain click or drag.
     host_ui: bool,
+    /// Touched on a layer row in the Layers panel: tracks reorder pickup, swipe-select, and context menu gestures.
+    layer_touch: Option<LayerRowTouch>,
     /// A drag on a panel or menu that is pressed like a mouse but turns into scrolling if the app
     /// does not pick it up as a drag of anything (a slider, a splitter).
     adaptive: bool,
@@ -769,7 +781,8 @@ impl Host {
     /// A click whose press and release land in different frames, so the app sees a real click.
     fn click(&mut self, x: f32, y: f32, button: egui::PointerButton, keep_pointer: bool) {
         let pos = self.pt(x, y);
-        let m = self.modifiers;
+        let host_ui = self.touch.rects.iter().any(|r| r.contains(pos));
+        let m = if host_ui { egui::Modifiers::NONE } else { self.modifiers };
         self.push(egui::Event::PointerMoved(pos));
         self.push(egui::Event::PointerButton { pos, button, pressed: true, modifiers: m });
         self.post(1, egui::Event::PointerButton { pos, button, pressed: false, modifiers: m });
@@ -794,12 +807,36 @@ impl Host {
         let p = self.pt(x, y);
         let host_ui = self.touch.rects.iter().any(|r| r.contains(p));
         let on_canvas = !host_ui && self.on_canvas(x, y);
+        let layer_touch = if !on_canvas && !host_ui {
+            photocraft_ui_egui::layer_row_ui::recorded(&self.ctx)
+                .into_iter()
+                .find(|r| r.row.contains(p))
+                .map(|r| LayerRowTouch {
+                    layer: r.layer,
+                    row: r.row,
+                    is_thumb: r.thumbnail.is_some_and(|th| th.expand(4.0).contains(p)),
+                })
+        } else {
+            None
+        };
         // Let the app see what is under the finger now, so by the time it moves we know if it is
         // a handle that can be dragged (panel edge, splitter) rather than something to scroll.
         self.push(egui::Event::PointerMoved(p));
-        self.gesture = Some(Gesture { start: (x, y), last: (x, y), t0: Instant::now(), mode: GMode::Pending, pen, consumed: false, on_canvas, host_ui, adaptive: false, since: Instant::now() });
-        // Wake up in time to notice a press-and-hold (that opens menus and tool trays).
-        wake_at(&self.deadline, Instant::now() + Duration::from_millis(480));
+        self.gesture = Some(Gesture {
+            start: (x, y),
+            last: (x, y),
+            t0: Instant::now(),
+            mode: GMode::Pending,
+            pen,
+            consumed: false,
+            on_canvas,
+            host_ui,
+            layer_touch,
+            adaptive: false,
+            since: Instant::now(),
+        });
+        // Wake up in time to notice a press-and-hold (layer pickup at 350ms, menus at 450ms).
+        wake_at(&self.deadline, Instant::now() + Duration::from_millis(360));
     }
 
     fn gesture_move(&mut self, x: f32, y: f32) {
@@ -813,6 +850,42 @@ impl Host {
                 // A little drag is needed first: panels, bars and menus never scroll the moment they are touched.
                 let slop2 = if g.on_canvas || g.host_ui { 64.0 } else { 144.0 };
                 if dx * dx + dy * dy <= slop2 {
+                    return;
+                }
+                if let Some(lt) = g.layer_touch && !lt.is_thumb {
+                    // Moving before 350ms pickup: check for horizontal swipe gestures
+                    if dx.abs() > dy.abs() * 1.1 && dx.abs() >= 24.0 {
+                        g.consumed = true;
+                        g.mode = GMode::Scroll;
+                        self.gesture = Some(g);
+                        if dx < -24.0 {
+                            // Swipe Left -> Multi-select layer (toggle into multi-selection)
+                            self.ctx.data_mut(|d| {
+                                let list = d.get_temp_mut_or_default::<Vec<u64>>(photocraft_ui_egui::layer_row_ui::swipe_select_key());
+                                if let Some(pos) = list.iter().position(|&id| id == lt.layer) {
+                                    list.remove(pos);
+                                } else {
+                                    list.push(lt.layer);
+                                }
+                            });
+                            let _ = self.app.run("layer.select", serde_json::json!({
+                                "layer": lt.layer,
+                                "mode": "toggle"
+                            }));
+                            self.ctx.request_repaint();
+                        } else {
+                            // Swipe Right -> Layer Context Menu
+                            self.click(sx, sy, egui::PointerButton::Secondary, true);
+                            self.ctx.request_repaint();
+                        }
+                        return;
+                    }
+                    // Vertical drag on layer row without holding: normal panel scroll!
+                    g.mode = GMode::Scroll;
+                    let cp = self.pt(x, y);
+                    self.push(egui::Event::PointerMoved(cp));
+                    self.wheel(dx, dy);
+                    self.gesture = Some(g);
                     return;
                 }
                 use egui::CursorIcon as C;
@@ -831,7 +904,8 @@ impl Host {
                     g.adaptive = !g.host_ui && !handle && !g.on_canvas;
                     let sp = self.pt(sx, sy);
                     let cp = self.pt(x, y);
-                    let m = self.modifiers;
+                    let host_ui = g.host_ui || self.touch.rects.iter().any(|r| r.contains(sp));
+                    let m = if host_ui { egui::Modifiers::NONE } else { self.modifiers };
                     self.push(egui::Event::PointerMoved(sp));
                     self.push(egui::Event::PointerButton { pos: sp, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
                     self.push(egui::Event::PointerMoved(cp));
@@ -863,14 +937,15 @@ impl Host {
             GMode::Pending => {
                 let quick = g.t0.elapsed() < Duration::from_millis(500);
                 // A quick tap clicks. A tap on the picture with a finger does nothing: fingers
-                // never select, move or deselect on the canvas.
-                if !cancelled && !g.consumed && quick && !(g.on_canvas && !g.pen) {
+                // never select, move or deselect on the canvas. Host UI always receives clicks.
+                if !cancelled && !g.consumed && quick && (!g.on_canvas || g.pen || g.host_ui) {
                     self.click(g.start.0, g.start.1, egui::PointerButton::Primary, false);
                 }
             }
             GMode::Pointer => {
                 let pos = self.pt(x, y);
-                let m = self.modifiers;
+                let host_ui = g.host_ui || self.touch.rects.iter().any(|r| r.contains(pos));
+                let m = if host_ui { egui::Modifiers::NONE } else { self.modifiers };
                 self.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
                 self.post(1, egui::Event::PointerGone);
             }
@@ -946,17 +1021,40 @@ impl Host {
         raw.focused = self.focused;
         raw.system_theme = Some(if self.dark { egui::Theme::Dark } else { egui::Theme::Light });
         raw.max_texture_side = Some(self.rs.device.limits().max_texture_dimension_2d as usize);
-        // A press that is held still opens the context menu / tool tray (a right click).
+        // A press that is held still opens the context menu / tool tray (a right click),
+        // or picks up a layer row for reordering / moving.
         if let Some(mut g) = self.gesture
             && g.mode == GMode::Pending
             && !g.consumed
             && !g.host_ui
-            && g.t0.elapsed() >= Duration::from_millis(450)
+            && g.t0.elapsed() >= Duration::from_millis(350)
         {
-            g.consumed = true;
-            self.gesture = Some(g);
-            note("press and hold: right click");
-            self.click(g.start.0, g.start.1, egui::PointerButton::Secondary, true);
+            if let Some(lt) = g.layer_touch {
+                if lt.is_thumb {
+                    if g.t0.elapsed() >= Duration::from_millis(450) {
+                        g.consumed = true;
+                        self.gesture = Some(g);
+                        note("press and hold on thumbnail: thumbnail menu");
+                        self.click(g.start.0, g.start.1, egui::PointerButton::Secondary, true);
+                    }
+                } else {
+                    // Press & Hold on layer row body: PICK UP FOR REORDER / MOVE!
+                    g.mode = GMode::Pointer;
+                    g.adaptive = false;
+                    g.consumed = false;
+                    self.gesture = Some(g);
+                    let sp = self.pt(g.start.0, g.start.1);
+                    self.ctx.data_mut(|d| d.insert_temp(egui::Id::unique("layer-drag"), lt.layer));
+                    self.push(egui::Event::PointerMoved(sp));
+                    self.push(egui::Event::PointerButton { pos: sp, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+                    self.ctx.request_repaint();
+                }
+            } else if g.t0.elapsed() >= Duration::from_millis(450) {
+                g.consumed = true;
+                self.gesture = Some(g);
+                note("press and hold: right click");
+                self.click(g.start.0, g.start.1, egui::PointerButton::Secondary, true);
+            }
         }
         let mut due = Vec::new();
         self.posts.retain_mut(|(n, e)| {
@@ -1354,6 +1452,17 @@ pub unsafe extern "C" fn pc_finger(h: *mut c_void, phase: c_int, x: f32, y: f32,
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_long_press(h: *mut c_void, x: f32, y: f32) {
     if let Some(h) = unsafe { host(h) } {
+        let p = h.pt(x, y);
+        let on_layer_row = photocraft_ui_egui::layer_row_ui::recorded(&h.ctx)
+            .into_iter()
+            .find(|r| r.row.contains(p));
+        if let Some(lr) = on_layer_row {
+            let is_thumb = lr.thumbnail.is_some_and(|th| th.expand(4.0).contains(p));
+            if !is_thumb {
+                // On layer row body, long-press is strictly reserved for reordering, not context menu!
+                return;
+            }
+        }
         if h.pen_down {
             h.pen_down = false;
             let pos = h.pt(x, y);

@@ -57,6 +57,7 @@ pub mod screenshot;
 pub mod state;
 pub mod texel_guard;
 pub mod theme;
+pub use panels::panel_docking::dock_divider_rects;
 pub use titlebar::{Caption, CaptionFamily, CaptionIcon, CaptionIcons, CaptionStyle, MIN_WINDOW_SIZE, RenderIconFn};
 pub mod tool_memory;
 pub mod updates_ui;
