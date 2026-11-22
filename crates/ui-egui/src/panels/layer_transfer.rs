@@ -250,22 +250,49 @@ pub fn ghost(ctx: &egui::Context, p: egui::Pos2, label: &str) {
     ghost_with_count(ctx, p, label, 1);
 }
 
-/// Dragged layer preview with optional multi-selection count badge (Affinity Designer style).
+/// Dragged layer preview with optional multi-selection count badge (Affinity style floating preview).
 pub fn ghost_with_count(ctx: &egui::Context, p: egui::Pos2, label: &str, count: usize) {
-    let t = crate::theme::Tokens::get(ctx);
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("layer-transfer-ghost")));
-    let g = painter.layout_no_wrap(label.to_string(), egui::FontId::proportional(12.0), t.text);
-    let r = egui::Rect::from_min_size(p + egui::vec2(16.0, -10.0), g.size() + egui::vec2(18.0, 8.0));
-    painter.rect_filled(r, t.radius_sm, t.card.gamma_multiply(0.95));
-    painter.rect_stroke(r, t.radius_sm, egui::Stroke::new(1.2, egui::Color32::from_rgb(30, 145, 255)), egui::StrokeKind::Inside);
-    painter.galley(r.min + egui::vec2(9.0, 4.0), g, t.text);
+    let card_w = 210.0_f32;
+    let card_h = 32.0_f32;
+    let card_pos = p + egui::vec2(16.0, -card_h / 2.0);
+
+    // Stacked preview behind it if dragging multiple layers
     if count > 1 {
-        // Red circular count badge like Affinity Designer
-        let badge_center = r.left_top() + egui::vec2(2.0, 2.0);
+        for i in (1..=2.min(count - 1)).rev() {
+            let offset = egui::vec2(i as f32 * 4.0, i as f32 * 4.0);
+            let back_rect = egui::Rect::from_min_size(card_pos + offset, egui::vec2(card_w, card_h));
+            painter.rect_filled(back_rect, 8.0, egui::Color32::from_rgba_unmultiplied(22, 24, 30, 160));
+            painter.rect_stroke(back_rect, 8.0, egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 25)), egui::StrokeKind::Inside);
+        }
+    }
+
+    let front_rect = egui::Rect::from_min_size(card_pos, egui::vec2(card_w, card_h));
+
+    // Subtle layered drop shadow
+    painter.rect_filled(front_rect.translate(egui::vec2(0.0, 4.0)).expand(3.0), 10.0, egui::Color32::from_black_alpha(35));
+    painter.rect_filled(front_rect.translate(egui::vec2(0.0, 2.0)).expand(1.0), 9.0, egui::Color32::from_black_alpha(60));
+
+    // Semi-translucent card body (Affinity floating row style)
+    let fill = egui::Color32::from_rgba_unmultiplied(32, 36, 44, 230);
+    painter.rect_filled(front_rect, 8.0, fill);
+    painter.rect_stroke(front_rect, 8.0, egui::Stroke::new(1.2, egui::Color32::from_rgb(30, 145, 255)), egui::StrokeKind::Inside);
+
+    // Layer icon on the left
+    let icon_rect = egui::Rect::from_min_size(front_rect.left_top() + egui::vec2(8.0, 7.0), egui::vec2(18.0, 18.0));
+    painter.rect_filled(icon_rect, 3.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30));
+
+    // Layer name
+    let g = painter.layout_no_wrap(label.to_string(), egui::FontId::proportional(12.5), egui::Color32::WHITE);
+    painter.galley(front_rect.left_top() + egui::vec2(32.0, (card_h - g.size().y) / 2.0), g, egui::Color32::WHITE);
+
+    // Multi-layer badge if count > 1
+    if count > 1 {
+        let badge_center = front_rect.right_top() + egui::vec2(-14.0, 14.0);
         let badge_radius = 8.5;
-        painter.circle_filled(badge_center, badge_radius, egui::Color32::from_rgb(225, 45, 45));
+        painter.circle_filled(badge_center, badge_radius, egui::Color32::from_rgb(30, 145, 255));
         painter.circle_stroke(badge_center, badge_radius, egui::Stroke::new(1.0, egui::Color32::WHITE));
-        let count_text = painter.layout_no_wrap(count.to_string(), egui::FontId::proportional(10.0), egui::Color32::WHITE);
+        let count_text = painter.layout_no_wrap(count.to_string(), egui::FontId::proportional(10.5), egui::Color32::WHITE);
         painter.galley(badge_center - count_text.size() / 2.0, count_text, egui::Color32::WHITE);
     }
 }

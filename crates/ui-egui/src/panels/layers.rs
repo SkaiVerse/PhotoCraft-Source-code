@@ -528,6 +528,8 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             actions.push(("layer.linkLayers".into(), json!({})));
         }
     });
+    let panel_left = ui.clip_rect().left();
+    render_layer_popover(app, &ui.ctx().clone(), ui, panel_left, &mut actions);
     for (id, p) in actions {
         // A row click commits even when it selects the layer already being edited (#5584).
         // Finish before selection changes so the existing type session keeps its own target.
@@ -622,3 +624,89 @@ pub(crate) fn fx_button(ui: &mut egui::Ui, size: f32, tip: &str) -> egui::Respon
 pub(super) fn channels(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     crate::channels_panel::show(app, ui);
 }
+
+/// Floating context menu popover anchored to the left edge of the Layers panel (Affinity style).
+pub(crate) fn render_layer_popover(
+    app: &PhotocraftApp,
+    ctx: &egui::Context,
+    _ui: &mut egui::Ui,
+    panel_left: f32,
+    actions: &mut Vec<(String, Value)>,
+) {
+    let Some(popover) = crate::layer_row_ui::layer_popover_state(ctx) else { return };
+    let Some(s) = app.session.active() else {
+        crate::layer_row_ui::close_layer_popover(ctx);
+        return;
+    };
+    let Some(l) = s.doc.layer(photocraft_doc::LayerId(popover.layer)) else {
+        crate::layer_row_ui::close_layer_popover(ctx);
+        return;
+    };
+
+    let now = ctx.input(|i| i.time);
+    let elapsed = (now - popover.opened_at) as f32;
+    let anim_dur = 0.20_f32;
+    if elapsed < anim_dur {
+        ctx.request_repaint();
+    }
+    let t = (elapsed / anim_dur).clamp(0.0, 1.0);
+    // Smooth ease-out animation
+    let ease_out = 1.0 - (1.0 - t) * (1.0 - t);
+    let alpha = ease_out;
+
+    let popover_w = 210.0_f32;
+    let target_x = (panel_left - popover_w - 8.0).max(8.0);
+    let row_cy = popover.row_rect.center().y;
+    let screen_h = ctx.input(|i| i.viewport_rect()).height();
+    let est_h = 320.0_f32;
+    let target_y = (row_cy - est_h / 2.0).clamp(32.0, (screen_h - est_h - 16.0).max(32.0));
+    let popover_pos = pos2(target_x, target_y);
+
+    let popover_area = egui::Area::new(egui::Id::unique("layer-context-popover"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(popover_pos);
+
+    let mut closed = false;
+    let prev_actions_len = actions.len();
+
+    popover_area.show(ctx, |ui| {
+        let frame = egui::Frame::NONE
+            .fill(egui::Color32::from_rgba_unmultiplied(22, 25, 32, (246.0 * alpha) as u8))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (32.0 * alpha) as u8)))
+            .corner_radius(13.0)
+            .inner_margin(egui::Margin::symmetric(8, 8));
+
+        let resp = frame.show(ui, |ui| {
+            ui.set_width(popover_w);
+            let mut multi = s.selected_layers().len() > 1 && s.selected_layers().contains(&l.id);
+            if let Some(swipe_list) = ctx.data(|d| d.get_temp::<Vec<u64>>(crate::layer_row_ui::swipe_select_key())) {
+                if swipe_list.len() > 1 && swipe_list.contains(&l.id.0) {
+                    multi = true;
+                }
+            }
+            if crate::layer_menu_ui::show(app, ui, l, multi, actions) {
+                if let Some(action) = crate::layer_row_ui::start_rename(ctx, l.id.0, &l.name) {
+                    actions.push(action);
+                }
+            }
+        });
+
+        // Layered subtle drop shadow
+        let painter = ui.painter();
+        painter.rect_filled(resp.response.rect.translate(vec2(0.0, 5.0)).expand(4.0), 15.0, egui::Color32::from_black_alpha((50.0 * alpha) as u8));
+
+        // Tap outside to dismiss
+        if elapsed > 0.08 && ctx.input(|i| i.pointer.any_pressed()) {
+            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos())) {
+                if !resp.response.rect.contains(pos) {
+                    closed = true;
+                }
+            }
+        }
+    });
+
+    if closed || ctx.input(|i| i.key_pressed(egui::Key::Escape)) || actions.len() > prev_actions_len {
+        crate::layer_row_ui::close_layer_popover(ctx);
+    }
+}
+

@@ -245,40 +245,46 @@ pub(super) fn layer_row(
         }
         return rect;
     }
-    let painter = ui.painter_at(rect.expand(1.0));
+    let live_nudge = ctx.data(|d| d.get_temp::<f32>(egui::Id::unique(("layer-live-nudge", l.id.0)))).unwrap_or(0.0);
+    let snap_offset = crate::layer_row_ui::row_swipe_offset(ctx, l.id.0);
+    let shift_x = live_nudge + snap_offset;
+    let draw_rect = rect.translate(vec2(shift_x, 0.0));
+    let painter = ui.painter_at(draw_rect.expand(1.0));
     let is_hovered = resp.hovered() || app.canvas_hover_layer == Some(l.id);
     if resp.hovered() {
         app.hover_layer = Some(l.id);
     }
     let is_swipe_sel = ctx.data(|d| d.get_temp::<Vec<u64>>(crate::layer_row_ui::swipe_select_key())).is_some_and(|s| s.contains(&l.id.0));
-    paint_row_background(&painter, &t, l, rect, selected || is_swipe_sel, row.multi || is_swipe_sel, is_hovered);
+    let is_blue = selected || is_swipe_sel;
+    let blue_fade = ctx.animate_bool_with_time(egui::Id::unique(("layer-blue-fade", l.id.0)), is_blue, 0.20);
+    paint_row_background(&painter, &t, l, draw_rect, is_blue, row.multi || is_swipe_sel, is_hovered, blue_fade);
     if ctx.data(|d| d.get_temp::<u64>(egui::Id::unique("layer-drag"))).is_some_and(|id| id == l.id.0) {
-        painter.rect_stroke(rect, if t.pro { 0.0 } else { t.radius }, Stroke::new(2.0, Color32::from_rgb(30, 145, 255)), StrokeKind::Inside);
+        painter.rect_filled(draw_rect, if t.pro { 0.0 } else { t.radius }, Color32::from_rgba_unmultiplied(0, 0, 0, 110));
     }
-    let eye_resp = eye_column(app, ui, l, row, rect, actions);
-    let (mut x, ts) = triangle_x_and_thumb_size(l, depth, rect, base);
-    let toggled = crate::layer_tree_ui::disclosure(ui, rect, &mut x, l, actions);
+    let eye_resp = eye_column(app, ui, l, row, draw_rect, actions);
+    let (mut x, ts) = triangle_x_and_thumb_size(l, depth, draw_rect, base);
+    let toggled = crate::layer_tree_ui::disclosure(ui, draw_rect, &mut x, l, actions);
     if l.clipped {
-        paint_clipping_indicator(&painter, pos2(x, rect.center().y), t.text_faint);
+        paint_clipping_indicator(&painter, pos2(x, draw_rect.center().y), t.text_faint);
         x += 12.0;
     }
-    let thumb = Rect::from_min_size(pos2(x, rect.center().y - ts / 2.0), vec2(ts, ts));
+    let thumb = Rect::from_min_size(pos2(x, draw_rect.center().y - ts / 2.0), vec2(ts, ts));
     if ts > 0.0 {
         draw_layer_thumb(app, ctx, ui, doc, l, thumb, row.primary);
         x += ts + 6.0;
     }
     let mut frame_clicked = false;
     if l.frame.is_some() && ts > 0.0 {
-        frame_clicked = frame_content_thumb(app, ctx, ui, &painter, (doc, l, rect), (thumb, x, ts, selected), &resp, actions);
+        frame_clicked = frame_content_thumb(app, ctx, ui, &painter, (doc, l, draw_rect), (thumb, x, ts, selected), &resp, actions);
         x += ts + 6.0;
     }
     // With thumbnails disabled the labels and disclosure controls remain interactive.
-    let masks = if ts > 0.0 { crate::mask_thumbs_ui::paint(app, ctx, ui, &painter, doc, l, &mut x, rect.center().y, ts, actions) } else { Default::default() };
-    let rc = RowCtx { l, doc, row, rect, ts, thumb, resp: &resp, masks: &masks };
+    let masks = if ts > 0.0 { crate::mask_thumbs_ui::paint(app, ctx, ui, &painter, doc, l, &mut x, draw_rect.center().y, ts, actions) } else { Default::default() };
+    let rc = RowCtx { l, doc, row, rect: draw_rect, ts, thumb, resp: &resp, masks: &masks };
     paint_target_brackets(app, &painter, &t, &rc);
     // Right-hand indicators first; the name gets what is left and ends in "…" (#144).
     let fx_open = app.session.active().is_none_or(|d| !d.fx_collapsed.contains(&l.id));
-    let (name_right, indicators, fx_toggled) = crate::layer_row_ui::indicators(ui, &painter, rect, x, l, fx_open, actions);
+    let (name_right, indicators, fx_toggled) = crate::layer_row_ui::indicators(ui, &painter, draw_rect, x, l, fx_open, actions);
     // Dragging the fx badge drags all the layer's effects, not the layer (Photoshop). Like the eye,
     // it takes the drag from the row; clicks still reach the row.
     if let Some(&(_, badge)) = indicators.iter().find(|(k, _)| *k == crate::layer_row_ui::Indicator::Fx)
@@ -371,10 +377,26 @@ fn eye_cell(rect: Rect) -> Rect {
 }
 
 /// The row's fill (selection / hover), the label colour behind the eye column and the pro dividers.
-fn paint_row_background(painter: &egui::Painter, t: &Tokens, l: &Layer, rect: Rect, selected: bool, _multi: bool, is_hovered: bool) {
-    if selected {
-        let blue = Color32::from_rgb(30, 115, 240);
-        painter.rect_filled(rect, if t.pro { 0.0 } else { t.radius }, blue);
+fn paint_row_background(painter: &egui::Painter, t: &Tokens, l: &Layer, rect: Rect, selected: bool, _multi: bool, is_hovered: bool, blue_fade: f32) {
+    let radius = if t.pro { 0.0 } else { t.radius };
+    let blue = Color32::from_rgb(28, 120, 242);
+    if blue_fade > 0.001 {
+        let base_bg = if is_hovered {
+            t.hover.gamma_multiply(0.5)
+        } else if l.artboard().is_some() {
+            t.hover.gamma_multiply(0.35)
+        } else {
+            Color32::TRANSPARENT
+        };
+        let r = (base_bg.r() as f32 * (1.0 - blue_fade) + blue.r() as f32 * blue_fade) as u8;
+        let g = (base_bg.g() as f32 * (1.0 - blue_fade) + blue.g() as f32 * blue_fade) as u8;
+        let b = (base_bg.b() as f32 * (1.0 - blue_fade) + blue.b() as f32 * blue_fade) as u8;
+        let a = (base_bg.a() as f32 * (1.0 - blue_fade) + 255.0 * blue_fade) as u8;
+        painter.rect_filled(rect, radius, Color32::from_rgba_premultiplied(r, g, b, a));
+        let bar = Rect::from_min_max(rect.left_top(), pos2(rect.left() + 4.0, rect.bottom()));
+        painter.rect_filled(bar, 0.0, Color32::from_rgba_unmultiplied(80, 160, 255, (255.0 * blue_fade) as u8));
+    } else if selected {
+        painter.rect_filled(rect, radius, blue);
         let bar = Rect::from_min_max(rect.left_top(), pos2(rect.left() + 4.0, rect.bottom()));
         painter.rect_filled(bar, 0.0, Color32::from_rgb(80, 160, 255));
     } else if t.pro {
@@ -386,7 +408,7 @@ fn paint_row_background(painter: &egui::Painter, t: &Tokens, l: &Layer, rect: Re
         painter.rect_filled(rect, t.radius, t.hover.gamma_multiply(0.5));
         painter.rect_filled(rect, t.radius, t.accent.gamma_multiply(0.12));
     }
-    if l.artboard().is_some() && !selected && !is_hovered {
+    if l.artboard().is_some() && !selected && blue_fade <= 0.001 && !is_hovered {
         // A faint band behind a board's row, so where each board starts stands out in a long
         // list. Under the label colour and the dividers, which keep their look on every row.
         painter.rect_filled(rect, if t.pro { 0.0 } else { t.radius }, t.hover.gamma_multiply(0.35));

@@ -63,9 +63,27 @@ pub(super) fn fx_trash_drop(ui: &egui::Ui, button: &egui::Response, drag: Option
 
 /// A drag from within a multi-selection moves the whole selection, not only the grabbed
 /// row. Dragging an unselected row keeps the existing single-layer behavior.
+#[allow(dead_code)]
 pub(super) fn layer_drop_payload(dragged: u64, target: LayerId, position: &str, selected: &[LayerId]) -> Value {
     if selected.len() > 1 && selected.contains(&LayerId(dragged)) {
         json!({"layers": selected.iter().map(|id| id.0).collect::<Vec<_>>(), "target": target.0, "position": position})
+    } else {
+        json!({"layer": dragged, "target": target.0, "position": position})
+    }
+}
+
+pub(super) fn layer_drop_payload_with_ctx(ctx: &egui::Context, dragged: u64, target: LayerId, position: &str, selected: &[LayerId]) -> Value {
+    let mut all_selected = selected.to_vec();
+    if let Some(swipe_list) = ctx.data(|d| d.get_temp::<Vec<u64>>(crate::layer_row_ui::swipe_select_key())) {
+        for id in swipe_list {
+            let lid = LayerId(id);
+            if !all_selected.contains(&lid) {
+                all_selected.push(lid);
+            }
+        }
+    }
+    if all_selected.len() > 1 && all_selected.contains(&LayerId(dragged)) {
+        json!({"layers": all_selected.iter().map(|id| id.0).collect::<Vec<_>>(), "target": target.0, "position": position})
     } else {
         json!({"layer": dragged, "target": target.0, "position": position})
     }
@@ -100,7 +118,7 @@ pub(super) fn layer_drag_and_drop(
         ctx.data_mut(|d| d.insert_temp(key, l.id.0));
     }
     let Some(dragged) = ctx.data(|d| d.get_temp::<u64>(key)) else { return };
-    let pointer = ctx.input(|i| i.pointer.interact_pos());
+    let pointer = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
     let released = ctx.input(|i| i.pointer.any_released());
     let copy = ctx.input(|i| i.modifiers.alt);
     if dragged == l.id.0 {
@@ -131,7 +149,7 @@ pub(super) fn layer_drag_and_drop(
             } else {
                 painter.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(2.0, t.accent));
             }
-            let mut payload = layer_drop_payload(dragged, l.id, position, &selected);
+            let mut payload = layer_drop_payload_with_ctx(ctx, dragged, l.id, position, &selected);
             if let Some(o) = payload.as_object_mut() {
                 o.insert("copy".into(), json!(true));
             }
@@ -173,25 +191,27 @@ pub(super) fn layer_drag_and_drop(
         }
         return;
     }
-    let mut payload = layer_drop_payload(dragged, l.id, position, &st.selected_layers());
+    let mut payload = layer_drop_payload_with_ctx(ctx, dragged, l.id, position, &st.selected_layers());
     if background_drop_refused(&st.doc, &payload, l.id, position, copy) {
         return;
     }
     let painter = ui.painter();
-    let drop_color = egui::Color32::from_rgb(30, 145, 255);
+    let drop_color = egui::Color32::from_rgb(0, 150, 255);
     match position {
         "into" => {
             painter.rect_stroke(rect.shrink(1.0), t.radius_sm, Stroke::new(2.5, drop_color), StrokeKind::Inside);
         }
         "above" => {
-            painter.line_segment([rect.left_top(), rect.right_top()], Stroke::new(2.5, drop_color));
-            painter.circle_filled(rect.left_top(), 3.5, drop_color);
-            painter.circle_filled(rect.right_top(), 3.5, drop_color);
+            let y = rect.top();
+            painter.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(3.0, drop_color));
+            painter.circle_filled(pos2(rect.left() + 4.0, y), 4.5, drop_color);
+            painter.circle_stroke(pos2(rect.left() + 4.0, y), 4.5, Stroke::new(1.0, egui::Color32::WHITE));
         }
         _ => {
-            painter.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(2.5, drop_color));
-            painter.circle_filled(rect.left_bottom(), 3.5, drop_color);
-            painter.circle_filled(rect.right_bottom(), 3.5, drop_color);
+            let y = rect.bottom();
+            painter.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(3.0, drop_color));
+            painter.circle_filled(pos2(rect.left() + 4.0, y), 4.5, drop_color);
+            painter.circle_stroke(pos2(rect.left() + 4.0, y), 4.5, Stroke::new(1.0, egui::Color32::WHITE));
         }
     }
     if copy && let Some(o) = payload.as_object_mut() {
@@ -224,16 +244,16 @@ pub(super) fn layer_drop_zone(
     if target.0 == LayerId(dragged) && selected.len() > 1 && selected.contains(&target.0) {
         return;
     }
-    let Some(p) = ctx.input(|i| i.pointer.interact_pos()) else { return };
+    let Some(p) = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos())) else { return };
     if !zone.contains(p) {
         return;
     }
-    let drop_color = egui::Color32::from_rgb(30, 145, 255);
+    let drop_color = egui::Color32::from_rgb(0, 150, 255);
     let line = if position == "above" { [target.1.left_top(), target.1.right_top()] } else { [target.1.left_bottom(), target.1.right_bottom()] };
-    ui.painter().line_segment(line, Stroke::new(2.5, drop_color));
-    ui.painter().circle_filled(line[0], 3.5, drop_color);
-    ui.painter().circle_filled(line[1], 3.5, drop_color);
-    let mut payload = layer_drop_payload(dragged, target.0, position, &selected);
+    ui.painter().line_segment(line, Stroke::new(3.0, drop_color));
+    ui.painter().circle_filled(pos2(line[0].x + 4.0, line[0].y), 4.5, drop_color);
+    ui.painter().circle_stroke(pos2(line[0].x + 4.0, line[0].y), 4.5, Stroke::new(1.0, egui::Color32::WHITE));
+    let mut payload = layer_drop_payload_with_ctx(ctx, dragged, target.0, position, &selected);
     if ctx.input(|i| i.modifiers.alt)
         && let Some(o) = payload.as_object_mut()
     {

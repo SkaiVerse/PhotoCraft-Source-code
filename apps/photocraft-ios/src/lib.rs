@@ -865,13 +865,18 @@ impl Host {
                         return;
                     }
                     // Horizontal swipe on layer row (Affinity style)
-                    if dx.abs() > dy.abs() * 1.0 {
-                        if dx.abs() >= 16.0 {
-                            g.consumed = true;
-                            g.mode = GMode::Scroll;
-                            self.gesture = Some(g);
-                            if dx > 0.0 {
-                                // Swipe Right -> Multi-select layer (toggle into multi-selection)
+                    if dx.abs() > dy.abs() * 0.8 {
+                        if dx > 0.0 {
+                            // Swiping right: live rubber-band nudge
+                            let nudge = (dx * 0.35).clamp(0.0, 36.0);
+                            self.ctx.data_mut(|d| d.insert_temp(egui::Id::unique(("layer-live-nudge", lt.layer)), nudge));
+                            self.ctx.request_repaint();
+
+                            if dx >= 28.0 && !g.consumed {
+                                g.consumed = true;
+                                g.mode = GMode::Scroll;
+                                self.gesture = Some(g);
+                                // Toggle multi-select
                                 self.ctx.data_mut(|d| {
                                     let list = d.get_temp_mut_or_default::<Vec<u64>>(photocraft_ui_egui::layer_row_ui::swipe_select_key());
                                     if let Some(pos) = list.iter().position(|&id| id == lt.layer) {
@@ -884,18 +889,22 @@ impl Host {
                                     "layer": lt.layer,
                                     "mode": "toggle"
                                 }));
+                                // Spring-snap back to x = 0
+                                self.ctx.data_mut(|d| d.remove::<f32>(egui::Id::unique(("layer-live-nudge", lt.layer))));
+                                photocraft_ui_egui::layer_row_ui::trigger_row_snap_back(&self.ctx, lt.layer, nudge);
                                 self.ctx.request_repaint();
-                            } else {
-                                // Swipe Left -> Layer Context Menu
-                                self.ctx.data_mut(|d| {
-                                    d.insert_temp(egui::Id::unique("open-layer-menu"), lt.layer);
-                                });
-                                self.click(sx, sy, egui::PointerButton::Secondary, true);
-                                self.ctx.request_repaint();
+                                return;
                             }
+                        } else if dx <= -28.0 && !g.consumed {
+                            // Swiping left: open floating layer context menu popover anchored to left edge of panel
+                            g.consumed = true;
+                            g.mode = GMode::Scroll;
+                            self.gesture = Some(g);
+                            photocraft_ui_egui::layer_row_ui::open_layer_popover(&self.ctx, lt.layer, lt.row);
+                            self.ctx.request_repaint();
                             return;
                         }
-                        // Predominantly horizontal swipe in progress: stay in Pending
+                        // Horizontal swipe in progress: stay in Pending
                         return;
                     }
                     // Vertical drag on layer row without holding: normal panel scroll!
@@ -964,12 +973,31 @@ impl Host {
 
     fn gesture_end(&mut self, x: f32, y: f32, cancelled: bool) {
         let Some(g) = self.gesture.take() else { return };
+        if let Some(lt) = g.layer_touch {
+            let key = egui::Id::unique(("layer-live-nudge", lt.layer));
+            let nudge = self.ctx.data(|d| d.get_temp::<f32>(key));
+            self.ctx.data_mut(|d| d.remove::<f32>(key));
+            if let Some(n) = nudge {
+                if n > 0.0 {
+                    photocraft_ui_egui::layer_row_ui::trigger_row_snap_back(&self.ctx, lt.layer, n);
+                    self.ctx.request_repaint();
+                }
+            }
+        }
         match g.mode {
             GMode::Pending => {
                 let quick = g.t0.elapsed() < Duration::from_millis(500);
                 if !cancelled && !g.consumed && quick {
                     if g.on_canvas {
                         self.ctx.data_mut(|d| d.remove::<Vec<u64>>(photocraft_ui_egui::layer_row_ui::swipe_select_key()));
+                    } else if let Some(lt) = g.layer_touch {
+                        // Tapping any single layer row clears multi-selection and selects only that tapped layer
+                        self.ctx.data_mut(|d| d.remove::<Vec<u64>>(photocraft_ui_egui::layer_row_ui::swipe_select_key()));
+                        let _ = self.app.run("layer.select", serde_json::json!({
+                            "layer": lt.layer,
+                            "mode": "replace"
+                        }));
+                        self.ctx.request_repaint();
                     }
                     self.click(g.start.0, g.start.1, egui::PointerButton::Primary, false);
                 }

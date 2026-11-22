@@ -367,6 +367,56 @@ pub fn swipe_select_key() -> egui::Id {
     egui::Id::unique("layer-swipe-selected")
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct LayerPopoverState {
+    pub layer: u64,
+    pub row_rect: Rect,
+    pub opened_at: f64,
+}
+
+pub fn open_layer_popover(ctx: &egui::Context, layer: u64, row_rect: Rect) {
+    let now = ctx.input(|i| i.time);
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("layer-popover-state"), LayerPopoverState { layer, row_rect, opened_at: now }));
+    ctx.request_repaint();
+}
+
+pub fn close_layer_popover(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<LayerPopoverState>(egui::Id::unique("layer-popover-state")));
+    ctx.request_repaint();
+}
+
+pub fn layer_popover_state(ctx: &egui::Context) -> Option<LayerPopoverState> {
+    ctx.data(|d| d.get_temp::<LayerPopoverState>(egui::Id::unique("layer-popover-state")))
+}
+
+/// Horizontal swipe offset and spring-snap animation for a layer row.
+pub fn row_swipe_offset(ctx: &egui::Context, layer_id: u64) -> f32 {
+    let key = egui::Id::unique(("layer-swipe-snap", layer_id));
+    if let Some((start_time, initial_offset)) = ctx.data(|d| d.get_temp::<(f64, f32)>(key)) {
+        let now = ctx.input(|i| i.time);
+        let elapsed = (now - start_time) as f32;
+        let duration = 0.20_f32; // ~0.2s spring animation
+        if elapsed < duration {
+            let progress = elapsed / duration;
+            let factor = (1.0 - progress) * (progress * std::f32::consts::FRAC_PI_2).cos();
+            ctx.request_repaint();
+            initial_offset * factor
+        } else {
+            ctx.data_mut(|d| d.remove::<(f64, f32)>(key));
+            0.0
+        }
+    } else {
+        0.0
+    }
+}
+
+pub fn trigger_row_snap_back(ctx: &egui::Context, layer_id: u64, current_nudge: f32) {
+    let key = egui::Id::unique(("layer-swipe-snap", layer_id));
+    let now = ctx.input(|i| i.time);
+    ctx.data_mut(|d| d.insert_temp(key, (now, current_nudge)));
+    ctx.request_repaint();
+}
+
 // ------------------------------------------------------------------ in-place rename (#314)
 
 /// The Layers panel's in-place rename. One at a time, like Photoshop: Enter, Tab or a click
