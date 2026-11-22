@@ -1817,6 +1817,25 @@ fn draw_canvas_tool_cursor(app: &mut PhotocraftApp, ui: &mut egui::Ui, input: &C
     let response = input.response;
     let tool = input.tool;
     let panning = input.panning;
+
+    let current_p = response
+        .hover_pos()
+        .or_else(|| response.interact_pointer_pos().filter(|p| response.rect.contains(*p)))
+        .or_else(|| ui.input(|i| i.pointer.latest_pos()).filter(|p| response.rect.contains(*p)));
+
+    let last_canvas_pos_id = egui::Id::unique("photocraft_last_canvas_pointer_pos");
+    if let Some(p) = current_p {
+        ctx.data_mut(|d| d.insert_temp(last_canvas_pos_id, p));
+    }
+
+    let active_p = current_p.or_else(|| {
+        if app.ui.brush_picker.is_some() && (tool.is_brushlike() || tool == Tool::QuickSelection) {
+            ctx.data(|d| d.get_temp::<Pos2>(last_canvas_pos_id)).or(Some(response.rect.center()))
+        } else {
+            None
+        }
+    });
+
     // Tool cursors (Photoshop-style).
     let guide_hover = response.hover_pos().and_then(|p| {
         let d = xf.to_doc(p);
@@ -1928,7 +1947,7 @@ fn draw_canvas_tool_cursor(app: &mut PhotocraftApp, ui: &mut egui::Ui, input: &C
             }
         };
         ui.ctx().set_cursor_icon(icon);
-    } else if let Some(p) = response.hover_pos() {
+    } else if let Some(p) = active_p {
         draw_default_tool_cursor(app, ui, input, resizing, p);
     }
 }

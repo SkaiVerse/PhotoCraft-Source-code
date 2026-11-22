@@ -479,7 +479,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         tapKey(eraserOn ? 0x08 : 0x05)
     }
 
-    /// Squeeze on the Pencil Pro: opens the floating arc tool menu.
+    /// Squeeze on the Pencil Pro: opens the floating arc tool menu (or toggles brush options if active tool is brush-like).
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
         guard squeeze.phase == .ended, let h = handle else { return }
         pcLog("pencil: squeeze")
@@ -491,13 +491,14 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         }
         let loc = (lastHover != .zero) ? lastHover : CGPoint(x: bounds.midX, y: bounds.midY)
         let optionsLoc = CGPoint(x: loc.x, y: max(80, loc.y - 120))
-        _ = pc_show_brush_options(h, Float(optionsLoc.x), Float(optionsLoc.y))
+        let brushMenuResult = pc_show_brush_options(h, Float(optionsLoc.x), Float(optionsLoc.y))
+        if brushMenuResult != 0 {
+            // Active tool is a brush/pencil/eraser/etc. - toggled brush options menu, do NOT open arc menu.
+            return
+        }
         let palette = SqueezePaletteView(centerAt: loc, in: self) { [weak self] toolId in
             guard let self = self, let h = self.handle else { return }
             toolId.withCString { pc_select_tool(h, $0) }
-            if toolId == "brush" || toolId == "eraser" {
-                _ = pc_show_brush_options(h, Float(optionsLoc.x), Float(optionsLoc.y))
-            }
             self.squeezePalette = nil
         } onDismiss: { [weak self] in
             guard let self = self else { return }

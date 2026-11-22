@@ -1535,15 +1535,22 @@ pub unsafe extern "C" fn pc_select_tool(h: *mut c_void, name: *const c_char) {
 }
 
 /// Show the quick brush options (size, picker) for the active tool at (x, y) if it supports one.
+/// Returns 1 if opened, 2 if closed (toggled off), or 0 if tool has no brush picker.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_show_brush_options(h: *mut c_void, x: f32, y: f32) -> c_int {
     if let Some(h) = unsafe { host(h) } {
         let tool = h.app.ui.tool;
         if photocraft_ui_egui::paint_mouse::has_brush_picker(tool) {
-            let p = h.pt(x, y);
-            h.app.ui.brush_picker = Some([p.x, p.y]);
-            h.wake();
-            return 1;
+            if h.app.ui.brush_picker.is_some() {
+                photocraft_ui_egui::brush_picker::close(&mut h.app.ui);
+                h.wake();
+                return 2;
+            } else {
+                let p = h.pt(x, y);
+                h.app.ui.brush_picker = Some([p.x, p.y]);
+                h.wake();
+                return 1;
+            }
         }
     }
     0
@@ -1554,7 +1561,7 @@ pub unsafe extern "C" fn pc_show_brush_options(h: *mut c_void, x: f32, y: f32) -
 pub unsafe extern "C" fn pc_close_brush_picker(h: *mut c_void) {
     if let Some(h) = unsafe { host(h) } {
         if h.app.ui.brush_picker.is_some() {
-            h.app.ui.brush_picker = None;
+            photocraft_ui_egui::brush_picker::close(&mut h.app.ui);
             h.wake();
         }
     }
