@@ -940,14 +940,10 @@ impl Host {
                     self.push(egui::Event::PointerMoved(sp));
                     self.push(egui::Event::PointerButton { pos: sp, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
                     self.push(egui::Event::PointerMoved(cp));
-                } else if g.on_canvas {
-                    // Single finger on canvas: do NOT pan! Two-finger pan handles canvas navigation.
-                    g.mode = GMode::Pan;
-                    let cp = self.pt(x, y);
-                    self.push(egui::Event::PointerMoved(cp));
                 } else {
-                    // A finger dragging up or down on a panel or menu scrolls it.
-                    g.mode = GMode::Scroll;
+                    // A finger on the picture pans it; a finger dragging up or down on a panel or
+                    // menu scrolls it.
+                    g.mode = if g.on_canvas { GMode::Pan } else { GMode::Scroll };
                     let cp = self.pt(x, y);
                     self.push(egui::Event::PointerMoved(cp));
                     self.wheel(dx, dy);
@@ -957,15 +953,10 @@ impl Host {
                 let cp = self.pt(x, y);
                 self.push(egui::Event::PointerMoved(cp));
             }
-            GMode::Scroll => {
+            GMode::Scroll | GMode::Pan => {
                 let cp = self.pt(x, y);
                 self.push(egui::Event::PointerMoved(cp));
                 self.wheel(x - last.0, y - last.1);
-            }
-            GMode::Pan => {
-                // 1 finger on canvas does NOT pan. Only 2 fingers (via pc_scroll) pan.
-                let cp = self.pt(x, y);
-                self.push(egui::Event::PointerMoved(cp));
             }
         }
         self.gesture = Some(g);

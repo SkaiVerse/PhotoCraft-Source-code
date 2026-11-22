@@ -13,7 +13,7 @@
 /// The workspace version, such as `0.1.0` or `0.2.0-rc.1`.
 pub const VERSION: &str = match option_env!("PHOTOCRAFT_OVERRIDE_VERSION") {
     Some(v) => v,
-    None => "0.9.3",
+    None => "0.9.4",
 };
 
 /// The full git commit this build was made from, when the build environment recorded it.
