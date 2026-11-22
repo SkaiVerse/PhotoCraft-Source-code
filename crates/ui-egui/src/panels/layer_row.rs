@@ -612,6 +612,8 @@ fn row_context_menu(app: &mut PhotocraftApp, ui: &mut egui::Ui, rc: &RowCtx<'_>,
     let force_open = ctx.data(|d| d.get_temp::<u64>(egui::Id::unique("open-layer-menu")) == Some(l.id.0));
     if force_open {
         ctx.data_mut(|d| d.remove::<u64>(egui::Id::unique("open-layer-menu")));
+        let popup_id = egui::Popup::default_response_id(resp);
+        egui::Popup::open_id(ctx, popup_id);
     }
     let is_secondary = resp.secondary_clicked() || (resp.long_touched() && (on_mask || on_thumb)) || force_open;
     if is_secondary {

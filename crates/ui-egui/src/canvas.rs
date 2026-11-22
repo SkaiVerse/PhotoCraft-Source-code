@@ -684,19 +684,8 @@ fn update_canvas_navigation(app: &mut PhotocraftApp, view: &mut View, input: Can
         if let Some(delta) = crate::rotate_view::trackpad_delta(input.ctx, rotate_trackpad, touch_gestures) {
             view.zoom_animating = false;
             view.zoom_anchor = None;
-            let mut next = view.rotation + crate::rotate_view::screen_delta(delta, input.xf.flip);
+            let next = view.rotation + crate::rotate_view::screen_delta(delta, input.xf.flip);
             if next.is_finite() {
-                // Affinity-style magnetic snap to cardinal angles (0°, 90°, 180°, -90°) within 5° threshold
-                let wrapped = crate::rotate_view::wrap_deg(next);
-                if wrapped.abs() < 5.0 {
-                    next = 0.0;
-                } else if (wrapped - 90.0).abs() < 5.0 {
-                    next = 90.0;
-                } else if (wrapped + 90.0).abs() < 5.0 {
-                    next = -90.0;
-                } else if (wrapped.abs() - 180.0).abs() < 5.0 {
-                    next = 180.0;
-                }
                 view.rotation = crate::rotate_view::wrap_deg(next);
             }
         }

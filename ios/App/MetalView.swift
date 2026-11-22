@@ -670,10 +670,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             return
         }
         guard g.state != .failed else { return }
-        // Strictly lock / suppress pan translation while rotating or twisting (zero drift like Affinity)
-        if twistEngaged || (twistRecognizer?.state == .began || twistRecognizer?.state == .changed) {
-            return
-        }
         let t = g.translation(in: self)
         g.setTranslation(.zero, in: self)
         let c = g.location(in: self)
@@ -683,8 +679,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         }
     }
 
-    /// Two-finger twist turns the canvas view only. It starts after a small twist (a bigger one
-    /// while the fingers are clearly pinching), so zooming does not turn the picture by accident.
+    /// Two-finger twist turns the canvas view only. It starts after a small twist (fluid like Affinity),
+    /// allowing simultaneous two-finger pan, pinch zoom, and rotation.
     @objc private func twisted(_ g: UIRotationGestureRecognizer) {
         guard let h = handle else { return }
         switch g.state {
@@ -695,8 +691,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             let total = g.rotation   // radians since the twist began, clockwise is positive
             if !twistEngaged {
                 let degrees = abs(total) * 180 / CGFloat.pi
-                let pinching = abs(log(Double(max(pinchTotal, 0.01)))) > 0.12
-                if degrees < (pinching ? 15 : 6) { return }
+                if degrees < 1.0 { return }
                 twistEngaged = true
                 twistSent = total
                 return
