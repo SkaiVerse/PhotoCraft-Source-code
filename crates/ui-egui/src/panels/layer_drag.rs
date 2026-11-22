@@ -104,9 +104,12 @@ pub(super) fn layer_drag_and_drop(
     let released = ctx.input(|i| i.pointer.any_released());
     let copy = ctx.input(|i| i.modifiers.alt);
     if dragged == l.id.0 {
-        // Ghost label following the pointer, and the copy cursor while ⌥ is held.
+        let selected = app.session.active().map(|st| st.selected_layers()).unwrap_or_default();
+        let in_multi = selected.len() > 1 && selected.contains(&l.id);
+        let count = if in_multi { selected.len() } else { 1 };
+        // Ghost label following the pointer with count badge, and the copy cursor while ⌥ is held.
         if let Some(p) = pointer {
-            crate::layer_transfer::ghost(ctx, p, &l.name);
+            crate::layer_transfer::ghost_with_count(ctx, p, &l.name, count);
         }
         if copy {
             ctx.set_cursor_icon(egui::CursorIcon::Copy);

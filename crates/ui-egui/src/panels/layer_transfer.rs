@@ -247,13 +247,27 @@ fn drop(app: &mut PhotocraftApp, ctx: &egui::Context, dest: usize, at: Option<[f
 
 /// The dragged layers' name next to the pointer (also the Layers panel's reorder drag).
 pub fn ghost(ctx: &egui::Context, p: egui::Pos2, label: &str) {
+    ghost_with_count(ctx, p, label, 1);
+}
+
+/// Dragged layer preview with optional multi-selection count badge (Affinity Designer style).
+pub fn ghost_with_count(ctx: &egui::Context, p: egui::Pos2, label: &str, count: usize) {
     let t = crate::theme::Tokens::get(ctx);
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("layer-transfer-ghost")));
     let g = painter.layout_no_wrap(label.to_string(), egui::FontId::proportional(12.0), t.text);
-    let r = egui::Rect::from_min_size(p + egui::vec2(12.0, -10.0), g.size() + egui::vec2(16.0, 8.0));
+    let r = egui::Rect::from_min_size(p + egui::vec2(16.0, -10.0), g.size() + egui::vec2(18.0, 8.0));
     painter.rect_filled(r, t.radius_sm, t.card.gamma_multiply(0.95));
-    painter.rect_stroke(r, t.radius_sm, egui::Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
-    painter.galley(r.min + egui::vec2(8.0, 4.0), g, t.text);
+    painter.rect_stroke(r, t.radius_sm, egui::Stroke::new(1.2, egui::Color32::from_rgb(30, 145, 255)), egui::StrokeKind::Inside);
+    painter.galley(r.min + egui::vec2(9.0, 4.0), g, t.text);
+    if count > 1 {
+        // Red circular count badge like Affinity Designer
+        let badge_center = r.left_top() + egui::vec2(2.0, 2.0);
+        let badge_radius = 8.5;
+        painter.circle_filled(badge_center, badge_radius, egui::Color32::from_rgb(225, 45, 45));
+        painter.circle_stroke(badge_center, badge_radius, egui::Stroke::new(1.0, egui::Color32::WHITE));
+        let count_text = painter.layout_no_wrap(count.to_string(), egui::FontId::proportional(10.0), egui::Color32::WHITE);
+        painter.galley(badge_center - count_text.size() / 2.0, count_text, egui::Color32::WHITE);
+    }
 }
 
 #[cfg(test)]

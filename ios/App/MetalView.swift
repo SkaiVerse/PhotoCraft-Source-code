@@ -550,6 +550,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         twist.allowedTouchTypes = direct
         twist.cancelsTouchesInView = false
         twist.delegate = self
+        twistRecognizer = twist
         addGestureRecognizer(twist)
 
         // Press-and-hold on canvas opens context menu (finger and Apple Pencil)
@@ -587,7 +588,10 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         // Hovering is how the Pencil is noticed before it touches: never filter it out.
         if g is UIHoverGestureRecognizer { return true }
         if g is UILongPressGestureRecognizer {
-            return !(touch.type == .direct && pencilNear)
+            let p = touch.location(in: self)
+            // Long press context menu is strictly for canvas; never intercept panel/dock/toolbar touches
+            let onCanvas = p.x > 80 && p.x < (bounds.width - 320) && p.y > 50
+            return onCanvas && !(touch.type == .direct && pencilNear)
         }
         if touch.type == .pencil { return false }
         if touch.type == .direct && (pencilNear || constrainTouch != nil || touch === constrainTouch) { return false }
@@ -655,33 +659,27 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     }
 
     private var pinchTotal: CGFloat = 1
+    private var twistRecognizer: UIRotationGestureRecognizer?
     private var twistEngaged = false
     private var twistSent: CGFloat = 0
-    private var cumulativeTwistPan: CGFloat = 0
 
     @objc private func twoFingerScroll(_ g: UIPanGestureRecognizer) {
         guard let h = handle else { return }
         if g.state == .ended || g.state == .cancelled {
-            cumulativeTwistPan = 0
             pc_pointer_gone(h)
             return
         }
         guard g.state != .failed else { return }
+        // Strictly lock / suppress pan translation while rotating or twisting (zero drift like Affinity)
+        if twistEngaged || (twistRecognizer?.state == .began || twistRecognizer?.state == .changed) {
+            return
+        }
         let t = g.translation(in: self)
         g.setTranslation(.zero, in: self)
-        if twistEngaged {
-            // Strictly zero out / lock pan translation during active rotation unless deliberate large pan (>45 pt)
-            cumulativeTwistPan += hypot(t.x, t.y)
-            if cumulativeTwistPan > 45.0 {
-                pc_scroll(h, Float(t.x), Float(t.y), 0)
-            }
-        } else {
-            cumulativeTwistPan = 0
-            let c = g.location(in: self)
-            pc_pointer_moved(h, Float(c.x), Float(c.y))
-            if t != .zero {
-                pc_scroll(h, Float(t.x), Float(t.y), 0)
-            }
+        let c = g.location(in: self)
+        pc_pointer_moved(h, Float(c.x), Float(c.y))
+        if t != .zero {
+            pc_scroll(h, Float(t.x), Float(t.y), 0)
         }
     }
 
@@ -691,7 +689,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         guard let h = handle else { return }
         switch g.state {
         case .began:
-            cumulativeTwistPan = 0
             twistEngaged = false
             twistSent = 0
         case .changed:
@@ -699,20 +696,18 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             if !twistEngaged {
                 let degrees = abs(total) * 180 / CGFloat.pi
                 let pinching = abs(log(Double(max(pinchTotal, 0.01)))) > 0.12
-                // Increased angular deadzone/threshold before rotation activates (prevent accidental rotation)
-                if degrees < (pinching ? 20 : 10) { return }
+                if degrees < (pinching ? 15 : 6) { return }
                 twistEngaged = true
                 twistSent = total
                 return
             }
             let delta = total - twistSent
             twistSent = total
-            // Invert rotation delta so it follows fingers naturally, and always rotate around the canvas center.
+            // Always rotate around the canvas center.
             let cx = Float(bounds.midX)
             let cy = Float(bounds.midY)
             pc_rotate(h, Float(delta), cx, cy)
         case .ended, .cancelled:
-            cumulativeTwistPan = 0
             twistEngaged = false
         default: break
         }

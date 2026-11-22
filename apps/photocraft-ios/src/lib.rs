@@ -835,8 +835,8 @@ impl Host {
             adaptive: false,
             since: Instant::now(),
         });
-        // Wake up in time to notice a press-and-hold (layer pickup at 350ms, menus at 450ms).
-        wake_at(&self.deadline, Instant::now() + Duration::from_millis(360));
+        // Wake up in time to notice a press-and-hold (layer pickup at 300ms, menus at 450ms).
+        wake_at(&self.deadline, Instant::now() + Duration::from_millis(305));
     }
 
     fn gesture_move(&mut self, x: f32, y: f32) {
@@ -853,13 +853,13 @@ impl Host {
                     return;
                 }
                 if let Some(lt) = g.layer_touch && !lt.is_thumb {
-                    // Moving before 350ms pickup: check for horizontal swipe gestures
-                    if dx.abs() > dy.abs() * 1.1 && dx.abs() >= 24.0 {
+                    // Moving before 300ms pickup: check for horizontal swipe gestures (Affinity style)
+                    if dx.abs() > dy.abs() * 1.1 && dx.abs() >= 20.0 {
                         g.consumed = true;
                         g.mode = GMode::Scroll;
                         self.gesture = Some(g);
-                        if dx < -24.0 {
-                            // Swipe Left -> Multi-select layer (toggle into multi-selection)
+                        if dx > 20.0 {
+                            // Swipe Right -> Multi-select layer (toggle into multi-selection)
                             self.ctx.data_mut(|d| {
                                 let list = d.get_temp_mut_or_default::<Vec<u64>>(photocraft_ui_egui::layer_row_ui::swipe_select_key());
                                 if let Some(pos) = list.iter().position(|&id| id == lt.layer) {
@@ -874,7 +874,10 @@ impl Host {
                             }));
                             self.ctx.request_repaint();
                         } else {
-                            // Swipe Right -> Layer Context Menu
+                            // Swipe Left -> Layer Context Menu
+                            self.ctx.data_mut(|d| {
+                                d.insert_temp(egui::Id::unique("open-layer-menu"), lt.layer);
+                            });
                             self.click(sx, sy, egui::PointerButton::Secondary, true);
                             self.ctx.request_repaint();
                         }
@@ -1027,7 +1030,7 @@ impl Host {
             && g.mode == GMode::Pending
             && !g.consumed
             && !g.host_ui
-            && g.t0.elapsed() >= Duration::from_millis(350)
+            && g.t0.elapsed() >= Duration::from_millis(300)
         {
             if let Some(lt) = g.layer_touch {
                 if lt.is_thumb {

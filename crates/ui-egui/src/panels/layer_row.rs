@@ -251,7 +251,7 @@ pub(super) fn layer_row(
         app.hover_layer = Some(l.id);
     }
     let is_swipe_sel = ctx.data(|d| d.get_temp::<Vec<u64>>(crate::layer_row_ui::swipe_select_key())).is_some_and(|s| s.contains(&l.id.0));
-    paint_row_background(&painter, &t, l, rect, selected, row.multi || is_swipe_sel, is_hovered);
+    paint_row_background(&painter, &t, l, rect, selected || is_swipe_sel, row.multi || is_swipe_sel, is_hovered);
     if ctx.data(|d| d.get_temp::<u64>(egui::Id::unique("layer-drag"))).is_some_and(|id| id == l.id.0) {
         painter.rect_stroke(rect, if t.pro { 0.0 } else { t.radius }, Stroke::new(2.0, Color32::from_rgb(30, 145, 255)), StrokeKind::Inside);
     }
@@ -371,22 +371,17 @@ fn eye_cell(rect: Rect) -> Rect {
 }
 
 /// The row's fill (selection / hover), the label colour behind the eye column and the pro dividers.
-fn paint_row_background(painter: &egui::Painter, t: &Tokens, l: &Layer, rect: Rect, selected: bool, multi: bool, is_hovered: bool) {
-    if selected && multi {
-        let blue_tint = Color32::from_rgba_unmultiplied(24, 110, 240, 160);
-        painter.rect_filled(rect, if t.pro { 0.0 } else { t.radius }, blue_tint);
+fn paint_row_background(painter: &egui::Painter, t: &Tokens, l: &Layer, rect: Rect, selected: bool, _multi: bool, is_hovered: bool) {
+    if selected {
+        let blue = Color32::from_rgb(30, 115, 240);
+        painter.rect_filled(rect, if t.pro { 0.0 } else { t.radius }, blue);
         let bar = Rect::from_min_max(rect.left_top(), pos2(rect.left() + 4.0, rect.bottom()));
-        painter.rect_filled(bar, 0.0, Color32::from_rgb(30, 145, 255));
+        painter.rect_filled(bar, 0.0, Color32::from_rgb(80, 160, 255));
     } else if t.pro {
-        if selected {
-            painter.rect_filled(rect, 0.0, t.row_selected);
-        } else if is_hovered {
+        if is_hovered {
             painter.rect_filled(rect, 0.0, t.hover.gamma_multiply(0.5));
             painter.rect_filled(rect, 0.0, t.accent.gamma_multiply(0.12));
         }
-    } else if selected {
-        painter.rect_filled(rect, t.radius, t.hover);
-        painter.rect_stroke(rect, t.radius, Stroke::new(1.0, t.field_border), StrokeKind::Inside);
     } else if is_hovered {
         painter.rect_filled(rect, t.radius, t.hover.gamma_multiply(0.5));
         painter.rect_filled(rect, t.radius, t.accent.gamma_multiply(0.12));
@@ -608,21 +603,29 @@ fn handle_row_double_click(app: &mut PhotocraftApp, ctx: &egui::Context, rc: &Ro
 fn row_context_menu(app: &mut PhotocraftApp, ui: &mut egui::Ui, rc: &RowCtx<'_>, eye_resp: &egui::Response, actions: &mut Vec<(String, Value)>) {
     let (l, resp, masks, row) = (rc.l, rc.resp, rc.masks, rc.row);
     let (ctx, selected) = (&ui.ctx().clone(), row.selected);
-    // The visibility icon has its own color menu, the layer-mask thumbnail its mask menu
-    // (#4575) and a pixel layer's thumbnail its thumbnail menu; elsewhere the full layer menu.
     let on_mask_id = ui.scope_id().with(("mask-menu", l.id.0));
     let on_thumb_id = ui.scope_id().with(("thumb-menu", l.id.0));
-    let is_secondary = resp.secondary_clicked() || resp.long_touched();
+    let pos = resp.interact_pointer_pos();
+    let on_mask = pos.and_then(|p| masks.hit(p)) == Some(crate::mask_thumbs_ui::MaskKind::Pixel);
+    let on_thumb = !on_mask && rc.ts > 0.0 && pos.is_some_and(|p| masks.hit(p).is_none() && rc.thumb.expand(6.0).contains(p));
+
+    let force_open = ctx.data(|d| d.get_temp::<u64>(egui::Id::unique("open-layer-menu")) == Some(l.id.0));
+    if force_open {
+        ctx.data_mut(|d| d.remove::<u64>(egui::Id::unique("open-layer-menu")));
+    }
+    let is_secondary = resp.secondary_clicked() || (resp.long_touched() && (on_mask || on_thumb)) || force_open;
     if is_secondary {
-        let pos = resp.interact_pointer_pos();
-        let on_mask = pos.and_then(|p| masks.hit(p)) == Some(crate::mask_thumbs_ui::MaskKind::Pixel);
-        let on_thumb = !on_mask && rc.ts > 0.0 && pos.is_some_and(|p| masks.hit(p).is_none() && rc.thumb.expand(6.0).contains(p));
         ctx.data_mut(|d| {
             d.insert_temp(on_mask_id, on_mask);
             d.insert_temp(on_thumb_id, on_thumb);
         });
     }
     if !eye_resp.secondary_clicked() && !eye_resp.context_menu_opened() {
+        // Long-touched on row body is reserved strictly for layer pickup/reorder, not context menu
+        if resp.long_touched() && !on_mask && !on_thumb && !resp.secondary_clicked() && !force_open {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::unique("layer-drag"), l.id.0));
+            return;
+        }
         resp.context_menu(|ui| {
             crate::widgets::style_spectrum_popup_menu(ui);
             if ui.ctx().data(|d| d.get_temp::<bool>(on_mask_id)).unwrap_or(false) {
