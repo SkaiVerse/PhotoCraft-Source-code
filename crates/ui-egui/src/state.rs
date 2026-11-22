@@ -147,7 +147,7 @@ impl Default for Panels {
             brush_settings: false,
             brushes: false,
             character: false,
-            toolbar_double: false,
+            toolbar_double: true,
             toolbar_side: ToolbarSide::Start,
             dock: true,
             hidden_by_tab: None,

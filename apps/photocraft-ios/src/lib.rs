@@ -429,34 +429,15 @@ fn touch_ui(
 ) {
     st.rects.clear();
     let has_canvas = canvas.width() > 10.0 && canvas.height() > 10.0;
-    let (left, right, top, bottom) = if has_canvas {
-        (canvas.min.x, canvas.max.x, canvas.min.y, canvas.max.y)
+    let (right, top, bottom) = if has_canvas {
+        (canvas.max.x, canvas.min.y, canvas.max.y)
     } else {
-        (screen.min.x, screen.max.x, screen.min.y, screen.max.y)
+        (screen.max.x, screen.min.y, screen.max.y)
     };
 
-    let actions = egui::Area::new(egui::Id::new("pc_actions"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(left + 6.0, bottom - screen.max.y - 6.0))
-        .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
-                if icon_button(ui, 44.0, Icon::Undo).clicked() {
-                    out.push(TouchAction::Undo);
-                }
-                if icon_button(ui, 44.0, Icon::Redo).clicked() {
-                    out.push(TouchAction::Redo);
-                }
-                if icon_button(ui, 44.0, Icon::Trash).clicked() {
-                    out.push(TouchAction::Delete);
-                }
-            });
-        });
-    st.rects.push(actions.response.rect);
-
-    // The round assist button.
-    let size = 56.0_f32;
-    let default = egui::pos2(right - size - 12.0, top + (bottom - top) * 0.62);
+    // The round assist button (Affinity minimalist circular floating modifier style).
+    let size = 48.0_f32;
+    let default = egui::pos2(right - size - 16.0, top + (bottom - top) * 0.62);
     let mut pos = st.puck.unwrap_or(default);
     pos.x = pos.x.clamp(screen.min.x, (screen.max.x - size).max(screen.min.x));
     pos.y = pos.y.clamp(screen.min.y, (screen.max.y - size).max(screen.min.y));
@@ -469,11 +450,34 @@ fn touch_ui(
         .fixed_pos(pos)
         .show(ctx, |ui| {
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click_and_drag());
-            let ring = if any_down || is_open { ui.visuals().selection.bg_fill } else { egui::Color32::from_gray(175) };
             let c = rect.center();
-            ui.painter().circle_filled(c, size / 2.0, egui::Color32::from_black_alpha(150));
-            ui.painter().circle_stroke(c, size / 2.0 - 3.0, egui::Stroke::new(3.0, ring));
-            ui.painter().circle_filled(c, 8.0, ring);
+            let r = size / 2.0;
+            let active = any_down || is_open || resp.is_pointer_button_down_on();
+
+            let bg_color = egui::Color32::from_rgba_unmultiplied(22, 22, 26, 215);
+            let rim_color = if active {
+                ui.visuals().selection.bg_fill
+            } else if resp.hovered() {
+                egui::Color32::from_white_alpha(80)
+            } else {
+                egui::Color32::from_white_alpha(45)
+            };
+            let inner_ring_color = if active {
+                ui.visuals().selection.bg_fill.gamma_multiply(0.6)
+            } else {
+                egui::Color32::from_white_alpha(35)
+            };
+            let core_color = if active {
+                ui.visuals().selection.bg_fill
+            } else {
+                egui::Color32::from_white_alpha(160)
+            };
+
+            ui.painter().circle_filled(c, r, bg_color);
+            ui.painter().circle_stroke(c, r - 0.75, egui::Stroke::new(1.2, rim_color));
+            ui.painter().circle_stroke(c, r * 0.62, egui::Stroke::new(1.0, inner_ring_color));
+            ui.painter().circle_filled(c, 3.5, core_color);
+
             if resp.dragged() {
                 new_pos += resp.drag_delta();
             }
@@ -603,13 +607,14 @@ impl Host {
         // Graphics: Metal through wgpu. The app's own GPU compositor shares this device.
         let instance = wgpu::Instance::default();
         #[cfg(any(target_os = "ios", target_os = "macos"))]
-        let surface_target = wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer);
-        #[cfg(not(any(target_os = "ios", target_os = "macos")))]
-        let surface_target = unimplemented!("CoreAnimationLayer is only available on iOS/macOS");
-
         let surface: wgpu::Surface<'static> =
-            unsafe { instance.create_surface_unsafe(surface_target) }
+            unsafe { instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer)) }
                 .map_err(|e| format!("surface: {e}"))?;
+        #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+        let surface: wgpu::Surface<'static> = {
+            let _ = (layer, width, height, scale, cb, &instance);
+            return Err("CoreAnimationLayer is only available on iOS/macOS".into());
+        };
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
@@ -1384,6 +1389,32 @@ pub unsafe extern "C" fn pc_select_tool(h: *mut c_void, name: *const c_char) {
                 photocraft_ui_egui::tool_memory::select(&mut h.app, t);
                 h.wake();
             }
+        }
+    }
+}
+
+/// Show the quick brush options (size, picker) for the active tool at (x, y) if it supports one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_show_brush_options(h: *mut c_void, x: f32, y: f32) -> c_int {
+    if let Some(h) = unsafe { host(h) } {
+        let tool = h.app.ui.tool;
+        if photocraft_ui_egui::paint_mouse::has_brush_picker(tool) {
+            let p = h.pt(x, y);
+            h.app.ui.brush_picker = Some([p.x, p.y]);
+            h.wake();
+            return 1;
+        }
+    }
+    0
+}
+
+/// Dismiss any open brush picker.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_close_brush_picker(h: *mut c_void) {
+    if let Some(h) = unsafe { host(h) } {
+        if h.app.ui.brush_picker.is_some() {
+            h.app.ui.brush_picker = None;
+            h.wake();
         }
     }
 }

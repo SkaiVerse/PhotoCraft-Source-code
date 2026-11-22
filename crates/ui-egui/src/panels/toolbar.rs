@@ -274,11 +274,13 @@ pub fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         // doesn't hide them.)
         let tool_tips = ui.data(|d| d.get_temp::<(egui::Id, Rect)>(flyout_id)).is_none() && !ui.input(|i| i.pointer.primary_down());
         let ctx = ui.ctx().clone();
-        let footer = (if t.pro { 8.0 } else { 14.0 })
+        let btn_size = bx.min(32.0);
+        let bottom_height = btn_size * 3.0 + 12.0;
+        let middle_height = (if t.pro { 8.0 } else { 14.0 })
             + chips_height(t.pro, t.round_chips, t.round_chips && double)
             + 8.0
-            + if double { bx } else { bx * 2.0 + 3.0 }
-            + 6.0;
+            + if double { bx } else { bx * 2.0 + 3.0 };
+        let footer = middle_height + bottom_height + 24.0;
         // As tall as the tools, so the colour chips sit right under them (Photoshop); a column
         // taller than the window scrolls and keeps the chips at the bottom.
         egui::ScrollArea::vertical()
@@ -287,8 +289,8 @@ pub fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             .max_height((ui.available_height() - footer).max(0.0))
             .min_scrolled_height(0.0)
             .show(ui, |ui| {
-                // Pro has no group dividers, so its two columns fill every row across groups.
-                let sections: Vec<Vec<(usize, Vec<Tool>)>> = if t.pro { vec![sections.into_iter().flatten().collect()] } else { sections };
+                // Two columns fill every row across groups when double or pro.
+                let sections: Vec<Vec<(usize, Vec<Tool>)>> = if t.pro || double { vec![sections.into_iter().flatten().collect()] } else { sections };
                 for (si, section) in sections.iter().enumerate() {
                     // Photoshop 2026 draws one uninterrupted column (no group dividers).
                     if si > 0 && !t.pro {
@@ -492,11 +494,16 @@ pub fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                 more_slot_flyout(app, ui, &more, &t, side);
                 reveal_focused_control(ui);
             });
-        ui.add_space(if t.pro { 8.0 } else { 14.0 });
+        // Divider line between top scrollable tools and middle fixed section
+        ui.add_space(4.0);
+        let (div1, _) = ui.allocate_exact_size(vec2(if double { bx * 2.0 + 2.0 } else { bx }, 1.0), Sense::hover());
+        ui.painter().line_segment([div1.left_center() + vec2(4.0, 0.0), div1.right_center() - vec2(4.0, 0.0)], Stroke::new(1.0, t.separator));
+        ui.add_space(6.0);
+
         // Centred in the tool column as it is before the tools scroll: a scroll bar widens the
         // UI it is in, and the chips moved over by its width (#7316).
         color_chips(app, ui, double, full.width());
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
         let layout = if double { egui::Layout::left_to_right(egui::Align::Min) } else { egui::Layout::top_down(egui::Align::Min) };
 
@@ -569,6 +576,26 @@ pub fn toolbar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                     }
                 }
             });
+        });
+
+        // Divider line between middle section and bottom section
+        ui.add_space(6.0);
+        let (div2, _) = ui.allocate_exact_size(vec2(if double { bx * 2.0 + 2.0 } else { bx }, 1.0), Sense::hover());
+        ui.painter().line_segment([div2.left_center() + vec2(4.0, 0.0), div2.right_center() - vec2(4.0, 0.0)], Stroke::new(1.0, t.separator));
+        ui.add_space(6.0);
+
+        // Bottom section (Fixed / Unscrollable): Undo, Redo, Delete stacked vertically
+        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            if icons::button_with_icon_size_tip(ui, "undo-2", btn_size, (btn_size * 0.55).round(), false, tl!("Undo  (⌘Z)"), tool_tips).clicked() {
+                let _ = crate::menus::invoke(app, &ctx, "edit.undo", json!({}));
+            }
+            if icons::button_with_icon_size_tip(ui, "redo-2", btn_size, (btn_size * 0.55).round(), false, tl!("Redo  (⇧⌘Z)"), tool_tips).clicked() {
+                let _ = crate::menus::invoke(app, &ctx, "edit.redo", json!({}));
+            }
+            if icons::button_with_icon_size_tip(ui, "trash", btn_size, (btn_size * 0.55).round(), false, tl!("Delete  (⌫)"), tool_tips).clicked() {
+                let _ = crate::menus::invoke(app, &ctx, "edit.clear", json!({}));
+            }
         });
     });
 }

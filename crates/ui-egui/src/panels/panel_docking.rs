@@ -866,6 +866,57 @@ fn show_layout(app: &mut PhotocraftApp, ui: &mut egui::Ui, dock_only: bool) {
     crate::shortcuts::handle_forwarded(app, ui.ctx(), forwarded, output.forwarded_modifiers.unwrap_or_default());
     let mut actions = output.actions;
     pin_group_heights(ui.ctx(), &layout, &mut actions);
+
+    // Refinement 6: Right-Side Panel Resize Dividers
+    let hits = craft_ui::docking::DockArea::<String>::hit_rects(ui.ctx(), area);
+    let mut divider_zones = Vec::new();
+    for (hit, r) in &hits {
+        if let craft_ui::docking::Hit::Divider(craft_ui::docking::Divider::Group(first)) = hit {
+            // Expand hit target to 20 pt height (10 pt above and below the divider line)
+            let expanded = egui::Rect::from_x_y_ranges(r.x_range(), (r.center().y - 10.0)..=(r.center().y + 10.0));
+            divider_zones.push((first.clone(), expanded, r.center().y));
+        }
+    }
+
+    let press_origin = ui.input(|i| i.pointer.press_origin());
+    let press_in_divider_zone = press_origin.is_some_and(|p| divider_zones.iter().any(|(_, zone, _)| zone.contains(p)));
+
+    // Strictly separate splitter resize hit-zone from panel tab drag-to-reorganize
+    if press_in_divider_zone {
+        actions.retain(|a| !matches!(a, Action::Float { .. } | Action::Move { .. } | Action::MoveGroup { .. } | Action::MoveColumn { .. } | Action::MoveWindow { .. }));
+        craft_ui::docking::cancel_drag::<String>(ui.ctx(), area);
+    }
+
+    for (first, zone, center_y) in &divider_zones {
+        let div_id = ui.scope_id().with(("overlay-group-divider", first));
+        let resp = ui.interact(*zone, div_id, egui::Sense::click_and_drag());
+
+        let is_active = resp.dragged() || resp.is_pointer_button_down_on();
+        let is_hovered = resp.hovered();
+
+        // Prominent horizontal splitter line matching Reference Image 2
+        let line_rect = egui::Rect::from_x_y_ranges(zone.x_range(), (center_y - 1.5)..=(center_y + 1.5));
+        let fill = if is_active {
+            t.accent
+        } else if is_hovered {
+            t.accent.gamma_multiply(0.7)
+        } else {
+            t.card_border
+        };
+        ui.painter().rect_filled(line_rect, 1.0, fill);
+
+        if resp.dragged() && resp.drag_delta().y != 0.0 {
+            let current_h = hits.iter()
+                .filter(|(hit, _)| matches!(hit, craft_ui::docking::Hit::Tab(p) | craft_ui::docking::Hit::DragBar(p) if p == first))
+                .map(|(_, rect)| rect.top())
+                .reduce(f32::min)
+                .map(|top| center_y - top);
+            if let Some(h) = current_h {
+                let new_h = (h + resp.drag_delta().y).max(60.0);
+                actions.push(Action::ResizeGroup { panel: first.clone(), height: Some(new_h) });
+            }
+        }
+    }
     for action in actions {
         let result = match action {
             // A dock group minimizes as PhotoCraft's collapsed group, which the native dock's

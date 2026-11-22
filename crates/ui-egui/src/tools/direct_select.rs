@@ -23,6 +23,9 @@
 //! step per drag, and the same commands drive it over MCP and the control channel. The Pen path
 //! being drawn is not in the document yet: its edits apply to it directly, without a command.
 
+use std::cell::RefCell;
+use std::time::Instant;
+
 use egui::{Color32, Modifiers, Pos2};
 use photocraft_doc::vector::Path;
 use photocraft_geom::Point;
@@ -33,6 +36,10 @@ use serde_json::{Value, json};
 use crate::PhotocraftApp;
 use crate::canvas::ToolEvent;
 use crate::state::Tool;
+
+thread_local! {
+    static LAST_ANCHOR_TAP: RefCell<Option<(PathRef, [usize; 2], Instant)>> = const { RefCell::new(None) };
+}
 
 /// A path Direct Selection edits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -711,6 +718,114 @@ fn press(app: &mut PhotocraftApp, p: [f64; 2], mods: Modifiers, convert: bool) -
         }
         Hit::Anchor(k) => {
             ds.segment = None;
+            // Direct Selection double-tap anchor toggle (Refinement 4)
+            if app.ui.tool == Tool::DirectSelection && !convert && !mods.alt && !mods.shift && !mods.command && !mods.ctrl {
+                let is_double_tap = LAST_ANCHOR_TAP.with(|cell| {
+                    let mut b = cell.borrow_mut();
+                    if let Some((prev_target, prev_k, time)) = *b {
+                        if prev_target == target && prev_k == k && time.elapsed().as_millis() <= 400 {
+                            *b = None;
+                            return true;
+                        }
+                    }
+                    *b = Some((target, k, Instant::now()));
+                    false
+                });
+
+                if is_double_tap {
+                    if let Some(sub) = base.subpaths.get(k[0]) {
+                        if let Some(kn) = sub.knots.get(k[1]) {
+                            let is_corner = retracted(kn, Handle::In) && retracted(kn, Handle::Out);
+                            if is_corner {
+                                // Add smooth Bézier handles
+                                let n = sub.knots.len();
+                                let prev_knot = if k[1] > 0 {
+                                    Some(&sub.knots[k[1] - 1])
+                                } else if sub.closed && n > 1 {
+                                    Some(&sub.knots[n - 1])
+                                } else {
+                                    None
+                                };
+                                let next_knot = if k[1] + 1 < n {
+                                    Some(&sub.knots[k[1] + 1])
+                                } else if sub.closed && n > 1 {
+                                    Some(&sub.knots[0])
+                                } else {
+                                    None
+                                };
+                                let out_pt = match (prev_knot, next_knot) {
+                                    (Some(p), Some(n)) => {
+                                        let dx = n.anchor.x - p.anchor.x;
+                                        let dy = n.anchor.y - p.anchor.y;
+                                        let len = dx.hypot(dy);
+                                        if len > 1e-6 {
+                                            let d = 25.0f64.min(len * 0.25).max(10.0);
+                                            Point::new(kn.anchor.x + (dx / len) * d, kn.anchor.y + (dy / len) * d)
+                                        } else {
+                                            Point::new(kn.anchor.x + 25.0, kn.anchor.y)
+                                        }
+                                    }
+                                    (Some(p), None) => {
+                                        let dx = kn.anchor.x - p.anchor.x;
+                                        let dy = kn.anchor.y - p.anchor.y;
+                                        let len = dx.hypot(dy);
+                                        if len > 1e-6 {
+                                            let d = 25.0f64.min(len * 0.25).max(10.0);
+                                            Point::new(kn.anchor.x + (dx / len) * d, kn.anchor.y + (dy / len) * d)
+                                        } else {
+                                            Point::new(kn.anchor.x + 25.0, kn.anchor.y)
+                                        }
+                                    }
+                                    (None, Some(n)) => {
+                                        let dx = n.anchor.x - kn.anchor.x;
+                                        let dy = n.anchor.y - kn.anchor.y;
+                                        let len = dx.hypot(dy);
+                                        if len > 1e-6 {
+                                            let d = 25.0f64.min(len * 0.25).max(10.0);
+                                            Point::new(kn.anchor.x + (dx / len) * d, kn.anchor.y + (dy / len) * d)
+                                        } else {
+                                            Point::new(kn.anchor.x + 25.0, kn.anchor.y)
+                                        }
+                                    }
+                                    _ => Point::new(kn.anchor.x + 25.0, kn.anchor.y),
+                                };
+
+                                if target == PathRef::Pen {
+                                    let mut p_copy = base.clone();
+                                    let _ = edit::convert_point(&mut p_copy, k, Some(out_pt));
+                                    crate::vector_ui::pen_replace(app, &p_copy);
+                                } else {
+                                    let mut params = target.params(app);
+                                    if let Some(obj) = params.as_object_mut() {
+                                        obj.insert("subpath".into(), json!(k[0]));
+                                        obj.insert("knot".into(), json!(k[1]));
+                                        obj.insert("out".into(), json!([out_pt.x, out_pt.y]));
+                                    }
+                                    let _ = app.run("path.convertPoint", params);
+                                }
+                            } else {
+                                // Remove Bézier handles (convert back to sharp corner)
+                                if target == PathRef::Pen {
+                                    let mut p_copy = base.clone();
+                                    let _ = edit::convert_point(&mut p_copy, k, None);
+                                    crate::vector_ui::pen_replace(app, &p_copy);
+                                } else {
+                                    let mut params = target.params(app);
+                                    if let Some(obj) = params.as_object_mut() {
+                                        obj.insert("subpath".into(), json!(k[0]));
+                                        obj.insert("knot".into(), json!(k[1]));
+                                    }
+                                    let _ = app.run("path.convertPoint", params);
+                                }
+                            }
+                            let ds = &mut app.ui.direct_selection;
+                            ds.anchors = vec![k];
+                            ds.drag = None;
+                            return true;
+                        }
+                    }
+                }
+            }
             if mods.alt {
                 ds.anchors = edit::subpath_anchors(&base, k[0]);
             } else if mods.shift {
