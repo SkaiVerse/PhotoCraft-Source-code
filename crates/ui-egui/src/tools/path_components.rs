@@ -48,7 +48,7 @@ pub(crate) fn untarget_saved_path_off(app: &mut PhotocraftApp, at: [f64; 2], tol
 /// reached. `None` with nothing selected, a selection on a path that is gone or locked, or another
 /// tool (they show no selection, so they act on none).
 pub(crate) fn selected(app: &PhotocraftApp) -> Option<(PathRef, Path, Vec<usize>)> {
-    if !matches!(app.ui.tool, Tool::PathSelection | Tool::DirectSelection) {
+    if !matches!(app.ui.tool, Tool::PathSelection | Tool::DirectSelection | Tool::Move) {
         return None;
     }
     let sel = &app.ui.direct_selection;

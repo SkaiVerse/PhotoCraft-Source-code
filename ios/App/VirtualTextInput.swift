@@ -48,6 +48,19 @@ final class VTRange: UITextRange {
     override var isEmpty: Bool { lo.offset == hi.offset }
 }
 
+final class VTSelectionRect: UITextSelectionRect {
+    private let _rect: CGRect
+    init(_ rect: CGRect) {
+        self._rect = rect
+        super.init()
+    }
+    override var rect: CGRect { _rect }
+    override var writingDirection: NSWritingDirection { .natural }
+    override var containsStart: Bool { true }
+    override var containsEnd: Bool { true }
+    override var isVertical: Bool { false }
+}
+
 extension MetalView: UITextInput {
 
     // MARK: Selection (the part the space-bar gesture drives)
@@ -57,13 +70,14 @@ extension MetalView: UITextInput {
         set {
             guard wantsKeyboard, let r = newValue as? VTRange else { return }
             vtSelect(lo: r.lo.offset, hi: r.hi.offset)
+            inputDelegate?.selectionDidChange(self)
         }
     }
 
     /// iPadOS set a new selection: send the matching arrow presses to the app.
     private func vtSelect(lo s: Int, hi e: Int) {
         guard wantsKeyboard else { return }
-        if vt.floating { return }   // the floating cursor moves the caret by itself
+        if vt.floating && s == e && vt.anchor == vt.focus { return }   // the floating cursor moves the caret by itself
         let oldLo = min(vt.anchor, vt.focus)
         let oldHi = max(vt.anchor, vt.focus)
         if s == oldLo && e == oldHi { return }
@@ -229,7 +243,9 @@ extension MetalView: UITextInput {
         CGRect(x: bounds.midX, y: bounds.midY, width: 2, height: 24)
     }
 
-    func selectionRects(for range: UITextRange) -> [UITextSelectionRect] { [] }
+    func selectionRects(for range: UITextRange) -> [UITextSelectionRect] {
+        [VTSelectionRect(firstRect(for: range))]
+    }
 
     func closestPosition(to point: CGPoint) -> UITextPosition? { VTPosition(vt.focus) }
 

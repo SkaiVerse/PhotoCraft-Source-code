@@ -159,19 +159,119 @@ fn straight(path: &Path, [s, k]: [usize; 2]) -> bool {
     path.subpaths.get(s).and_then(|sp| sp.segments().get(k).copied()).is_some_and(|seg| on(seg[0], seg[1]) && on(seg[2], seg[3]))
 }
 
+struct PendingPenAnchor {
+    target: PathRef,
+    base: Path,
+    knot: [usize; 2],
+    start: [f64; 2],
+    t0: std::time::Instant,
+    dragged: bool,
+    converted_corner: bool,
+}
+
+thread_local! {
+    static PENDING_PEN_ANCHOR: std::cell::RefCell<Option<PendingPenAnchor>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Canvas pointer events for the anchor tools, and a Pen press that Auto Add/Delete takes; false
 /// when they aren't theirs.
 pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: Modifiers) -> bool {
-    if let ToolEvent::Down { x, y, .. } = ev
-        && let Some((_, r, path, hit)) = pen_auto(app, app.ui.tool, mods, [x, y])
-    {
-        // The release finds no Pen drag to finish, so the Pen draws nothing.
-        if r == PathRef::Pen {
-            edit_pen(app, path, hit, [x, y]);
-        } else {
-            apply(app, r, hit, [x, y]);
+    match ev {
+        ToolEvent::Down { x, y, .. } => {
+            if let Some((_, r, path, hit)) = pen_auto(app, app.ui.tool, mods, [x, y]) {
+                match hit {
+                    Hit::Anchor([s, k]) => {
+                        PENDING_PEN_ANCHOR.with(|p| {
+                            *p.borrow_mut() = Some(PendingPenAnchor {
+                                target: r,
+                                base: path.clone(),
+                                knot: [s, k],
+                                start: [x, y],
+                                t0: std::time::Instant::now(),
+                                dragged: false,
+                                converted_corner: false,
+                            });
+                        });
+                        return true;
+                    }
+                    _ => {
+                        if r == PathRef::Pen {
+                            edit_pen(app, path, hit, [x, y]);
+                        } else {
+                            apply(app, r, hit, [x, y]);
+                        }
+                        return true;
+                    }
+                }
+            }
         }
-        return true;
+        ToolEvent::Move { x, y, .. } => {
+            let mut pending_action = None;
+            PENDING_PEN_ANCHOR.with(|cell| {
+                if let Some(p) = cell.borrow_mut().as_mut() {
+                    let dist = (x - p.start[0]).hypot(y - p.start[1]) * f64::from(app.point_zoom());
+                    if !p.dragged && dist > 3.0 {
+                        p.dragged = true;
+                        pending_action = Some((true, p.target, p.base.clone(), p.knot, p.start));
+                    } else if !p.dragged && !p.converted_corner && dist <= 3.0 && p.t0.elapsed() >= std::time::Duration::from_millis(400) {
+                        p.converted_corner = true;
+                        pending_action = Some((false, p.target, p.base.clone(), p.knot, p.start));
+                    }
+                }
+            });
+            if let Some((is_drag, target, base, knot, start)) = pending_action {
+                if is_drag {
+                    use crate::direct_select::{Drag, Edit, Owner};
+                    app.ui.direct_selection = DirectSelection {
+                        target: Some(target),
+                        anchors: vec![knot],
+                        owner: Owner::current(app),
+                        ..Default::default()
+                    };
+                    app.ui.direct_selection.drag = Some(Drag::Edit {
+                        target,
+                        base,
+                        edit: Edit::Convert(knot),
+                        start,
+                        end: [x, y],
+                        preview: None,
+                    });
+                    PENDING_PEN_ANCHOR.with(|cell| *cell.borrow_mut() = None);
+                    return true;
+                } else {
+                    if target == PathRef::Pen {
+                        let mut p = base.clone();
+                        if photocraft_vector::edit::convert_point(&mut p, knot, None).is_ok() {
+                            crate::vector_ui::pen_replace(app, &p);
+                        }
+                    } else {
+                        let [s, k] = knot;
+                        let mut params = serde_json::json!({"subpath": s, "knot": k});
+                        if let (Some(o), Some(tp)) = (params.as_object_mut(), target.params(app).as_object()) {
+                            o.extend(tp.clone());
+                        }
+                        let _ = app.run("path.convertPoint", params);
+                    }
+                    return true;
+                }
+            }
+            if PENDING_PEN_ANCHOR.with(|cell| cell.borrow().is_some()) {
+                return true;
+            }
+        }
+        ToolEvent::Up { .. } => {
+            let pending = PENDING_PEN_ANCHOR.with(|cell| cell.borrow_mut().take());
+            if let Some(p) = pending {
+                if !p.dragged && !p.converted_corner {
+                    if p.target == PathRef::Pen {
+                        edit_pen(app, p.base, Hit::Anchor(p.knot), p.start);
+                    } else {
+                        apply(app, p.target, Hit::Anchor(p.knot), p.start);
+                    }
+                }
+                return true;
+            }
+        }
     }
     let Some(tool) = effective(app.ui.tool, mods) else { return false };
     match ev {

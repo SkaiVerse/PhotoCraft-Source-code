@@ -58,6 +58,29 @@ fn layers_hit(doc: &Document, x: i32, y: i32, type_bounds: bool) -> Vec<LayerId>
             LayerContent::Fill(_) => 1.0,
             // The text's pixel bounds (in document space, so they follow the layer's transform).
             LayerContent::Text(t) if type_bounds && t.cache.as_ref().is_some_and(|c| c.content_bounds().contains(x, y)) => 1.0,
+            LayerContent::Shape(sh) => {
+                let surf_alpha = match l.surface() {
+                    Some(s) => {
+                        let mut px = [[0.0f32; 4]; 1];
+                        s.read_rgba_into(Rect::from_xywh(x, y, 1, 1), &mut px);
+                        px[0][3]
+                    }
+                    None => 0.0,
+                };
+                if surf_alpha > 0.0 {
+                    surf_alpha
+                } else if sh.path.control_bounds().map_or(false, |(x0, y0, x1, y1)| {
+                    let (xf, yf) = (x as f64, y as f64);
+                    xf >= x0 - 8.0 && xf <= x1 + 8.0 && yf >= y0 - 8.0 && yf <= y1 + 8.0 && {
+                        let p = photocraft_geom::Point::new(xf, yf);
+                        photocraft_vector::edit::hit(&sh.path, p, 8.0, &[]).is_some()
+                    }
+                }) {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
             _ => match l.surface() {
                 Some(s) => {
                     let mut px = [[0.0f32; 4]; 1];

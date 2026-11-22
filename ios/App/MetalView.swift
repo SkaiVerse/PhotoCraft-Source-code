@@ -48,6 +48,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private let palmGrace: CFTimeInterval = 0.45
     private var eraserOn = false
     private var lastHover = CGPoint(x: 200, y: 200)
+    private var squeezePalette: SqueezePaletteView?
     private var hoverLogged = 0
     private var keyLogged = 0
 
@@ -478,17 +479,31 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         tapKey(eraserOn ? 0x08 : 0x05)
     }
 
-    /// Squeeze on the Pencil Pro: opens the tool menu (a right click, which shows the brush
-    /// picker for brush tools) where the Pencil is.
+    /// Squeeze on the Pencil Pro: opens the floating arc/radial tool menu.
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
         guard squeeze.phase == .ended, let h = handle else { return }
         pcLog("pencil: squeeze")
-        pc_click(h, Float(lastHover.x), Float(lastHover.y), 1, 0)
+        if let existing = squeezePalette {
+            existing.dismiss()
+            squeezePalette = nil
+            return
+        }
+        let loc = (lastHover != .zero) ? lastHover : CGPoint(x: bounds.midX, y: bounds.midY)
+        let palette = SqueezePaletteView(centerAt: loc, in: self) { [weak self] toolId in
+            guard let self = self, let h = self.handle else { return }
+            toolId.withCString { pc_select_tool(h, $0) }
+            self.squeezePalette = nil
+        } onDismiss: { [weak self] in
+            self?.squeezePalette = nil
+        }
+        squeezePalette = palette
+        addSubview(palette)
+        palette.animateIn()
     }
 
     // MARK: Apple Pencil Scribble
     func scribbleInteraction(_ interaction: UIScribbleInteraction, shouldBeginAt location: CGPoint) -> Bool {
-        wantsKeyboard
+        false
     }
 
     // MARK: Gestures
@@ -527,6 +542,18 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         twist.delegate = self
         addGestureRecognizer(twist)
 
+        // Press-and-hold on canvas opens context menu (finger and Apple Pencil)
+        let longPress = UILongPressGestureRecognizer(target: self, action: #selector(canvasLongPress(_:)))
+        longPress.minimumPressDuration = 0.45
+        longPress.allowableMovement = 12
+        longPress.allowedTouchTypes = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue),
+            NSNumber(value: UITouch.TouchType.pencil.rawValue)
+        ]
+        longPress.cancelsTouchesInView = false
+        longPress.delegate = self
+        addGestureRecognizer(longPress)
+
         // Two fingers tap: Undo. Three fingers tap: Redo.
         let twoTap = UITapGestureRecognizer(target: self, action: #selector(twoFingerTap(_:)))
         twoTap.numberOfTouchesRequired = 2
@@ -549,9 +576,19 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
         // Hovering is how the Pencil is noticed before it touches: never filter it out.
         if g is UIHoverGestureRecognizer { return true }
+        if g is UILongPressGestureRecognizer {
+            return !(touch.type == .direct && pencilNear)
+        }
         if touch.type == .pencil { return false }
-        if touch.type == .direct && pencilNear { return false }
+        if touch.type == .direct && (pencilNear || constrainTouch != nil || touch === constrainTouch) { return false }
         return true
+    }
+
+    @objc private func canvasLongPress(_ g: UILongPressGestureRecognizer) {
+        guard g.state == .began, let h = handle else { return }
+        let p = g.location(in: self)
+        pcLog("canvas: long press at \(p)")
+        pc_long_press(h, Float(p.x), Float(p.y))
     }
 
     @objc private func hoverMoved(_ g: UIHoverGestureRecognizer) {
@@ -879,9 +916,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 pc_pointer_moved(h, Float(p.x), Float(p.y))
                 pc_pointer_button(h, Float(p.x), Float(p.y), pointerButton, 1, mods)
             default:
-                // One fingertip (not a palm) on the screen while the Pencil is drawing or
-                // resizing: keeps the proportions, like holding Shift.
-                if pencilTouch != nil && constrainTouch == nil && t.majorRadius < 20 {
+                // One fingertip on the screen while the Pencil or primary finger is drawing,
+                // creating a shape, or transforming: keeps proportions (Shift modifier).
+                if (pencilTouch != nil || fingerTouch != nil) && constrainTouch == nil && t !== fingerTouch && t.majorRadius < 32 {
                     constrainTouch = t
                     pc_set_touch_shift(h, 1)
                     continue
@@ -951,4 +988,117 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { finish(touches, with: event, cancelled: false) }
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { finish(touches, with: event, cancelled: true) }
+}
+
+// MARK: - Apple Pencil Squeeze Floating Radial Palette
+
+final class SqueezePaletteView: UIView {
+    struct ToolItem {
+        let id: String
+        let name: String
+        let systemIcon: String
+    }
+
+    private static let tools: [ToolItem] = [
+        ToolItem(id: "pathSelection", name: "Select", systemIcon: "arrow.up.left"),
+        ToolItem(id: "directSelection", name: "Direct", systemIcon: "arrow.triangle.turn.up.right.diamond"),
+        ToolItem(id: "pencil", name: "Pencil", systemIcon: "pencil"),
+        ToolItem(id: "eraser", name: "Eraser", systemIcon: "eraser"),
+        ToolItem(id: "eyedropper", name: "Picker", systemIcon: "eyedropper.halffull"),
+        ToolItem(id: "type", name: "Text", systemIcon: "textformat"),
+    ]
+
+    private let platter = UIVisualEffectView(effect: UIBlurEffect(style: .systemMaterialDark))
+    private let onSelect: (String) -> Void
+    private let onDismiss: () -> Void
+    private let platterRadius: CGFloat = 88.0
+
+    init(centerAt point: CGPoint, in container: UIView, onSelect: @escaping (String) -> Void, onDismiss: @escaping () -> Void) {
+        self.onSelect = onSelect
+        self.onDismiss = onDismiss
+        super.init(frame: container.bounds)
+        autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        backgroundColor = .clear
+
+        let clampedX = max(platterRadius + 16, min(container.bounds.width - platterRadius - 16, point.x))
+        let clampedY = max(platterRadius + 16, min(container.bounds.height - platterRadius - 16, point.y))
+        let centerPoint = CGPoint(x: clampedX, y: clampedY)
+
+        platter.frame = CGRect(x: centerPoint.x - platterRadius, y: centerPoint.y - platterRadius, width: platterRadius * 2, height: platterRadius * 2)
+        platter.layer.cornerRadius = platterRadius
+        platter.layer.masksToBounds = true
+        platter.layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
+        platter.layer.borderWidth = 1.0
+        addSubview(platter)
+
+        layer.shadowColor = UIColor.black.cgColor
+        layer.shadowOpacity = 0.35
+        layer.shadowRadius = 14
+        layer.shadowOffset = CGSize(width: 0, height: 6)
+
+        let centerDot = UIView(frame: CGRect(x: platterRadius - 4, y: platterRadius - 4, width: 8, height: 8))
+        centerDot.backgroundColor = UIColor.white.withAlphaComponent(0.4)
+        centerDot.layer.cornerRadius = 4
+        platter.contentView.addSubview(centerDot)
+
+        let btnRadius: CGFloat = 55.0
+        let btnSize: CGFloat = 40.0
+        let count = SqueezePaletteView.tools.count
+        for (i, tool) in SqueezePaletteView.tools.enumerated() {
+            let angle = CGFloat(i) * (2.0 * .pi / CGFloat(count)) - (.pi / 2.0)
+            let bx = platterRadius + btnRadius * cos(angle) - (btnSize / 2.0)
+            let by = platterRadius + btnRadius * sin(angle) - (btnSize / 2.0)
+
+            let btn = UIButton(type: .system)
+            btn.frame = CGRect(x: bx, y: by, width: btnSize, height: btnSize)
+            btn.layer.cornerRadius = btnSize / 2.0
+            btn.backgroundColor = UIColor.white.withAlphaComponent(0.14)
+            btn.tintColor = .white
+
+            let img = UIImage(systemName: tool.systemIcon, withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .medium))
+            btn.setImage(img, for: .normal)
+            btn.accessibilityLabel = tool.name
+            btn.tag = i
+            btn.addTarget(self, action: #selector(toolTapped(_:)), for: .touchUpInside)
+
+            platter.contentView.addSubview(btn)
+        }
+
+        let tapBg = UITapGestureRecognizer(target: self, action: #selector(bgTapped(_:)))
+        addGestureRecognizer(tapBg)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    func animateIn() {
+        platter.transform = CGAffineTransform(scaleX: 0.5, y: 0.5)
+        platter.alpha = 0.0
+        UIView.animate(withDuration: 0.22, delay: 0, usingSpringWithDamping: 0.78, initialSpringVelocity: 0, options: [.curveEaseOut]) {
+            self.platter.transform = .identity
+            self.platter.alpha = 1.0
+        }
+    }
+
+    func dismiss() {
+        UIView.animate(withDuration: 0.15, animations: {
+            self.platter.transform = CGAffineTransform(scaleX: 0.8, y: 0.8)
+            self.alpha = 0.0
+        }, completion: { _ in
+            self.removeFromSuperview()
+            self.onDismiss()
+        })
+    }
+
+    @objc private func toolTapped(_ sender: UIButton) {
+        let tool = SqueezePaletteView.tools[sender.tag]
+        onSelect(tool.id)
+        dismiss()
+    }
+
+    @objc private func bgTapped(_ g: UITapGestureRecognizer) {
+        let p = g.location(in: platter)
+        if !platter.bounds.contains(p) {
+            dismiss()
+        }
+    }
 }

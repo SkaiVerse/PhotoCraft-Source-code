@@ -608,6 +608,11 @@ pub(super) fn tool_event_with_view(app: &mut PhotocraftApp, ev: ToolEvent, mods:
                     // The component pressed is selected, so the drag moves it (and the others selected).
                     crate::path_components::press(app, [x, y], mods.shift);
                 }
+                Tool::Move => {
+                    if app.ui.selected_path.is_some() || crate::vector_ui::active_shape_path(app).is_some() {
+                        crate::path_components::press(app, [x, y], mods.shift);
+                    }
+                }
                 Tool::Pen => {
                     if !(mods.alt && crate::vector_ui::pen_grab_handle(app, x, y)) {
                         crate::vector_ui::pen_down(app, x, y, mods.shift);

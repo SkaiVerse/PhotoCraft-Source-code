@@ -602,8 +602,13 @@ impl Host {
 
         // Graphics: Metal through wgpu. The app's own GPU compositor shares this device.
         let instance = wgpu::Instance::default();
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        let surface_target = wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer);
+        #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+        let surface_target = unimplemented!("CoreAnimationLayer is only available on iOS/macOS");
+
         let surface: wgpu::Surface<'static> =
-            unsafe { instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(layer)) }
+            unsafe { instance.create_surface_unsafe(surface_target) }
                 .map_err(|e| format!("surface: {e}"))?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -1340,17 +1345,46 @@ pub unsafe extern "C" fn pc_finger(h: *mut c_void, phase: c_int, x: f32, y: f32,
     }
 }
 
-/// A long press by a finger: a right click there.
+/// A long press by a finger or Pencil: a right click there.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_long_press(h: *mut c_void, x: f32, y: f32) {
     if let Some(h) = unsafe { host(h) } {
+        if h.pen_down {
+            h.pen_down = false;
+            let pos = h.pt(x, y);
+            let m = h.modifiers;
+            h.push(egui::Event::PointerMoved(pos));
+            h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
+            h.feed.set(None);
+        }
         if let Some(g) = h.gesture.as_mut() {
-            if g.mode != GMode::Pending {
-                return;
-            }
             g.consumed = true;
         }
         h.click(x, y, egui::PointerButton::Secondary, true);
+    }
+}
+
+/// Select a tool by name (for Apple Pencil squeeze palette and external controls).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_select_tool(h: *mut c_void, name: *const c_char) {
+    if let Some(h) = unsafe { host(h) } {
+        if let Some(s) = unsafe { from_c(name) } {
+            let tool = match s.as_str() {
+                "select" | "pathSelection" | "path_selection" => Some(photocraft_ui_egui::Tool::PathSelection),
+                "directSelect" | "directSelection" | "direct_selection" => Some(photocraft_ui_egui::Tool::DirectSelection),
+                "pencil" => Some(photocraft_ui_egui::Tool::Pencil),
+                "brush" => Some(photocraft_ui_egui::Tool::Brush),
+                "eraser" => Some(photocraft_ui_egui::Tool::Eraser),
+                "eyedropper" => Some(photocraft_ui_egui::Tool::Eyedropper),
+                "text" | "type" => Some(photocraft_ui_egui::Tool::Type),
+                "move" => Some(photocraft_ui_egui::Tool::Move),
+                _ => None,
+            };
+            if let Some(t) = tool {
+                photocraft_ui_egui::tool_memory::select(&mut h.app, t);
+                h.wake();
+            }
+        }
     }
 }
 

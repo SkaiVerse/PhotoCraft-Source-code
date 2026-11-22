@@ -225,6 +225,21 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) ->
     match ev {
         ToolEvent::Down { x, y, .. } => {
             let mut h = hit_with(&t, [x, y], tol, show_pivot);
+            if h == Hit::Outside {
+                let min_edge_dist = (0..4)
+                    .filter_map(|i| edge_projection(&t.quad, i, [x, y]))
+                    .map(|(_, q)| (x - q[0]).hypot(y - q[1]))
+                    .min_by(|a, b| a.total_cmp(b))
+                    .unwrap_or(f64::INFINITY);
+                let rotate_reach = tol * (24.0 / HANDLE_PX);
+                if min_edge_dist > rotate_reach {
+                    // Far outside the bounding box: cleanly commit and deselect instead of rotating
+                    pv.gesture = None;
+                    commit(app);
+                    let _ = app.run("select.deselectLayers", serde_json::json!({}));
+                    return false;
+                }
+            }
             // ⌥-click away from the handles moves the reference point there (and drags it).
             if mods.alt
                 && matches!(h, Hit::Inside | Hit::Outside)
@@ -389,13 +404,25 @@ pub(super) fn rotation_degrees(quad: [[f64; 2]; 4]) -> f64 {
 /// anywhere outside, or while a rotate drag is on. It follows the nearest edge or corner.
 pub(crate) fn rotate_cursor_dir(app: &PhotocraftApp, p: [f64; 2]) -> Option<[f64; 2]> {
     let t = app.ui.transform.as_ref()?;
-    rotate_dir(t, handle_at(app, t, p, handle_tolerance(app)), p)
+    let tol = handle_tolerance(app);
+    rotate_dir(t, handle_at(app, t, p, tol), p, tol)
 }
 
 /// Follow the nearest edge or corner during a rotation hover or drag.
-fn rotate_dir(t: &TransformSession, h: Hit, p: [f64; 2]) -> Option<[f64; 2]> {
+fn rotate_dir(t: &TransformSession, h: Hit, p: [f64; 2], tol: f64) -> Option<[f64; 2]> {
     if !near_rotate_corner(t, h) {
         return None;
+    }
+    if h == Hit::Outside {
+        let min_edge_dist = (0..4)
+            .filter_map(|i| edge_projection(&t.quad, i, p))
+            .map(|(_, q)| (p[0] - q[0]).hypot(p[1] - q[1]))
+            .min_by(|a, b| a.total_cmp(b))
+            .unwrap_or(f64::INFINITY);
+        let rotate_reach = tol * (24.0 / HANDLE_PX);
+        if min_edge_dist > rotate_reach {
+            return None;
+        }
     }
     TransformSession::box_turn_direction(&t.quad, p)
 }
@@ -441,7 +468,7 @@ pub fn cursor(app: &PhotocraftApp, xf: &ViewXform, p: [f64; 2], mods: egui::Modi
         return Some(CursorIcon::Default);
     }
     // A ⌘-drag outside the box still rotates, so ⌘ keeps the curved arrow there.
-    if rotate_dir(t, h, p).is_some() {
+    if rotate_dir(t, h, p, tol).is_some() {
         // The canvas draws the curved rotate arrow (`rotate_cursor_dir`), also during the drag.
         return Some(CursorIcon::None);
     }

@@ -5784,6 +5784,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "photocraft-ios"
+version = "0.23.1"
+dependencies = [
+ "craft-image-codecs",
+ "eframe",
+ "egui",
+ "egui-wgpu",
+ "log",
+ "photocraft-doc",
+ "photocraft-engine",
+ "photocraft-io",
+ "photocraft-ui-egui",
+ "pollster 1.0.1",
+ "wgpu",
+]
+
+[[package]]
 name = "photocraft-ipp"
 version = "0.23.1"
 

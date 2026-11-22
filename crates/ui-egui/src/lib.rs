@@ -58,7 +58,7 @@ pub mod state;
 pub mod texel_guard;
 pub mod theme;
 pub use titlebar::{Caption, CaptionFamily, CaptionIcon, CaptionIcons, CaptionStyle, MIN_WINDOW_SIZE, RenderIconFn};
-pub(crate) mod tool_memory;
+pub mod tool_memory;
 pub mod updates_ui;
 pub mod widgets;
 pub mod work_area;

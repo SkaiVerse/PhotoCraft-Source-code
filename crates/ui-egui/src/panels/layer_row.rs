@@ -600,14 +600,11 @@ fn row_context_menu(app: &mut PhotocraftApp, ui: &mut egui::Ui, rc: &RowCtx<'_>,
     // (#4575) and a pixel layer's thumbnail its thumbnail menu; elsewhere the full layer menu.
     let on_mask_id = ui.scope_id().with(("mask-menu", l.id.0));
     let on_thumb_id = ui.scope_id().with(("thumb-menu", l.id.0));
-    if resp.secondary_clicked() {
+    let is_secondary = resp.secondary_clicked() || resp.long_touched();
+    if is_secondary {
         let pos = resp.interact_pointer_pos();
         let on_mask = pos.and_then(|p| masks.hit(p)) == Some(crate::mask_thumbs_ui::MaskKind::Pixel);
-        // A pixel layer's thumbnail; not the Background's, which has no transparency to load.
-        // Type, shape, smart object, fill, adjustment and group thumbnails keep the layer menu
-        // with their own items (Rasterize, Edit Contents…).
-        let pixels = matches!(l.content, LayerContent::Raster(_)) && l.frame.is_none() && !rc.doc.is_background(l.id);
-        let on_thumb = !on_mask && pixels && rc.ts > 0.0 && pos.is_some_and(|p| masks.hit(p).is_none() && rc.thumb.expand(2.0).contains(p));
+        let on_thumb = !on_mask && rc.ts > 0.0 && pos.is_some_and(|p| masks.hit(p).is_none() && rc.thumb.expand(6.0).contains(p));
         ctx.data_mut(|d| {
             d.insert_temp(on_mask_id, on_mask);
             d.insert_temp(on_thumb_id, on_thumb);

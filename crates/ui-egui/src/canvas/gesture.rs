@@ -186,7 +186,11 @@ fn finish(app: &mut PhotocraftApp, mut d: Drag, click: Option<bool>) {
         }
         Tool::Move => {
             let (dx, dy) = ((end[0] - d.start[0]).round(), (end[1] - d.start[1]).round());
-            crate::move_ui::finish(app, dx, dy);
+            if crate::path_components::selected(app).is_some() || app.ui.selected_path.is_some() {
+                crate::vector_ui::path_selection_finish(app, [d.start[0], d.start[1]], [end[0], end[1]]);
+            } else {
+                crate::move_ui::finish(app, dx, dy);
+            }
         }
         _ => {}
     }
