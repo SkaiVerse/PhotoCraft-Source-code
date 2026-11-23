@@ -160,7 +160,7 @@ pub fn alpha_index(fmt: &PixelFormat) -> Option<usize> {
 pub fn over_native(fmt: &PixelFormat, dst: &mut [f32], src: &[f32], k: f32, lock_transparency: bool) {
     match alpha_index(fmt) {
         Some(a) => {
-            let (da, sa) = (dst[a], src[a] * k);
+            let (da, sa) = (dst[a].clamp(0.0, 1.0), (src[a] * k).clamp(0.0, 1.0));
             // Zero-weight source-over must preserve even the native float channel bits.
             if sa <= 0.0 {
                 return;
@@ -172,10 +172,11 @@ pub fn over_native(fmt: &PixelFormat, dst: &mut [f32], src: &[f32], k: f32, lock
                 }
                 return;
             }
-            let oa = sa + da * (1.0 - sa);
+            let oa = (sa + da * (1.0 - sa)).clamp(0.0, 1.0);
             if oa > 0.0 {
                 for c in 0..a {
-                    dst[c] = (src[c] * sa + dst[c] * da * (1.0 - sa)) / oa;
+                    let val = (src[c] * sa + dst[c] * da * (1.0 - sa)) / oa;
+                    dst[c] = val.clamp(0.0, 1.0);
                 }
             }
             dst[a] = oa;

@@ -243,6 +243,12 @@ impl EngineStroke {
             Self::Mixer(s) => s.push(pts),
         }
     }
+    pub(super) fn finish(&mut self) -> photocraft_engine::Result<DRect> {
+        match self {
+            Self::Brush(s) => s.finish(),
+            Self::Retouch(_) | Self::Dab(_) | Self::Mixer(_) => Ok(DRect::EMPTY),
+        }
+    }
     /// The jitter seed the commit must reuse (the Clone Stamp's comes from the session brush).
     fn seed(&self) -> Option<u64> {
         match self {
@@ -770,6 +776,11 @@ pub(super) fn commit_brush_stroke(app: &mut PhotocraftApp, d: &Drag) {
     let painted = stroke.and_then(|mut stroke| {
         for step in steps.into_iter().chain((!rest.is_empty()).then(|| stroke.push(&rest))) {
             damage.push(step.ok()?);
+        }
+        if let Ok(dmg) = stroke.finish() {
+            if !dmg.is_empty() {
+                damage.push(dmg);
+            }
         }
         Some(stroke)
     });

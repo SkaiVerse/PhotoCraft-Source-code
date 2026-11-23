@@ -601,7 +601,7 @@ pub(super) fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter
         draw_marquee_readout(app, painter.ctx(), xf.to_screen(last[0] as f32, last[1] as f32), size_readout(app, r));
     }
     if let Some((sample, pred_screen_pos)) = app.stylus.feed.predicted() {
-        if d.tool.is_brushlike() || strokes_live(d.tool) {
+        if (d.tool.is_brushlike() || strokes_live(d.tool)) && !d.erase && d.tool != Tool::Eraser {
             let last_screen = xf.to_screen(last[0] as f32, last[1] as f32);
             let brush = &app.session.tools.brush;
             let strength = brush.smoothing.stabilization.max(brush.smoothing.streamline);
@@ -634,15 +634,26 @@ pub(super) fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter
             };
             let dist = (pred_pos - last_screen).length();
             if dist > 0.5 && dist < 400.0 {
+                let lut = photocraft_paint::DynamicsLut::new(brush);
+                let size_factor = if brush.shape_dynamics.size.is_active() || brush.pressure_size {
+                    lut.size_from_pressure(sample.pressure)
+                } else {
+                    1.0
+                };
+                let opacity_factor = if brush.transfer.opacity.is_active() || brush.pressure_opacity {
+                    lut.opacity_from_pressure(sample.pressure)
+                } else {
+                    1.0
+                };
                 let fg = app.session.tools.foreground;
                 let stroke_col = egui::Color32::from_rgba_unmultiplied(
                     (fg[0] * 255.0).clamp(0.0, 255.0) as u8,
                     (fg[1] * 255.0).clamp(0.0, 255.0) as u8,
                     (fg[2] * 255.0).clamp(0.0, 255.0) as u8,
-                    ((fg[3] * 255.0) * sample.pressure.clamp(0.15, 1.0)).clamp(0.0, 255.0) as u8,
+                    ((fg[3] * 255.0) * (brush.opacity * opacity_factor).clamp(0.05, 1.0)).clamp(0.0, 255.0) as u8,
                 );
                 let brush_radius = (app.session.tools.brush.size * xf.zoom / 2.0).max(1.0);
-                let line_width = (brush_radius * 2.0 * sample.pressure.clamp(0.1, 1.0)).clamp(1.5, (brush_radius * 2.0).max(1.5));
+                let line_width = (brush_radius * 2.0 * size_factor).clamp(1.0, (brush_radius * 2.0).max(1.0));
                 painter.line_segment([last_screen, pred_pos], egui::Stroke::new(line_width, stroke_col));
             }
         }

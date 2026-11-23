@@ -686,6 +686,7 @@ impl LiveStroke {
 
     /// The stroke as its commit would take it over (see [`LiveCommit`]).
     pub fn into_commit(mut self) -> Result<LiveCommit> {
+        let _ = self.finish();
         let bounds = self.bounds();
         let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
         Ok(LiveCommit {
@@ -776,6 +777,42 @@ impl LiveStroke {
             crate::mode_cmds::keep_in_color_table(&table, &self.pre, surf, dmg);
         }
         Ok(dmg)
+    }
+
+    /// Finalize the live stroke: finish the renderer (smoothing catch-up and final dabs),
+    /// bake the wet-stroke texture into the layer surface, and clear the temporary tail preview.
+    pub fn finish(&mut self) -> Result<Rect> {
+        let cmyk = self.cmyk.clone();
+        photocraft_color::convert::with_cmyk_space(cmyk.as_ref(), || -> Result<Rect> {
+            self.renderer.finish();
+            if self.symmetry.is_some() {
+                for (mirror, distinct) in self.mirrors.iter_mut().zip(&self.mirror_distinct) {
+                    if *distinct {
+                        mirror.finish();
+                    }
+                }
+            }
+            let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
+            if self.mirror_distinct.iter().any(|d| *d) {
+                let mut renderers: Vec<&mut StrokeRenderer> = std::iter::once(&mut self.renderer)
+                    .chain(self.mirrors.iter_mut().zip(&self.mirror_distinct).filter(|(_, d)| **d).map(|(r, _)| r))
+                    .collect();
+                let mut live = self.union_live.take().map(|(l, _)| l).unwrap_or_default();
+                let dmg = StrokeRenderer::composite_union_live(&mut renderers, &mut live, false, &self.pre, surf, self.sel.as_ref(), self.lock);
+                self.tail = Rect::EMPTY;
+                return Ok(dmg);
+            }
+            let old = std::mem::replace(&mut self.tail, Rect::EMPTY);
+            if !old.is_empty() {
+                self.renderer.mark_dirty(old);
+            }
+            let dmg = old.union(&self.renderer.composite(&self.pre, surf, self.sel.as_ref(), self.lock, false));
+            self.tail = Rect::EMPTY;
+            if let Some(colors) = self.colors {
+                crate::color_channels::restrict_region(&self.pre, surf, colors, dmg)?;
+            }
+            Ok(dmg)
+        })
     }
 }
 
