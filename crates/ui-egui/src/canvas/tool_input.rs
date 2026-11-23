@@ -776,7 +776,6 @@ pub(super) fn tool_event_with_view(app: &mut PhotocraftApp, ev: ToolEvent, mods:
                 d.points.push([x, y, d.points.last().map_or(1.0, |p| p[2])]);
                 app.stylus.record_point();
             }
-            app.stylus.feed.set_predicted(None);
             finish_release(app, d, click);
             crate::move_mods::finish(app);
         }

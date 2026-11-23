@@ -807,13 +807,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 lastQueuedLocation = loc
             }
             let maxForce = c.maximumPossibleForce
-            var normForce = max(0.0009765625, min(1.0, maxForce > 0 ? (c.force / maxForce) : 0.5))
+            let normForce = max(0.0009765625, min(1.0, maxForce > 0 ? (c.force / maxForce) : 0.5))
             let waiting = c.estimationUpdateIndex != nil && c.estimatedPropertiesExpectingUpdates.contains(.force)
-            if waiting && phase == 0 {
-                // If initial touch down is waiting for force calibration from the sensor,
-                // do not let an uncalibrated 1.0 or 0.5 placeholder spike through.
-                normForce = min(normForce, 0.08)
-            }
             var roll: CGFloat = 0
             if #available(iOS 17.5, *) { roll = c.rollAngle }
             penQueue.append(PenItem(
@@ -832,10 +827,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if phase != 1 {
             lastQueuedLocation = nil
         }
-        // During active drawing and initial touch, allow pending force estimates to settle briefly
-        // rather than flushing uncalibrated placeholder forces immediately. On lift/cancel (phase 2/3),
-        // flush everything completely.
-        flushPen(all: phase >= 2)
+        flushPen(all: true)
     }
 
     /// iPadOS refines the Pencil's pressure a few milliseconds after the touch. Matching the
@@ -858,12 +850,12 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 pc_pen_update_estimate(h, Float(normForce), tx, ty, roll)
             }
         }
-        flushPen(all: false)
+        flushPen(all: true)
     }
 
     private func flushPen(all: Bool) {
         let now = CACurrentMediaTime()
-        while let first = penQueue.first, first.ready || all || now - first.time > 0.008 {
+        while let first = penQueue.first, first.ready || all || now - first.time > 0.004 {
             penQueue.removeFirst()
             sendPen(first)
         }
@@ -889,16 +881,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private func sendPen(_ item: PenItem) {
         guard handle != nil else { return }
         // The Pencil's normalized force (0.0009765625 to 1.0)
-        var pressure = Float(max(0.0009765625, min(1.0, item.force.isFinite ? item.force : 0.5)))
-        // Clamp single-step pressure rate-of-change spikes from uncalibrated jumps (> 0.4 delta)
-        if item.phase == 0 {
-            smoothedPressure = pressure
-        } else {
-            let maxDelta: Float = 0.4
-            let delta = max(-maxDelta, min(maxDelta, pressure - smoothedPressure))
-            let target = smoothedPressure + delta
-            smoothedPressure = smoothedPressure * 0.6 + target * 0.4
-        }
+        var pressure = Float(max(0.0009765625, min(1.0, item.force)))
+        // Responsive exponential moving average (alpha = 0.4)
+        if item.phase == 0 { smoothedPressure = pressure } else { smoothedPressure = smoothedPressure * 0.6 + pressure * 0.4 }
         pressure = max(0.0009765625, min(1.0, smoothedPressure))
         let (tx, ty) = self.tilt(altitude: Double(item.altitude), azimuth: item.azimuth)
         let point = PenPoint(x: Double(item.location.x), y: Double(item.location.y), pressure: pressure, tiltX: tx, tiltY: ty,
@@ -1014,10 +999,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             if (devX * devX + devY * devY) > maxDevSq { continue }
 
             let f = Float(u)
-            let p1_p = p1.pressure.isFinite ? p1.pressure : 0.5
-            let p2_p = p2.pressure.isFinite ? p2.pressure : 0.5
-            let rawMid = p1_p + (p2_p - p1_p) * f
-            let midPressure = max(0.0009765625, min(1.0, rawMid.isFinite ? rawMid : 0.5))
+            let midPressure = max(0.0009765625, min(1.0, p1.pressure + (p2.pressure - p1.pressure) * f))
             let mid = PenPoint(x: C.0, y: C.1,
                                pressure: midPressure,
                                tiltX: p1.tiltX + (p2.tiltX - p1.tiltX) * f,

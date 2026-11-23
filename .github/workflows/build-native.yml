@@ -186,7 +186,7 @@ jobs:
           p = pathlib.Path("ios/project.yml")
           s = p.read_text().replace("__BUILD__", build)
           p.write_text(s)
-          line = f"PhotoCraft version 0.P.3, build {build}"
+          line = f"PhotoCraft version 0.P.4, build {build}"
           pathlib.Path("logs/version.txt").write_text(line + "\n")
           print(line)
           PYEOF

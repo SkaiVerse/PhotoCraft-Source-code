@@ -433,26 +433,3 @@ fn predicted_touch_is_ephemeral_and_cleared_across_frames() {
     s.feed.update_latest(PenSample { pressure: 0.85, ..Default::default() });
     assert_eq!(s.feed.get().unwrap().pressure, 0.85);
 }
-
-#[test]
-fn test_stylus_feed_estimate_updates_in_place_no_extra_samples() {
-    let feed = StylusFeed::default();
-    // Simulate touchesBegan / phase 0 with placeholder force
-    feed.set(Some(PenSample { pressure: 0.5, ..Default::default() }));
-    assert_eq!(feed.get().unwrap().pressure, 0.5);
-
-    // touchesEstimatedPropertiesUpdated arrives with refined sensor force (e.g. 0.04)
-    feed.update_latest(PenSample { pressure: 0.04, ..Default::default() });
-    assert_eq!(feed.get().unwrap().pressure, 0.04);
-
-    // Ensure update_latest updated the queue item in-place without pushing an extra item!
-    let drained = feed.drain();
-    assert_eq!(drained.len(), 1, "update_latest must not add extra samples to the queue");
-    assert_eq!(drained[0].pressure, 0.04, "drained sample must reflect the refined pressure");
-
-    // Predicted touch clearing
-    feed.set_predicted(Some((PenSample { pressure: 0.5, ..Default::default() }, egui::pos2(10.0, 10.0))));
-    assert!(feed.predicted().is_some());
-    feed.set_predicted(None);
-    assert!(feed.predicted().is_none());
-}

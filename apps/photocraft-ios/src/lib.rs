@@ -1454,7 +1454,6 @@ pub unsafe extern "C" fn pc_pen(
             _ => {
                 if h.pen_down {
                     h.pen_down = false;
-                    h.feed.set_predicted(None);
                     h.push(egui::Event::PointerMoved(pos));
                     h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
                     // The stroke's last samples keep their pressure; nothing is held after this.

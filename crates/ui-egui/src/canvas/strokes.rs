@@ -578,7 +578,6 @@ impl PhotocraftApp {
         self.live_stroke = None;
         self.session.clear_live_stroke();
         self.drag = None;
-        self.stylus.feed.set_predicted(None);
     }
 }
 
