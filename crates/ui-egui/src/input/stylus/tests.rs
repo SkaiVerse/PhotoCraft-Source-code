@@ -326,6 +326,7 @@ fn eraser_end_switches_tools_once_and_never_mid_drag() {
     use crate::state::Tool;
     let mut app = crate::PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
     app.session.execute("file.new", serde_json::json!({"width": 60, "height": 60})).unwrap();
+    app.session.execute("layer.new.layer", serde_json::json!({})).unwrap();
     app.ui.tool = Tool::Brush;
     let pen = |eraser| Some(PenSample { pressure: 0.5, eraser, ..Default::default() });
     // A mouse never switches.
@@ -360,6 +361,7 @@ fn the_platform_pen_end_switches_to_the_eraser_and_back() {
     use std::sync::atomic::{AtomicU8, Ordering};
     let mut app = crate::PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
     app.session.execute("file.new", serde_json::json!({"width": 60, "height": 60})).unwrap();
+    app.session.execute("layer.new.layer", serde_json::json!({})).unwrap();
     app.ui.tool = Tool::Brush;
     // 0 = no pen, 1 = tip, 2 = eraser end.
     let end = Arc::new(AtomicU8::new(0));

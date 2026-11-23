@@ -242,7 +242,17 @@ fn items(app: &crate::PhotocraftApp, ui: &mut egui::Ui, l: &Layer, on_set: bool,
                     if !on_set {
                         actions.push(("layer.select".into(), json!({"layer": l.id.0})));
                     }
-                    actions.push((id.into(), Value::Null));
+                    let params = if id == "layer.delete" {
+                        let alt = ui.input(|i| i.modifiers.alt);
+                        if alt {
+                            json!({})
+                        } else {
+                            json!({"__trash": true, "layer": l.id.0})
+                        }
+                    } else {
+                        Value::Null
+                    };
+                    actions.push((id.into(), params));
                     ui.close();
                 }
             }

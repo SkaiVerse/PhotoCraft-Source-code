@@ -132,3 +132,67 @@ fn test_duplicate_points_and_rapid_pressure_spikes() {
     let o_neg = lut.opacity_from_pressure(-10.0);
     assert!(o_neg.is_finite(), "LUT opacity lookup on negative pressure must be finite");
 }
+
+#[test]
+fn test_phase3_arc_length_stepping_and_taper() {
+    use crate::dynamics::DabGenerator;
+    use crate::render::StrokeRenderer;
+    use photocraft_color::PixelFormat;
+    use photocraft_raster::Surface;
+
+    // 1. Arc-length stepping floor of 0.5 pt
+    let brush = BrushSettings {
+        size: 1.0,
+        spacing: 0.05, // 5% of 1px = 0.05px, but should floor at 0.5
+        ..Default::default()
+    };
+    let d_gen = DabGenerator::new(&brush, 1.0);
+    let mut dabs = Vec::new();
+    let mut dual = Vec::new();
+    let mut gen_clone = d_gen.clone();
+    gen_clone.push(&[StrokePoint::new(0.0, 0.0, 1.0), StrokePoint::new(10.0, 0.0, 1.0)], &mut dabs, &mut dual);
+    gen_clone.finish(&mut dabs, &mut dual);
+    // Over a 10px line with 0.5 step, we should have around 20 dabs
+    assert!((18..=25).contains(&dabs.len()), "Expected ~20 dabs for 10px line at 0.5 floor, got {}", dabs.len());
+
+    // 2. Start & end taper
+    let taper_brush = BrushSettings {
+        size: 20.0,
+        taper_start_length: 0.3,
+        taper_end_length: 0.3,
+        taper_pressure: 0.8,
+        ..Default::default()
+    };
+    let mut t_gen = DabGenerator::new(&taper_brush, 1.0);
+    let mut t_dabs = Vec::new();
+    let mut t_dual = Vec::new();
+    let pts: Vec<StrokePoint> = (0..50).map(|i| StrokePoint::new(i as f64 * 5.0, 0.0, 1.0)).collect();
+    t_gen.push(&pts, &mut t_dabs, &mut t_dual);
+    t_gen.finish(&mut t_dabs, &mut t_dual);
+
+    assert!(!t_dabs.is_empty());
+    let first_r = t_dabs[0].radius;
+    let mid_r = t_dabs[t_dabs.len() / 2].radius;
+    let last_r = t_dabs.last().unwrap().radius;
+    assert!(first_r < mid_r, "Start dab radius ({first_r}) should be smaller than mid ({mid_r}) due to start taper");
+    assert!(last_r < mid_r, "End dab radius ({last_r}) should be smaller than mid ({mid_r}) due to end taper");
+
+    // 3. Separate flow vs opacity
+    let mut surf = Surface::new(PixelFormat::RGBA8);
+    let flow_brush = BrushSettings {
+        size: 30.0,
+        flow: 0.2,
+        opacity: 0.5,
+        color: [1.0, 0.0, 0.0, 1.0],
+        ..Default::default()
+    };
+    let pre = surf.clone();
+    let mut renderer = StrokeRenderer::new(&flow_brush, Some(surf.format()), 1.0);
+    renderer.push(&[StrokePoint::new(20.0, 50.0, 1.0), StrokePoint::new(80.0, 50.0, 1.0)]);
+    renderer.finish();
+    renderer.composite(&pre, &mut surf, None, false, true);
+    // At opacity 0.5, maximum alpha on canvas cannot exceed 0.5
+    let col = surf.rgba(50, 50);
+    assert!(col[3] <= 0.51, "Final stroke alpha ({}) should not exceed opacity ceiling (0.5)", col[3]);
+    assert!(col[3] > 0.05, "Stroke must have painted red pixels");
+}

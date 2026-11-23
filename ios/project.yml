@@ -13,7 +13,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.justinfor.photocraft
         TARGETED_DEVICE_FAMILY: "2"
         SWIFT_VERSION: "5.0"
-        MARKETING_VERSION: "0.P.4"
+        MARKETING_VERSION: "0.P.5"
         CURRENT_PROJECT_VERSION: "__BUILD__"
         SWIFT_OBJC_BRIDGING_HEADER: App/PhotoCraft-Bridging-Header.h
         LIBRARY_SEARCH_PATHS: "$(SRCROOT)/rust-lib"
@@ -24,7 +24,7 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: PhotoCraft
-        CFBundleShortVersionString: "0.P.4"
+        CFBundleShortVersionString: "0.P.5"
         CFBundleVersion: "__BUILD__"
         UILaunchScreen: {}
         UIFileSharingEnabled: true

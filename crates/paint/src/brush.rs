@@ -632,6 +632,39 @@ pub struct BrushSettings {
     pub mixer: MixerSettings,
     /// Random seed for jitters (commands derive it from the stroke when not given), so strokes replay.
     pub seed: u64,
+    // --- Procreate / Phase 3 Taper, Grain & Preset Dynamics ---
+    #[serde(alias = "taperStartLength")]
+    pub taper_start_length: f32,
+    #[serde(alias = "taperEndLength")]
+    pub taper_end_length: f32,
+    #[serde(alias = "taperPressure")]
+    pub taper_pressure: f32,
+    #[serde(alias = "taperSize")]
+    pub taper_size: f32,
+    #[serde(alias = "taperOpacity")]
+    pub taper_opacity: f32,
+    #[serde(alias = "grainDepth")]
+    pub grain_depth: f32,
+    #[serde(alias = "strokeSpaceGrain")]
+    pub stroke_space_grain: bool,
+    #[serde(alias = "textureScale")]
+    pub texture_scale: f32,
+    #[serde(alias = "dynamicsPressureSize")]
+    pub dynamics_pressure_size: f32,
+    #[serde(alias = "dynamicsPressureOpacity")]
+    pub dynamics_pressure_opacity: f32,
+    #[serde(alias = "dynamicsPressureSizeCurve")]
+    pub dynamics_pressure_size_curve: ResponseCurve,
+    #[serde(alias = "dynamicsPressureOpacityCurve")]
+    pub dynamics_pressure_opacity_curve: ResponseCurve,
+    #[serde(alias = "dynamicsTiltSize")]
+    pub dynamics_tilt_size: f32,
+    #[serde(alias = "dynamicsTiltOpacity")]
+    pub dynamics_tilt_opacity: f32,
+    #[serde(alias = "shapeAzimuth")]
+    pub shape_azimuth: bool,
+    #[serde(alias = "shapeScatter")]
+    pub shape_scatter: f32,
 }
 
 impl Default for BrushSettings {
@@ -676,6 +709,22 @@ impl Default for BrushSettings {
             locks: SectionLocks::default(),
             mixer: MixerSettings::default(),
             seed: 0,
+            taper_start_length: 0.0,
+            taper_end_length: 0.0,
+            taper_pressure: 0.0,
+            taper_size: 0.0,
+            taper_opacity: 0.0,
+            grain_depth: 0.0,
+            stroke_space_grain: false,
+            texture_scale: 0.0,
+            dynamics_pressure_size: 0.0,
+            dynamics_pressure_opacity: 0.0,
+            dynamics_pressure_size_curve: ResponseCurve::LINEAR,
+            dynamics_pressure_opacity_curve: ResponseCurve::LINEAR,
+            dynamics_tilt_size: 0.0,
+            dynamics_tilt_opacity: 0.0,
+            shape_azimuth: false,
+            shape_scatter: 0.0,
         }
     }
 }

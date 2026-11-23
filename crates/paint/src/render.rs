@@ -218,7 +218,7 @@ pub struct BrushContext {
 
 fn prepare_pattern(b: &BrushSettings) -> Option<Arc<PatternImage>> {
     let t = &b.texture;
-    if !t.enabled {
+    if !t.enabled && b.grain_depth <= 0.0 {
         return None;
     }
     if let Pattern::Procedural { style, size, seed } = &t.pattern {
@@ -262,12 +262,23 @@ impl BrushContext {
     #[inline]
     pub fn texture_at(&self, x: i32, y: i32) -> f32 {
         let Some(p) = &self.texture else { return 1.0 };
-        let s = self.brush.texture.scale.max(0.01);
+        let s = if self.brush.texture_scale > 0.0 { self.brush.texture_scale } else { self.brush.texture.scale }.max(0.01);
         if s == 1.0 {
             // Pixel centres land exactly on texels at 100 %.
             return p.data[y.rem_euclid(p.height as i32) as usize * p.width + x.rem_euclid(p.width as i32) as usize];
         }
         let (fx, fy) = ((x as f32 + 0.5) / s - 0.5, (y as f32 + 0.5) / s - 0.5);
+        let (x0, y0) = (crate::tile::fast_floor(fx), crate::tile::fast_floor(fy));
+        let (tx, ty) = (fx - x0, fy - y0);
+        p.sample_bilinear_wrap(x0, y0, tx, ty)
+    }
+
+    /// Texture value at continuous tip/stroke coordinates (bilinear, tiled), for stroke-space rotated grain.
+    #[inline]
+    pub fn texture_at_coord(&self, x: f32, y: f32) -> f32 {
+        let Some(p) = &self.texture else { return 1.0 };
+        let s = if self.brush.texture_scale > 0.0 { self.brush.texture_scale } else { self.brush.texture.scale }.max(0.01);
+        let (fx, fy) = ((x + 0.5) / s - 0.5, (y + 0.5) / s - 0.5);
         let (x0, y0) = (crate::tile::fast_floor(fx), crate::tile::fast_floor(fy));
         let (tx, ty) = (fx - x0, fy - y0);
         p.sample_bilinear_wrap(x0, y0, tx, ty)
@@ -342,7 +353,7 @@ impl BrushContext {
         let aliased = b.aliased && !dual;
         let wet = b.wet_edges && !dual && depth.is_none();
         let noise = b.noise && !dual;
-        let tex_tip = !dual && b.texture.enabled && b.texture.each_tip && self.texture.is_some();
+        let tex_tip = !dual && (b.texture.enabled || b.grain_depth > 0.0) && (b.texture.each_tip || b.stroke_space_grain) && self.texture.is_some();
         let (cx, cy) = if aliased { grid_center(d.center.x, d.center.y, 2.0 * d.radius) } else { (d.center.x as f32, d.center.y as f32) };
         let (sn, cs) = d.angle.sin_cos();
         let (fx, fy) = (if d.flip_x { -1.0 } else { 1.0 }, if d.flip_y { -1.0 } else { 1.0 });
@@ -1677,7 +1688,13 @@ impl GeneralTip<'_> {
                 val += (hard - val) * 0.7;
             }
             if tex_tip {
-                val = texture_combine(b.texture.mode, val, ctx.texture_at(x, y), d.depth);
+                let tex_val = if b.stroke_space_grain {
+                    ctx.texture_at_coord(u, v)
+                } else {
+                    ctx.texture_at(x, y)
+                };
+                let depth = if b.grain_depth > 0.0 { b.grain_depth } else { d.depth };
+                val = texture_combine(b.texture.mode, val, tex_val, depth);
             }
             if wet {
                 val *= wet_factor(rn);

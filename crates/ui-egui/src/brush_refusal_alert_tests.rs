@@ -102,5 +102,13 @@ fn other_tools_keep_the_status_bar() {
     assert!(alerts(&app).is_empty());
     assert_eq!(app.ui.status, photocraft_engine::hidden_target::HIDDEN);
     assert_eq!(tool_name(&app, Tool::Pencil), None);
-    assert_eq!(tool_name(&app, Tool::Brush), Some("brush tool"), "the one place that names the tool");
+    assert_eq!(tool_name(&app, Tool::Brush), Some("brush tool"));
+    assert_eq!(tool_name(&app, Tool::Eraser), Some("eraser tool"));
+}
+
+#[test]
+fn eraser_on_locked_layer_is_refused() {
+    let mut app = app(Tool::Eraser);
+    app.run("layer.lockLayers", json!({"all": true})).unwrap();
+    refused(&mut app, "Could not use the eraser tool because the layer is locked.");
 }

@@ -43,6 +43,7 @@ fn mode_tool_name(tool: Tool) -> Option<&'static str> {
 pub fn tool_name(app: &PhotocraftApp, tool: Tool) -> Option<&'static str> {
     match tool {
         Tool::Brush => Some(tl!("brush tool")),
+        Tool::Eraser => Some(tl!("eraser tool")),
         Tool::Sharpen => Some(tl!("sharpen tool")),
         Tool::Sponge => Some(tl!("sponge tool")),
         Tool::Smudge => Some(tl!("smudge tool")),
@@ -92,7 +93,13 @@ fn layer_refusal(app: &PhotocraftApp, tool: Tool) -> Option<&'static str> {
         None
     } else if layer.is_group() {
         Some(GROUP)
-    } else if locked(st.doc.effective_locks(layer.id), tool) {
+    } else if locked(st.doc.effective_locks(layer.id), tool)
+        || (tool == Tool::Eraser
+            && (st.doc.is_background(layer.id)
+                || st.doc.effective_locks(layer.id).all
+                || st.doc.effective_locks(layer.id).pixels
+                || st.doc.effective_locks(layer.id).transparency))
+    {
         Some(LOCKED)
     } else {
         None

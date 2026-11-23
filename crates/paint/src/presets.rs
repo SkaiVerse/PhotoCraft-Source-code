@@ -8,6 +8,7 @@ use crate::brush::{
     BrushPreset, BrushSettings, ColorDynamics, Control, DualBrush, Dynamic, MaskMode, Pattern, PatternStyle, Scattering, ShapeDynamics, Smoothing, Texture,
     TipShape, Transfer,
 };
+use crate::curve::ResponseCurve;
 use crate::procedural::{bristle_tip, chalk_tip, charcoal_tip, grass_tip, leaf_tip, rake_tip, spatter_tip, sponge_tip, star_tip};
 
 /// Preset groups, in panel order.
@@ -66,6 +67,39 @@ fn general(base: &BrushSettings) -> Vec<BrushPreset> {
             },
         ),
         g("Calligraphy Flat", BrushSettings { size: 28.0, hardness: 1.0, roundness: 0.2, angle: 45.0, spacing: 0.05, ..base.clone() }),
+        g(
+            "Technical Pen",
+            BrushSettings {
+                size: 8.0,
+                hardness: 1.0,
+                spacing: 0.05,
+                dynamics_pressure_size: 1.0,
+                dynamics_pressure_opacity: 0.3,
+                dynamics_pressure_size_curve: ResponseCurve::new(&[[0.0, 0.0], [0.370, 0.637], [1.0, 1.0]]),
+                taper_start_length: 0.31,
+                taper_end_length: 0.23,
+                taper_pressure: 0.80,
+                grain_depth: 1.0,
+                texture_scale: 1.0,
+                ..base.clone()
+            },
+        ),
+        g(
+            "Round Brush",
+            BrushSettings {
+                size: 20.0,
+                hardness: 0.9,
+                spacing: 0.05,
+                dynamics_pressure_size: 0.0,
+                dynamics_pressure_opacity: 1.0,
+                dynamics_pressure_size_curve: ResponseCurve::LINEAR,
+                dynamics_pressure_opacity_curve: ResponseCurve::LINEAR,
+                taper_size: 0.0,
+                taper_opacity: 0.0,
+                texture_scale: 1.0,
+                ..base.clone()
+            },
+        ),
     ]
 }
 
@@ -174,6 +208,27 @@ fn dry_media(base: &BrushSettings) -> Vec<BrushPreset> {
                 spacing: 0.03,
                 shape_dynamics: ShapeDynamics { enabled: true, angle: Dynamic::controlled(Control::Direction), ..Default::default() },
                 transfer: transfer(pressure_min(0.25), Dynamic::default()),
+                ..base.clone()
+            },
+        ),
+        g(
+            "6B Pencil",
+            BrushSettings {
+                size: 14.0,
+                hardness: 0.7,
+                spacing: 0.08,
+                dynamics_pressure_size: 0.89,
+                dynamics_pressure_opacity: 1.0,
+                dynamics_pressure_opacity_curve: ResponseCurve::new(&[[0.0, 0.0], [0.294, 0.565], [1.0, 1.0]]),
+                dynamics_tilt_size: 0.63,
+                dynamics_tilt_opacity: 0.80,
+                shape_azimuth: true,
+                shape_scatter: 0.19,
+                taper_start_length: 0.28,
+                taper_end_length: 0.18,
+                texture_scale: 1.37,
+                grain_depth: 1.0,
+                stroke_space_grain: true,
                 ..base.clone()
             },
         ),
@@ -460,7 +515,7 @@ mod tests {
     #[test]
     fn builtins_are_grouped_and_unique() {
         let v = builtin();
-        assert!((30..=40).contains(&v.len()), "{}", v.len());
+        assert!((30..=45).contains(&v.len()), "{}", v.len());
         let mut names: Vec<&str> = v.iter().map(|p| p.name.as_str()).collect();
         names.sort_unstable();
         names.dedup();
@@ -475,5 +530,51 @@ mod tests {
         // Pressure variants respond to pressure.
         let ps = find(&v, "Hard Round Pressure Size").map(|p| p.brush.shape_dynamics.size.control);
         assert_eq!(ps, Some(Control::PenPressure));
+    }
+
+    #[test]
+    fn test_phase3_default_presets() {
+        let v = builtin();
+
+        // 1. Technical Pen
+        let tech_pen = find(&v, "Technical Pen").expect("Technical Pen preset missing");
+        assert_eq!(tech_pen.brush.dynamics_pressure_size, 1.0);
+        assert_eq!(tech_pen.brush.dynamics_pressure_opacity, 0.3);
+        assert_eq!(
+            tech_pen.brush.dynamics_pressure_size_curve,
+            ResponseCurve::new(&[[0.0, 0.0], [0.370, 0.637], [1.0, 1.0]])
+        );
+        assert_eq!(tech_pen.brush.taper_start_length, 0.31);
+        assert_eq!(tech_pen.brush.taper_end_length, 0.23);
+        assert_eq!(tech_pen.brush.taper_pressure, 0.80);
+        assert_eq!(tech_pen.brush.grain_depth, 1.0);
+        assert_eq!(tech_pen.brush.texture_scale, 1.0);
+
+        // 2. 6B Pencil
+        let pencil = find(&v, "6B Pencil").expect("6B Pencil preset missing");
+        assert_eq!(pencil.brush.dynamics_pressure_size, 0.89);
+        assert_eq!(pencil.brush.dynamics_pressure_opacity, 1.0);
+        assert_eq!(
+            pencil.brush.dynamics_pressure_opacity_curve,
+            ResponseCurve::new(&[[0.0, 0.0], [0.294, 0.565], [1.0, 1.0]])
+        );
+        assert_eq!(pencil.brush.dynamics_tilt_size, 0.63);
+        assert_eq!(pencil.brush.dynamics_tilt_opacity, 0.80);
+        assert!(pencil.brush.shape_azimuth);
+        assert_eq!(pencil.brush.shape_scatter, 0.19);
+        assert_eq!(pencil.brush.taper_start_length, 0.28);
+        assert_eq!(pencil.brush.taper_end_length, 0.18);
+        assert_eq!(pencil.brush.texture_scale, 1.37);
+        assert_eq!(pencil.brush.grain_depth, 1.0);
+
+        // 3. Round Brush
+        let round_brush = find(&v, "Round Brush").expect("Round Brush preset missing");
+        assert_eq!(round_brush.brush.dynamics_pressure_size, 0.0);
+        assert_eq!(round_brush.brush.dynamics_pressure_opacity, 1.0);
+        assert_eq!(round_brush.brush.dynamics_pressure_size_curve, ResponseCurve::LINEAR);
+        assert_eq!(round_brush.brush.dynamics_pressure_opacity_curve, ResponseCurve::LINEAR);
+        assert_eq!(round_brush.brush.taper_size, 0.0);
+        assert_eq!(round_brush.brush.taper_opacity, 0.0);
+        assert_eq!(round_brush.brush.texture_scale, 1.0);
     }
 }

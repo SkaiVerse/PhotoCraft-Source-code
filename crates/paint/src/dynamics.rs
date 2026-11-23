@@ -678,7 +678,11 @@ impl DynamicsLut {
         // 1. pressure -> size
         for i in 0..256 {
             let t = i as f32 / 255.0;
-            if sd.enabled && sd.size.control == Control::PenPressure {
+            if b.dynamics_pressure_size > 0.0 {
+                let curve_val = b.dynamics_pressure_size_curve.eval(t);
+                let gain = b.dynamics_pressure_size.clamp(0.0, 1.0);
+                pressure_to_size[i] = (1.0 - gain) + gain * curve_val;
+            } else if sd.enabled && sd.size.control == Control::PenPressure {
                 let min = sd.size.minimum.clamp(0.0, 1.0);
                 pressure_to_size[i] = min + (1.0 - min) * sd.size.curve.eval(t);
             } else if b.pressure_size {
@@ -691,7 +695,11 @@ impl DynamicsLut {
         // 2. pressure -> opacity
         for i in 0..256 {
             let t = i as f32 / 255.0;
-            if tr.enabled && tr.opacity.control == Control::PenPressure {
+            if b.dynamics_pressure_opacity > 0.0 {
+                let curve_val = b.dynamics_pressure_opacity_curve.eval(t);
+                let gain = b.dynamics_pressure_opacity.clamp(0.0, 1.0);
+                pressure_to_opacity[i] = (1.0 - gain) + gain * curve_val;
+            } else if tr.enabled && tr.opacity.control == Control::PenPressure {
                 let min = tr.opacity.minimum.clamp(0.0, 1.0);
                 pressure_to_opacity[i] = min + (1.0 - min) * tr.opacity.curve.eval(t);
             } else if b.pressure_opacity {
@@ -705,7 +713,10 @@ impl DynamicsLut {
         for i in 0..256 {
             let norm_tilt = i as f32 / 255.0; // 0..90 deg normalized
             let pen_tilt_val = 1.0 - norm_tilt; // upright pen = 1, flat pen = 0
-            if sd.enabled && sd.size.control == Control::PenTilt {
+            if b.dynamics_tilt_size > 0.0 {
+                let gain = b.dynamics_tilt_size.clamp(0.0, 1.0);
+                tilt_to_size[i] = 1.0 + gain * norm_tilt;
+            } else if sd.enabled && sd.size.control == Control::PenTilt {
                 let min = sd.size.minimum.clamp(0.0, 1.0);
                 tilt_to_size[i] = min + (1.0 - min) * sd.size.curve.eval(pen_tilt_val);
             } else {
@@ -717,7 +728,10 @@ impl DynamicsLut {
         for i in 0..256 {
             let norm_tilt = i as f32 / 255.0;
             let pen_tilt_val = 1.0 - norm_tilt;
-            if tr.enabled && tr.opacity.control == Control::PenTilt {
+            if b.dynamics_tilt_opacity > 0.0 {
+                let gain = b.dynamics_tilt_opacity.clamp(0.0, 1.0);
+                tilt_to_opacity[i] = (1.0 - gain) + gain * (1.0 - norm_tilt * 0.5);
+            } else if tr.enabled && tr.opacity.control == Control::PenTilt {
                 let min = tr.opacity.minimum.clamp(0.0, 1.0);
                 tilt_to_opacity[i] = min + (1.0 - min) * tr.opacity.curve.eval(pen_tilt_val);
             } else {
@@ -792,7 +806,10 @@ impl DynamicsLut {
 pub fn base_diameter(b: &BrushSettings, s: &StepInput) -> f32 {
     let sd = &b.shape_dynamics;
     let mut f = 1.0;
-    if sd.enabled && sd.size.control != Control::Off {
+    if b.dynamics_pressure_size > 0.0 {
+        let lut = DynamicsLut::new(b);
+        f = lut.size_from_pressure(s.point.pressure);
+    } else if sd.enabled && sd.size.control != Control::Off {
         let min = sd.size.minimum.clamp(0.0, 1.0);
         f = min + (1.0 - min) * dynamic_value(&sd.size, s);
     } else if b.pressure_size {
@@ -841,7 +858,9 @@ impl DabBuilder {
         } else {
             1
         };
-        let base_d = if sd.enabled && sd.size.control != Control::Off {
+        let base_d = if b.dynamics_pressure_size > 0.0 {
+            b.size * self.lut.size_from_pressure(s.point.pressure)
+        } else if sd.enabled && sd.size.control != Control::Off {
             base_diameter(b, s)
         } else if b.pressure_size {
             b.size * self.lut.size_from_pressure(s.point.pressure)
@@ -854,7 +873,28 @@ impl DabBuilder {
             let r = |st: u64| rand01(seed, i, st);
             // Shape.
             let mut diameter = base_d;
+            if b.dynamics_tilt_size > 0.0 {
+                let tilt_mag = s.point.tilt_x.hypot(s.point.tilt_y);
+                diameter *= self.lut.size_from_tilt(tilt_mag);
+            }
+            let mut taper_factor = 1.0f32;
+            if b.taper_start_length > 0.0 {
+                let start_steps = (b.taper_start_length * 100.0).max(1.0);
+                if (s.step as f32) < start_steps {
+                    let ramp = (s.step as f32) / start_steps;
+                    let p_inf = if b.taper_pressure > 0.0 { b.taper_pressure } else { 1.0 };
+                    taper_factor = (1.0 - p_inf * (1.0 - ramp)).clamp(0.01, 1.0);
+                }
+            }
+            if b.taper_start_length > 0.0 {
+                if b.taper_size != 0.0 || (b.taper_size == 0.0 && b.taper_opacity == 0.0) {
+                    diameter *= taper_factor;
+                }
+            }
             let mut angle = b.angle;
+            if b.shape_azimuth {
+                angle += self.lut.rotation_from_azimuth(s.point.rotation);
+            }
             let mut roundness = b.roundness.clamp(0.01, 1.0);
             let (mut fx, mut fy) = (b.flip_x, b.flip_y);
             if sd.enabled {
@@ -892,16 +932,23 @@ impl DabBuilder {
             let radius = (diameter / 2.0).max(0.5);
             // Scatter.
             let mut c = Point::new(s.point.x, s.point.y);
-            if sc.enabled && sc.scatter.jitter > 0.0 {
+            let scatter_factor = if b.shape_scatter > 0.0 {
+                b.shape_scatter
+            } else if sc.enabled && sc.scatter.jitter > 0.0 {
                 let cv = if sc.scatter.control == Control::PenTilt {
                     let tilt = s.point.tilt_x.hypot(s.point.tilt_y);
                     self.lut.scatter_from_tilt(tilt)
                 } else {
                     dynamic_value(&sc.scatter, s)
                 };
-                let amt = f64::from(sc.scatter.jitter * cv * radius);
+                sc.scatter.jitter * cv
+            } else {
+                0.0
+            };
+            if scatter_factor > 0.0 {
+                let amt = f64::from(scatter_factor * radius);
                 let (ox, oy) = (rand_signed(seed, i, stream::SCATTER_X) as f64 * amt, rand_signed(seed, i, stream::SCATTER_Y) as f64 * amt);
-                if sc.both_axes {
+                if sc.both_axes || b.shape_scatter > 0.0 {
                     c.x += ox;
                     c.y += oy;
                 } else {
@@ -927,8 +974,19 @@ impl DabBuilder {
                 flow *= scalar(&tr.flow, s, r(stream::FLOW));
             }
             let (wet, mix) = if tr.enabled { (scalar(&tr.wetness, s, r(stream::WET)), scalar(&tr.mix, s, r(stream::MIX))) } else { (1.0, 1.0) };
-            if b.pressure_opacity && !(tr.enabled && tr.opacity.control != Control::Off) {
+            if b.dynamics_pressure_opacity > 0.0 {
                 opacity *= self.lut.opacity_from_pressure(s.point.pressure);
+            } else if b.pressure_opacity && !(tr.enabled && tr.opacity.control != Control::Off) {
+                opacity *= self.lut.opacity_from_pressure(s.point.pressure);
+            }
+            if b.dynamics_tilt_opacity > 0.0 {
+                let tilt_mag = s.point.tilt_x.hypot(s.point.tilt_y);
+                opacity *= self.lut.opacity_from_tilt(tilt_mag);
+            }
+            if b.taper_start_length > 0.0 {
+                if b.taper_opacity != 0.0 || (b.taper_size == 0.0 && b.taper_opacity == 0.0) {
+                    opacity *= taper_factor;
+                }
             }
             // Colour.
             let color = if b.color_dynamics.enabled {
@@ -938,8 +996,13 @@ impl DabBuilder {
             };
             // Texture depth (per tip).
             let tx = &b.texture;
-            let depth =
-                if tx.enabled && tx.each_tip { tx.depth.clamp(0.0, 1.0) * scalar(&tx.depth_jitter, s, r(stream::DEPTH)) } else { tx.depth.clamp(0.0, 1.0) };
+            let depth = if b.grain_depth > 0.0 {
+                b.grain_depth.clamp(0.0, 1.0)
+            } else if tx.enabled && tx.each_tip {
+                tx.depth.clamp(0.0, 1.0) * scalar(&tx.depth_jitter, s, r(stream::DEPTH))
+            } else {
+                tx.depth.clamp(0.0, 1.0)
+            };
             out.push(Dab {
                 center: c,
                 radius,
@@ -1116,6 +1179,24 @@ impl DabGenerator {
         self.walker.finish(&mut |s| self.builder.build(&s, dabs));
         if let (Some(w), Some(db)) = (self.dual_walker.as_mut(), self.dual.as_mut()) {
             w.finish(&mut |s| db.build(&s, dual));
+        }
+        let brush = &self.builder.brush;
+        if brush.taper_end_length > 0.0 && !dabs.is_empty() {
+            let end_steps = (brush.taper_end_length * 100.0).max(1.0) as usize;
+            let len = dabs.len();
+            let start_idx = len.saturating_sub(end_steps);
+            let p_inf = if brush.taper_pressure > 0.0 { brush.taper_pressure } else { 1.0 };
+            for (idx, dab) in dabs[start_idx..].iter_mut().enumerate() {
+                let remaining = (len - 1 - (start_idx + idx)) as f32;
+                let ramp = remaining / end_steps as f32;
+                let taper_factor = (1.0 - p_inf * (1.0 - ramp)).clamp(0.01, 1.0);
+                if brush.taper_size != 0.0 || (brush.taper_size == 0.0 && brush.taper_opacity == 0.0) {
+                    dab.radius = (dab.radius * taper_factor).max(0.5);
+                }
+                if brush.taper_opacity != 0.0 || (brush.taper_size == 0.0 && brush.taper_opacity == 0.0) {
+                    dab.opacity = (dab.opacity * taper_factor).clamp(0.0, 1.0);
+                }
+            }
         }
     }
 }

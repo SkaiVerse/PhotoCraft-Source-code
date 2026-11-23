@@ -1,9 +1,10 @@
 use egui::{Modifiers, PointerButton, Pos2, vec2};
 use egui_kittest::Harness;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::*;
 use crate::canvas::{ToolEvent, tool_event};
+use crate::state::DialogKind;
 
 mod right_click;
 
@@ -658,8 +659,8 @@ fn each_tool_keeps_its_own_brush() {
 }
 
 #[test]
-fn eraser_tool_on_the_background_paints_the_background_colour() {
-    // #76: the Eraser on the Background (locked transparency) paints the background colour.
+fn eraser_tool_on_the_background_triggers_locked_layer_alert() {
+    // Eraser on the Background (locked transparency) triggers locked-layer error and blocks the stroke completely.
     let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
     app.run("file.new", json!({"width": 120, "height": 80})).unwrap();
     app.run("tools.setColors", json!({"background": "#ff0000"})).unwrap();
@@ -671,9 +672,11 @@ fn eraser_tool_on_the_background_paints_the_background_colour() {
     tool_event(&mut app, ToolEvent::Up { x: 100.0, y: 40.0 }, m);
     let st = app.session.active().unwrap();
     assert_eq!(st.doc.layers[0].name, "Background");
-    assert_eq!(st.doc.layers[0].surface().unwrap().rgba(50, 40), [1.0, 0.0, 0.0, 1.0]);
-    assert_eq!(st.history.undo_label(), Some("Eraser"));
-    assert!(!app.ui.status_error, "{}", app.ui.status);
+    // Pixels remain untouched (white, not background #ff0000)
+    assert_eq!(st.doc.layers[0].surface().unwrap().rgba(50, 40), [1.0, 1.0, 1.0, 1.0]);
+    assert_eq!(st.history.undo_label(), None);
+    let alerts: Vec<String> = app.ui.dialogs.iter().filter(|d| d.kind == DialogKind::Error).filter_map(|d| d.fields.get("message").and_then(Value::as_str).map(str::to_string)).collect();
+    assert_eq!(alerts, ["Could not use the eraser tool because the layer is locked."]);
 }
 
 /// Assert the one committed stroke contains a point at each queued screen position.
