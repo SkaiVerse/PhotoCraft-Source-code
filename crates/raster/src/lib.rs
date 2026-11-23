@@ -15,9 +15,10 @@ pub mod scratch;
 mod shift;
 pub use shift::TranslateSteps;
 pub use dynamic_layers::{
-    DynamicLayerStorage512, MetalTile512, TileBitmask512, TileStorageMode,
-    compute_dynamic_layer_cap, handle_memory_pressure, os_proc_available_memory,
-    MAX_DYNAMIC_LAYER_CAP, MEMORY_PRESSURE_THRESHOLD, MIN_DYNAMIC_LAYER_CAP, TILE_SIZE_512,
+    CompressedTileDelta512, DynamicLayerStorage512, MetalTile512, StrokeTileDelta512,
+    TileBitmask512, TileStorageMode, compute_dynamic_layer_cap, handle_memory_pressure,
+    os_proc_available_memory, MAX_DYNAMIC_LAYER_CAP, MEMORY_PRESSURE_THRESHOLD,
+    MIN_DYNAMIC_LAYER_CAP, TILE_SIZE_512,
 };
 
 use std::collections::BTreeMap;

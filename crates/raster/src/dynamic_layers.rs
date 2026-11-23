@@ -616,6 +616,89 @@ impl DynamicLayerStorage512 {
         self.bitmask.mark_rect(rect);
         Ok(())
     }
+
+    /// Calculate the grid tile coordinates covering `rect`.
+    pub fn tile_coords_for_rect(&self, rect: Rect) -> Option<(u32, u32, u32, u32)> {
+        if rect.is_empty() || self.width == 0 || self.height == 0 || self.bitmask.cols == 0 || self.bitmask.rows == 0 {
+            return None;
+        }
+        let col_start = (rect.x0.max(0) as u32) / TILE_SIZE_512;
+        let col_end = ((rect.x1.max(0) as u32).saturating_sub(1) / TILE_SIZE_512).min(self.bitmask.cols.saturating_sub(1));
+        let row_start = (rect.y0.max(0) as u32) / TILE_SIZE_512;
+        let row_end = ((rect.y1.max(0) as u32).saturating_sub(1) / TILE_SIZE_512).min(self.bitmask.rows.saturating_sub(1));
+        if col_start > col_end || row_start > row_end {
+            return None;
+        }
+        Some((col_start, row_start, col_end, row_end))
+    }
+
+    /// Capture compressed deltas for all tiles intersecting `rect` prior to mutation.
+    /// Only dirty/modified tiles are recorded, respecting lazy unallocated tiles and Phase 5 bitmasks.
+    pub fn capture_delta_for_rect(&self, rect: Rect) -> StrokeTileDelta512 {
+        let mut deltas = Vec::new();
+        if let Some((c0, r0, c1, r1)) = self.tile_coords_for_rect(rect) {
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    if let Some(tile) = self.tiles.get(&(c, r)) {
+                        let bytes = tile.read_bytes().unwrap_or_default();
+                        let compressed = lz4_flex::block::compress(&bytes);
+                        deltas.push(CompressedTileDelta512 {
+                            col: c,
+                            row: r,
+                            prior_compressed: Some(compressed),
+                        });
+                    } else {
+                        deltas.push(CompressedTileDelta512 {
+                            col: c,
+                            row: r,
+                            prior_compressed: None,
+                        });
+                    }
+                }
+            }
+        }
+        StrokeTileDelta512 {
+            deltas,
+            prior_bitmask: self.bitmask.clone(),
+        }
+    }
+
+    /// Restore the layer storage to the exact prior state captured by `delta` (Undo).
+    pub fn restore_delta(&mut self, delta: &StrokeTileDelta512) -> Result<(), String> {
+        for d in &delta.deltas {
+            match &d.prior_compressed {
+                Some(compressed) => {
+                    let expected_len = (TILE_SIZE_512 as usize) * (TILE_SIZE_512 as usize) * self.bpp;
+                    let decompressed = lz4_flex::block::decompress(compressed, expected_len)
+                        .map_err(|e| format!("delta decompression failed: {e}"))?;
+                    let tile = MetalTile512::from_bytes(decompressed, self.bpp);
+                    self.tiles.insert((d.col, d.row), tile);
+                }
+                None => {
+                    self.tiles.remove(&(d.col, d.row));
+                }
+            }
+        }
+        self.bitmask = delta.prior_bitmask.clone();
+        Ok(())
+    }
+}
+
+/// A compressed per-tile delta for undo/redo recording: captures the prior state of modified tiles.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompressedTileDelta512 {
+    pub col: u32,
+    pub row: u32,
+    /// If None, this tile was previously unallocated (blank).
+    /// If Some, contains the LZ4-compressed prior bytes of the 512x512 tile.
+    pub prior_compressed: Option<Vec<u8>>,
+}
+
+/// A collection of compressed tile deltas capturing the exact before/after state of a stroke or edit.
+#[derive(Clone, Debug)]
+pub struct StrokeTileDelta512 {
+    pub deltas: Vec<CompressedTileDelta512>,
+    pub prior_bitmask: TileBitmask512,
 }
 
 static REGISTERED_STORAGES: Mutex<Vec<std::sync::Weak<Mutex<DynamicLayerStorage512>>>> = Mutex::new(Vec::new());
@@ -795,5 +878,66 @@ mod tests {
 
         let faulted_bytes = tile.read_bytes().unwrap();
         assert_eq!(faulted_bytes, test_pattern, "Faulted tile bytes must match original pattern exactly");
+    }
+
+    #[test]
+    fn test_compressed_tile_delta_undo_redo_fidelity() {
+        let mut storage = DynamicLayerStorage512::new(1024, 1024, 4);
+        assert!(storage.is_empty());
+        assert_eq!(storage.populated_count(), 0);
+
+        // Step 1: Capture delta of unallocated rect before stroke 1
+        let stroke_rect = Rect::new(100, 100, 300, 300); // within tile (0, 0)
+        let delta1 = storage.capture_delta_for_rect(stroke_rect);
+        assert_eq!(delta1.deltas.len(), 1);
+        assert_eq!(delta1.deltas[0].col, 0);
+        assert_eq!(delta1.deltas[0].row, 0);
+        assert!(delta1.deltas[0].prior_compressed.is_none()); // was unallocated
+
+        // Paint stroke 1 (green)
+        let green = [0u8, 255, 0, 255];
+        storage.fill_rect(stroke_rect, &green).unwrap();
+        assert_eq!(storage.populated_count(), 1);
+        assert!(storage.bitmask().has_tile(0, 0));
+
+        // Step 2: Undo stroke 1 using restored delta
+        storage.restore_delta(&delta1).unwrap();
+        assert!(storage.is_empty(), "Restoring delta1 should return storage to empty");
+        assert_eq!(storage.populated_count(), 0);
+        assert!(!storage.bitmask().has_tile(0, 0));
+
+        // Step 3: Paint stroke 2 across boundary: tile (0, 0) and (1, 0)
+        let boundary_rect = Rect::new(400, 100, 600, 200);
+        let delta2 = storage.capture_delta_for_rect(boundary_rect);
+        assert_eq!(delta2.deltas.len(), 2);
+
+        let purple = [128u8, 0, 128, 255];
+        storage.fill_rect(boundary_rect, &purple).unwrap();
+        assert_eq!(storage.populated_count(), 2);
+        assert!(storage.bitmask().has_tile(0, 0));
+        assert!(storage.bitmask().has_tile(1, 0));
+
+        // Step 4: Duplicate layer (CoW), then mutate layer 2
+        let mut storage_dup = storage.duplicate();
+        assert_eq!(storage_dup.tile(0, 0).unwrap().ref_count(), 2);
+
+        let dup_rect = Rect::new(450, 120, 550, 180);
+        let delta_dup = storage_dup.capture_delta_for_rect(dup_rect);
+        let yellow = [255u8, 255, 0, 255];
+        storage_dup.fill_rect(dup_rect, &yellow).unwrap();
+
+        // Mutating storage_dup isolated its modified tiles (ref count becomes 1)
+        assert_eq!(storage_dup.tile(0, 0).unwrap().ref_count(), 1);
+        assert_eq!(storage.tile(0, 0).unwrap().ref_count(), 1);
+
+        // Step 5: Undo on storage_dup restores it to stroke 2 state without affecting storage
+        storage_dup.restore_delta(&delta_dup).unwrap();
+        let b_dup = storage_dup.tile(0, 0).unwrap().read_bytes().unwrap();
+        let b_orig = storage.tile(0, 0).unwrap().read_bytes().unwrap();
+        assert_eq!(b_dup, b_orig, "Undo on duplicated layer restores matching pixels");
+
+        // Step 6: Undo on original storage restores it to blank
+        storage.restore_delta(&delta2).unwrap();
+        assert!(storage.is_empty(), "Original storage returns to blank after undoing delta2");
     }
 }

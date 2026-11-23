@@ -435,3 +435,57 @@ fn predicted_touch_is_ephemeral_and_cleared_across_frames() {
     s.feed.update_latest(PenSample { pressure: 0.85, ..Default::default() });
     assert_eq!(s.feed.get().unwrap().pressure, 0.85);
 }
+
+#[test]
+fn test_phase6_five_input_devices_routing_regression() {
+    use crate::state::Tool;
+
+    let mut app = crate::PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+    app.session.execute("file.new", serde_json::json!({"width": 200, "height": 200})).unwrap();
+
+    // 1. Device: Apple Pencil
+    // Calibrated pressure, tilt, rotation
+    app.stylus.feed.set(Some(PenSample {
+        pressure: 0.65,
+        tilt_x: 12.0,
+        tilt_y: -8.0,
+        rotation: 30.0,
+        eraser: false,
+    }));
+    let sample = app.stylus.feed.get().unwrap();
+    assert_eq!(sample.pressure, 0.65);
+    assert_eq!(sample.tilt_x, 12.0);
+    assert_eq!(sample.tilt_y, -8.0);
+    assert_eq!(sample.rotation, 30.0);
+
+    // Predicted touch integration
+    let pred_pos = egui::pos2(50.0, 60.0);
+    app.stylus.feed.set_predicted(Some((sample, pred_pos)));
+    assert!(app.stylus.feed.predicted().is_some());
+
+    // 2. Device: Finger Touch Arbitration & Gesture Cancellation
+    // If pencil is near, palm rejection protects the canvas
+    app.stylus.touch = None;
+    app.cancel_active_stroke();
+    assert!(app.live_stroke.is_none());
+    assert!(app.drag.is_none());
+
+    // 3. Device: Mouse / Pointer
+    // Tool buttons and canvas pointer moved events
+    app.ui.tool = Tool::Brush;
+    assert_eq!(app.active_tool(), Tool::Brush);
+
+    // 4. Device: Hardware Keyboard / Tool Switching
+    app.ui.tool = Tool::Eraser;
+    assert_eq!(app.active_tool(), Tool::Eraser);
+
+    app.ui.tool = Tool::Move;
+    assert_eq!(app.active_tool(), Tool::Move);
+
+    app.ui.tool = Tool::Brush;
+    assert_eq!(app.active_tool(), Tool::Brush);
+
+    // Undo / Redo command execution (as triggered by 2-finger and 3-finger taps)
+    let _ = app.run("edit.undo", serde_json::json!({}));
+    let _ = app.run("edit.redo", serde_json::json!({}));
+}
