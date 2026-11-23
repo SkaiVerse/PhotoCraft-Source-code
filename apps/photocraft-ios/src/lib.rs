@@ -932,7 +932,7 @@ impl Host {
                         | C::ResizeSouthWest | C::ResizeColumn | C::ResizeRow | C::Grab | C::Grabbing | C::Move | C::AllScroll
                 );
                 // Fingers never draw: on the picture a finger only pans. The Pencil draws elsewhere.
-                let pointer = if g.host_ui || handle { true } else if g.on_canvas { false } else { dy.abs() <= dx.abs() * 1.2 };
+                let pointer = if g.host_ui { true } else if g.on_canvas { false } else if handle { true } else { dy.abs() <= dx.abs() * 1.2 };
                 if pointer {
                     g.mode = GMode::Pointer;
                     g.since = Instant::now();
@@ -991,21 +991,9 @@ impl Host {
                 if !cancelled && !g.consumed && quick {
                     if g.on_canvas {
                         self.ctx.data_mut(|d| d.remove::<Vec<u64>>(photocraft_ui_egui::layer_row_ui::swipe_select_key()));
-                        let tool = self.app.ui.tool;
-                        let is_pen_tool = matches!(
-                            tool,
-                            photocraft_ui_egui::Tool::Pen
-                                | photocraft_ui_egui::Tool::CurvaturePen
-                                | photocraft_ui_egui::Tool::FreeformPen
-                                | photocraft_ui_egui::Tool::AddAnchorPoint
-                                | photocraft_ui_egui::Tool::DeleteAnchorPoint
-                                | photocraft_ui_egui::Tool::ConvertPoint
-                        );
-                        if tool.is_brushlike() || is_pen_tool {
-                            // Under pencil-only drawing / finger-draw lock, finger touches on the canvas
-                            // are restricted strictly to navigation/gestures and never place Pen anchors or strokes.
-                            return;
-                        }
+                        // Under pencil-only drawing / finger-draw lock, zero single-finger touches
+                        // on the canvas may be forwarded as tool clicks/drags to any tool.
+                        return;
                     } else if let Some(lt) = g.layer_touch {
                         // Tapping any single layer row clears multi-selection and selects only that tapped layer
                         self.ctx.data_mut(|d| d.remove::<Vec<u64>>(photocraft_ui_egui::layer_row_ui::swipe_select_key()));
@@ -1466,6 +1454,7 @@ pub unsafe extern "C" fn pc_pen(
             _ => {
                 if h.pen_down {
                     h.pen_down = false;
+                    h.feed.set_predicted(None);
                     h.push(egui::Event::PointerMoved(pos));
                     h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
                     // The stroke's last samples keep their pressure; nothing is held after this.
@@ -1559,6 +1548,16 @@ pub unsafe extern "C" fn pc_canvas_zoom(h: *mut c_void) -> f32 {
         }
     }
     1.0
+}
+
+/// Returns 1 if (x, y) is on the canvas (document) and not on a panel/menu/dialog/floating window.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_on_canvas(h: *mut c_void, x: f32, y: f32) -> c_int {
+    if let Some(h) = unsafe { host(h) } {
+        if h.on_canvas(x, y) { 1 } else { 0 }
+    } else {
+        0
+    }
 }
 
 /// Apple Pencil hovering above the screen: moves the pointer (the brush preview follows it) and
