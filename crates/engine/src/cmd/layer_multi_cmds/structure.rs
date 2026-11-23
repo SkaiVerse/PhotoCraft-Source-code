@@ -274,6 +274,7 @@ pub fn duplicate_selected(s: &mut Session, in_place: bool, label: &str) -> Resul
     let add_copy = crate::commands::layer_panel_option(s, "addCopyToCopiedLayersAndGroups", true);
     let mut shift = (0i32, 0i32);
     let (copies, active) = s.edit(label, |doc, active| {
+        crate::dynamic_layers::check_layer_limit(doc, sel.len().max(1))?;
         let mut copies = Vec::new();
         let mut new_active = None;
         for id in top_level(doc, &sel) {

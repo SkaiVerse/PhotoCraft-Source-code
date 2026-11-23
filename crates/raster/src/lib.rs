@@ -7,12 +7,18 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod dynamic_layers;
 pub mod headroom;
 mod interrupt;
 pub use interrupt::{Cancelled, Interrupt};
 pub mod scratch;
 mod shift;
 pub use shift::TranslateSteps;
+pub use dynamic_layers::{
+    DynamicLayerStorage512, MetalTile512, TileBitmask512, TileStorageMode,
+    compute_dynamic_layer_cap, handle_memory_pressure, os_proc_available_memory,
+    MAX_DYNAMIC_LAYER_CAP, MEMORY_PRESSURE_THRESHOLD, MIN_DYNAMIC_LAYER_CAP, TILE_SIZE_512,
+};
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -586,6 +592,17 @@ fn decode_tile_row_rgba(fmt: &PixelFormat, t: &[u8], base: usize, dst: &mut [[f3
 }
 
 impl Surface {
+    /// Return the compact 512x512 tile bitmask representing allocated tiles in this surface.
+    pub fn empty_tile_bitmask_512(&self, width: u32, height: u32) -> dynamic_layers::TileBitmask512 {
+        let mut mask = dynamic_layers::TileBitmask512::new(width, height);
+        for tc in self.tiles.keys() {
+            let col = (tc.tx.max(0) as u32 * 256) / dynamic_layers::TILE_SIZE_512;
+            let row = (tc.ty.max(0) as u32 * 256) / dynamic_layers::TILE_SIZE_512;
+            mask.set_tile(col, row, true);
+        }
+        mask
+    }
+
     /// Reads a region into a newly allocated buffer, returning an error instead of aborting if
     /// the requested pixel buffer cannot be represented or reserved.
     pub fn try_read_region(&self, r: Rect) -> Result<Vec<f32>, AllocationError> {

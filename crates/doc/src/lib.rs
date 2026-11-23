@@ -765,6 +765,21 @@ impl Layer {
             _ => None,
         }
     }
+    /// Return the compact 512x512 tile bitmask for this layer across the document dimensions.
+    pub fn empty_tile_bitmask_512(&self, width: u32, height: u32) -> photocraft_raster::dynamic_layers::TileBitmask512 {
+        match &self.content {
+            LayerContent::Raster(surf) => surf.empty_tile_bitmask_512(width, height),
+            LayerContent::Group(_) | LayerContent::Adjustment(_) => {
+                photocraft_raster::dynamic_layers::TileBitmask512::new(width, height)
+            }
+            _ => {
+                let mut mask = photocraft_raster::dynamic_layers::TileBitmask512::new(width, height);
+                mask.mark_rect(photocraft_geom::Rect::new(0, 0, width as i32, height as i32));
+                mask
+            }
+        }
+    }
+
     /// Deep copy with fresh ids (for Duplicate Layer).
     pub fn duplicate(&self) -> Layer {
         let mut l = self.clone();
@@ -1158,6 +1173,14 @@ impl Document {
 
     pub fn layer_count(&self) -> usize {
         self.walk().len()
+    }
+
+    /// Compute the dynamic layer cap based on device memory and canvas dimensions:
+    /// clamp(floor(os_proc_available_memory() * 0.5 / bytesPerPaintedLayer), 8, 512)
+    pub fn dynamic_layer_cap(&self) -> usize {
+        let bpp = self.pixel_format().bytes_per_pixel();
+        let avail = photocraft_raster::dynamic_layers::os_proc_available_memory();
+        photocraft_raster::dynamic_layers::compute_dynamic_layer_cap(avail, self.size.width, self.size.height, bpp)
     }
 
     pub fn path_of(&self, id: LayerId) -> Option<LayerPath> {

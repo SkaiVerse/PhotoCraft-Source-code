@@ -172,6 +172,13 @@ pub(crate) fn empty_in(layer: &Layer, rect: Rect) -> bool {
         let bounds = shapeless_stroke_bounds(layer).unwrap_or_else(|| effect_source_bounds(layer, canvas));
         return transparent_outside(layer) && bounds.inflate(effects::margin(layer)).intersect(&rect).is_empty();
     }
+    // Fast path: use compact empty-tile bitmask to skip empty 512x512 tiles with zero overhead
+    if rect.x1 > 0 && rect.y1 > 0 {
+        let mask = layer.empty_tile_bitmask_512(rect.x1 as u32, rect.y1 as u32);
+        if (mask.is_empty() || !mask.intersects_rect(rect)) && transparent_outside(layer) {
+            return true;
+        }
+    }
     match &layer.content {
         LayerContent::Raster(_) | LayerContent::Text(_) | LayerContent::Shape(_) | LayerContent::Smart(_) => match layer.surface() {
             Some(s) => !s.has_tiles_in(rect) && s.default_pixel().last().is_some_and(|a| *a <= 0.0) && s.format().alpha,

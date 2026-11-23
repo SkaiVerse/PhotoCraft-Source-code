@@ -66,6 +66,10 @@ final class PhotoCraftViewController: UIViewController, UIDocumentPickerDelegate
         nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             self?.metal.setFocused(true)
         }
+        nc.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { [weak self] _ in
+            pcLog("didReceiveMemoryWarningNotification received, evicting cold layer tiles")
+            self?.metal.didReceiveMemoryWarning()
+        }
         nc.addObserver(forName: .pcAddFonts, object: nil, queue: .main) { [weak self] _ in
             self?.showFontPicker()
         }
@@ -82,6 +86,12 @@ final class PhotoCraftViewController: UIViewController, UIDocumentPickerDelegate
             guard let url = note.object as? URL else { return }
             self?.openFromOutside(url)
         }
+    }
+
+    override func didReceiveMemoryWarning() {
+        super.didReceiveMemoryWarning()
+        pcLog("didReceiveMemoryWarning invoked on ViewController")
+        metal.didReceiveMemoryWarning()
     }
 
     // MARK: Fonts

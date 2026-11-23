@@ -85,6 +85,10 @@ pub fn tick(app: &mut PhotocraftApp, now: f64) {
     }
     let below_warn = headroom::below(WARN_BELOW);
     let below_rearm = if app.low_memory.warned() { headroom::below(REARM_ABOVE) } else { below_warn };
+    let avail = photocraft_raster::dynamic_layers::os_proc_available_memory();
+    if avail < photocraft_raster::dynamic_layers::MEMORY_PRESSURE_THRESHOLD || below_warn {
+        photocraft_raster::dynamic_layers::handle_memory_pressure();
+    }
     match app.low_memory.step(below_warn, below_rearm) {
         Step::Idle => {}
         Step::Warn => post(app),

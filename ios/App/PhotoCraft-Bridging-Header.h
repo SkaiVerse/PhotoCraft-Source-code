@@ -54,5 +54,6 @@ void pc_save_dialog_end(void *h, const char *path);
 int pc_frame(void *h);
 void pc_save_state(void *h);
 int pc_is_dirty(void *h);
+void pc_memory_warning(void *h);
 
 #endif

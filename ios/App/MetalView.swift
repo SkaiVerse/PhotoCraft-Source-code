@@ -200,6 +200,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     }
 
     func saveState() { if let h = handle { pc_save_state(h) } }
+    func didReceiveMemoryWarning() { if let h = handle { pc_memory_warning(h) } }
     func setFocused(_ focused: Bool) { if let h = handle { pc_set_focused(h, focused ? 1 : 0) } }
 
     @objc private func tick() {

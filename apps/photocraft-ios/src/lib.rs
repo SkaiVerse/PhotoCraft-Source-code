@@ -1893,3 +1893,9 @@ pub unsafe extern "C" fn pc_is_dirty(h: *mut c_void) -> c_int {
         None => 0,
     }
 }
+
+/// iOS memory warning received: evict cold tiles to disk storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_memory_warning(_h: *mut c_void) {
+    photocraft_raster::dynamic_layers::handle_memory_pressure();
+}
