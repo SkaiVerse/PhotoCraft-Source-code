@@ -40,6 +40,7 @@ pub use brush::{
     Scattering, SectionLocks, ShapeDynamics, Smoothing, Texture, TipShape, Transfer,
 };
 pub use curve::ResponseCurve;
+pub use dynamics::{DynamicsLut, apply_directional_damping};
 pub use mip_cache::{mip_cache_bytes, purge_mip_cache};
 pub use mixer::MixerSettings;
 pub use render::{BrushContext, StrokeRenderer, UnionLive, grid_center, grid_square, render_stroke, render_stroke_clipped};
@@ -415,3 +416,5 @@ mod mixer_click_empty_layer_tests;
 
 #[cfg(test)]
 mod smoothing_catch_up_default_tests;
+#[cfg(test)]
+mod phase2_stroke_model_tests;

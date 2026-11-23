@@ -518,7 +518,7 @@ impl From<Pose> for PoseWire {
     }
 }
 
-/// Stroke smoothing (Photoshop's Smoothing % and its options).
+/// Stroke smoothing (Photoshop's Smoothing % and its options, plus Stabilization & StreamLine).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Smoothing {
@@ -534,11 +534,24 @@ pub struct Smoothing {
     pub catch_up_on_end: bool,
     /// Divide the string length by the view zoom (the command's `zoom` param).
     pub adjust_for_zoom: bool,
+    /// 0..1: Directional damping transverse stabilization (0.125 base gain).
+    pub stabilization: f32,
+    /// 0..1: StreamLine directional damping.
+    pub streamline: f32,
 }
 
 impl Default for Smoothing {
     fn default() -> Self {
-        Self { enabled: true, amount: 0.0, pulled_string: false, catch_up: true, catch_up_on_end: false, adjust_for_zoom: true }
+        Self {
+            enabled: true,
+            amount: 0.0,
+            pulled_string: false,
+            catch_up: true,
+            catch_up_on_end: false,
+            adjust_for_zoom: true,
+            stabilization: 0.0,
+            streamline: 0.0,
+        }
     }
 }
 

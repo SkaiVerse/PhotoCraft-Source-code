@@ -42,7 +42,12 @@ fn tool_move(app: &mut PhotocraftApp, x: f64, y: f64, pressure: f32, mods: egui:
         // ⇧: a selection-tool drag of the selection locks to multiples of 45° (#6231). The Move
         // tool's own drags were already locked by `move_mods::filter_event`.
         let [x, y] = crate::move_mods::selection_drag_to(d, [x, y], mods.shift && tool != Tool::Move);
-        let moved = d.points.last().is_none_or(|p| (p[0] - x).abs() + (p[1] - y).abs() > 0.25);
+        let min_dist = f64::from((0.5 / zoom.max(1.0)).min(0.5));
+        let moved = d.points.last().is_none_or(|p| {
+            let dx = p[0] - x;
+            let dy = p[1] - y;
+            (dx * dx + dy * dy) >= (min_dist * min_dist)
+        });
         // A held pen repeats its point now and then, so the stroke's time keeps advancing.
         let held = app.stylus.last_point_ms().is_some_and(|t| app.stylus.clock_ms - t >= HOLD_REPEAT_MS)
             && app.live_stroke.as_ref().is_some_and(LiveStroke::wants_time);

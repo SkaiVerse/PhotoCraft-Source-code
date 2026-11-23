@@ -110,6 +110,17 @@ pub(super) fn smoothing_options(ui: &mut egui::Ui, b: &mut photocraft_engine::Br
             widgets::checkbox(ui, &mut s.catch_up_on_end, tl!("Catch-up on Stroke End"));
             widgets::checkbox(ui, &mut s.adjust_for_zoom, tl!("Adjust for Zoom"));
         });
+        ui.separator();
+        let mut stab_pct = (s.stabilization * 100.0).round();
+        if widgets::value_field_named(ui, tl!("Stabilization"), &mut stab_pct, 0.0..=100.0, "%", 60.0).changed() {
+            s.enabled = true;
+            s.stabilization = (stab_pct / 100.0).clamp(0.0, 1.0);
+        }
+        let mut stream_pct = (s.streamline * 100.0).round();
+        if widgets::value_field_named(ui, tl!("StreamLine"), &mut stream_pct, 0.0..=100.0, "%", 60.0).changed() {
+            s.enabled = true;
+            s.streamline = (stream_pct / 100.0).clamp(0.0, 1.0);
+        }
     });
 }
 

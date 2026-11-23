@@ -1527,6 +1527,19 @@ pub unsafe extern "C" fn pc_canvas_rotation(h: *mut c_void) -> f32 {
     0.0
 }
 
+/// Current active document view camera zoom factor (1.0 = 100%).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_canvas_zoom(h: *mut c_void) -> f32 {
+    if let Some(h) = unsafe { host(h) } {
+        if let Some(i) = h.app.session.active_index() {
+            if let Some(v) = h.app.ui.views.get(i) {
+                return v.zoom;
+            }
+        }
+    }
+    1.0
+}
+
 /// Apple Pencil hovering above the screen: moves the pointer (the brush preview follows it) and
 /// reports the Pencil's tilt and roll, with no pressure, like a pen hovering over a Mac tablet.
 #[unsafe(no_mangle)]

@@ -96,6 +96,63 @@ fn pose_differs(brush: &StrokePoint, p: &StrokePoint, eps: f32) -> bool {
         || (p.wheel - brush.wheel).abs() > eps
 }
 
+/// Directional damping with 0.125 base gain + EMA for stabilization and streamline.
+pub fn apply_directional_damping(
+    raw: StrokePoint,
+    prev: StrokePoint,
+    dir: &mut Option<[f64; 2]>,
+    strength: f32,
+) -> StrokePoint {
+    let s = (strength as f64).clamp(0.0, 1.0);
+    if s <= 0.0 {
+        return raw;
+    }
+    // Base gain 0.125: perpendicular shakiness damped with alpha in [1.0 -> 0.125];
+    // parallel travel damped with alpha in [1.0 -> 0.5] (strictly < 2 frames latency at max strength).
+    let alpha_par = 1.0 - 0.5 * s;
+    let alpha_perp = 1.0 - 0.875 * s;
+    let dx = raw.x - prev.x;
+    let dy = raw.y - prev.y;
+    let dist = (dx * dx + dy * dy).sqrt();
+    if dist < 1e-6 {
+        return StrokePoint { x: prev.x, y: prev.y, ..raw };
+    }
+    let (damped_dx, damped_dy) = if let Some(u) = *dir {
+        let dot = dx * u[0] + dy * u[1];
+        let par_x = dot * u[0];
+        let par_y = dot * u[1];
+        let perp_x = dx - par_x;
+        let perp_y = dy - par_y;
+        (par_x * alpha_par + perp_x * alpha_perp, par_y * alpha_par + perp_y * alpha_perp)
+    } else {
+        (dx * alpha_par, dy * alpha_par)
+    };
+    let new_len = (damped_dx * damped_dx + damped_dy * damped_dy).sqrt();
+    if new_len > 1e-6 {
+        let new_u = [damped_dx / new_len, damped_dy / new_len];
+        *dir = Some(if let Some(u) = *dir {
+            let blend_x = u[0] * 0.7 + new_u[0] * 0.3;
+            let blend_y = u[1] * 0.7 + new_u[1] * 0.3;
+            let blen = (blend_x * blend_x + blend_y * blend_y).sqrt().max(1e-6);
+            [blend_x / blen, blend_y / blen]
+        } else {
+            new_u
+        });
+    }
+    let ff = alpha_par as f32;
+    let dr = (raw.rotation - prev.rotation + 540.0).rem_euclid(360.0) - 180.0;
+    StrokePoint {
+        x: prev.x + damped_dx,
+        y: prev.y + damped_dy,
+        pressure: prev.pressure + (raw.pressure - prev.pressure) * ff,
+        tilt_x: prev.tilt_x + (raw.tilt_x - prev.tilt_x) * ff,
+        tilt_y: prev.tilt_y + (raw.tilt_y - prev.tilt_y) * ff,
+        rotation: (prev.rotation + dr * ff).rem_euclid(360.0),
+        wheel: prev.wheel + (raw.wheel - prev.wheel) * ff,
+        time: raw.time,
+    }
+}
+
 /// Incremental stroke smoothing: exponential (with optional time-based catch-up) or pulled string.
 #[derive(Clone, Debug)]
 pub struct Smoother {
@@ -103,12 +160,21 @@ pub struct Smoother {
     zoom: f64,
     pos: Option<StrokePoint>,
     last_input: Option<StrokePoint>,
+    direction: Option<[f64; 2]>,
+    damped_pos: Option<StrokePoint>,
 }
 
 impl Smoother {
     /// `zoom` is the view zoom (only used with `adjust_for_zoom`).
     pub fn new(cfg: &Smoothing, zoom: f32) -> Self {
-        Self { cfg: cfg.clone(), zoom: f64::from(zoom.max(0.01)), pos: None, last_input: None }
+        Self {
+            cfg: cfg.clone(),
+            zoom: f64::from(zoom.max(0.01)),
+            pos: None,
+            last_input: None,
+            direction: None,
+            damped_pos: None,
+        }
     }
 
     fn active(&self) -> bool {
@@ -121,6 +187,15 @@ impl Smoother {
         if !(p.x.is_finite() && p.y.is_finite()) {
             return;
         }
+        let p = if self.cfg.enabled && (self.cfg.stabilization > 0.0 || self.cfg.streamline > 0.0) {
+            let strength = self.cfg.stabilization.max(self.cfg.streamline);
+            let prev = self.damped_pos.unwrap_or(p);
+            let damped = apply_directional_damping(p, prev, &mut self.direction, strength);
+            self.damped_pos = Some(damped);
+            damped
+        } else {
+            p
+        };
         let prev_input = self.last_input.replace(p);
         if !self.active() {
             out.push(p);
@@ -556,6 +631,160 @@ pub fn dynamic_color(b: &BrushSettings, s: &StepInput, seed: u64, index: u64) ->
     [o[0], o[1], o[2], fg[3] + (bg[3] - fg[3]) * t]
 }
 
+#[inline]
+fn sample_lut_256(table: &[f32; 256], x: f32) -> f32 {
+    let t = x.clamp(0.0, 1.0) * 255.0;
+    let idx = t.floor() as usize;
+    if idx >= 255 {
+        return table[255];
+    }
+    let frac = t - idx as f32;
+    table[idx] * (1.0 - frac) + table[idx + 1] * frac
+}
+
+/// Precomputed 256-entry 1-D lookup tables evaluated from brush curves for high-performance dab dynamics.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DynamicsLut {
+    /// Maps pressure (0..=255 -> 0.0..=1.0) to size multiplier [0.0..=1.0].
+    pub pressure_to_size: [f32; 256],
+    /// Maps pressure (0..=255 -> 0.0..=1.0) to opacity multiplier [0.0..=1.0].
+    pub pressure_to_opacity: [f32; 256],
+    /// Maps tilt magnitude (0..=255 -> 0..=90 deg) to size multiplier [0.0..=1.0].
+    pub tilt_to_size: [f32; 256],
+    /// Maps tilt magnitude (0..=255 -> 0..=90 deg) to opacity multiplier [0.0..=1.0].
+    pub tilt_to_opacity: [f32; 256],
+    /// Maps tilt magnitude (0..=255 -> 0..=90 deg) to scatter multiplier [0.0..=1.0].
+    pub tilt_to_scatter: [f32; 256],
+    /// Maps azimuth / rotation (0..=255 -> 0..=360 deg) to rotation angle in degrees.
+    pub azimuth_to_rotation: [f32; 256],
+}
+
+impl DynamicsLut {
+    pub fn new(b: &BrushSettings) -> Self {
+        let mut pressure_to_size = [1.0f32; 256];
+        let mut pressure_to_opacity = [1.0f32; 256];
+        let mut tilt_to_size = [1.0f32; 256];
+        let mut tilt_to_opacity = [1.0f32; 256];
+        let mut tilt_to_scatter = [1.0f32; 256];
+        let mut azimuth_to_rotation = [0.0f32; 256];
+
+        let sd = &b.shape_dynamics;
+        let tr = &b.transfer;
+        let sc = &b.scattering;
+
+        // 1. pressure -> size
+        for i in 0..256 {
+            let t = i as f32 / 255.0;
+            if sd.enabled && sd.size.control == Control::PenPressure {
+                let min = sd.size.minimum.clamp(0.0, 1.0);
+                pressure_to_size[i] = min + (1.0 - min) * sd.size.curve.eval(t);
+            } else if b.pressure_size {
+                pressure_to_size[i] = sd.size.curve.eval(t);
+            } else {
+                pressure_to_size[i] = 1.0;
+            }
+        }
+
+        // 2. pressure -> opacity
+        for i in 0..256 {
+            let t = i as f32 / 255.0;
+            if tr.enabled && tr.opacity.control == Control::PenPressure {
+                let min = tr.opacity.minimum.clamp(0.0, 1.0);
+                pressure_to_opacity[i] = min + (1.0 - min) * tr.opacity.curve.eval(t);
+            } else if b.pressure_opacity {
+                pressure_to_opacity[i] = tr.opacity.curve.eval(t);
+            } else {
+                pressure_to_opacity[i] = 1.0;
+            }
+        }
+
+        // 3. tilt -> size
+        for i in 0..256 {
+            let norm_tilt = i as f32 / 255.0; // 0..90 deg normalized
+            let pen_tilt_val = 1.0 - norm_tilt; // upright pen = 1, flat pen = 0
+            if sd.enabled && sd.size.control == Control::PenTilt {
+                let min = sd.size.minimum.clamp(0.0, 1.0);
+                tilt_to_size[i] = min + (1.0 - min) * sd.size.curve.eval(pen_tilt_val);
+            } else {
+                tilt_to_size[i] = 1.0;
+            }
+        }
+
+        // 4. tilt -> opacity
+        for i in 0..256 {
+            let norm_tilt = i as f32 / 255.0;
+            let pen_tilt_val = 1.0 - norm_tilt;
+            if tr.enabled && tr.opacity.control == Control::PenTilt {
+                let min = tr.opacity.minimum.clamp(0.0, 1.0);
+                tilt_to_opacity[i] = min + (1.0 - min) * tr.opacity.curve.eval(pen_tilt_val);
+            } else {
+                tilt_to_opacity[i] = 1.0;
+            }
+        }
+
+        // 5. tilt -> scatter
+        for i in 0..256 {
+            let norm_tilt = i as f32 / 255.0;
+            let pen_tilt_val = 1.0 - norm_tilt;
+            if sc.enabled && sc.scatter.control == Control::PenTilt {
+                let min = sc.scatter.minimum.clamp(0.0, 1.0);
+                tilt_to_scatter[i] = min + (1.0 - min) * sc.scatter.curve.eval(pen_tilt_val);
+            } else {
+                tilt_to_scatter[i] = 1.0;
+            }
+        }
+
+        // 6. azimuth -> rotation
+        for i in 0..256 {
+            let deg = (i as f32 / 255.0) * 360.0;
+            azimuth_to_rotation[i] = deg;
+        }
+
+        Self {
+            pressure_to_size,
+            pressure_to_opacity,
+            tilt_to_size,
+            tilt_to_opacity,
+            tilt_to_scatter,
+            azimuth_to_rotation,
+        }
+    }
+
+    #[inline]
+    pub fn size_from_pressure(&self, pressure: f32) -> f32 {
+        sample_lut_256(&self.pressure_to_size, pressure)
+    }
+
+    #[inline]
+    pub fn opacity_from_pressure(&self, pressure: f32) -> f32 {
+        sample_lut_256(&self.pressure_to_opacity, pressure)
+    }
+
+    #[inline]
+    pub fn size_from_tilt(&self, tilt_mag: f32) -> f32 {
+        let norm = (tilt_mag.clamp(0.0, 90.0) / 90.0).clamp(0.0, 1.0);
+        sample_lut_256(&self.tilt_to_size, norm)
+    }
+
+    #[inline]
+    pub fn opacity_from_tilt(&self, tilt_mag: f32) -> f32 {
+        let norm = (tilt_mag.clamp(0.0, 90.0) / 90.0).clamp(0.0, 1.0);
+        sample_lut_256(&self.tilt_to_opacity, norm)
+    }
+
+    #[inline]
+    pub fn scatter_from_tilt(&self, tilt_mag: f32) -> f32 {
+        let norm = (tilt_mag.clamp(0.0, 90.0) / 90.0).clamp(0.0, 1.0);
+        sample_lut_256(&self.tilt_to_scatter, norm)
+    }
+
+    #[inline]
+    pub fn rotation_from_azimuth(&self, azimuth_deg: f32) -> f32 {
+        let norm = (azimuth_deg.rem_euclid(360.0) / 360.0).clamp(0.0, 1.0);
+        sample_lut_256(&self.azimuth_to_rotation, norm)
+    }
+}
+
 /// Base (pre-jitter) diameter at a step: size × size control (pressure etc.). Drives spacing.
 pub fn base_diameter(b: &BrushSettings, s: &StepInput) -> f32 {
     let sd = &b.shape_dynamics;
@@ -564,7 +793,8 @@ pub fn base_diameter(b: &BrushSettings, s: &StepInput) -> f32 {
         let min = sd.size.minimum.clamp(0.0, 1.0);
         f = min + (1.0 - min) * dynamic_value(&sd.size, s);
     } else if b.pressure_size {
-        f = s.point.pressure.clamp(0.0, 1.0);
+        let lut = DynamicsLut::new(b);
+        f = lut.size_from_pressure(s.point.pressure);
     }
     b.size * f
 }
@@ -581,6 +811,7 @@ fn step_len_for(brush: &BrushSettings, p: &StrokePoint) -> f64 {
 pub struct DabBuilder {
     pub brush: BrushSettings,
     pub seed: u64,
+    pub lut: DynamicsLut,
     /// Per-stroke colour (Color Dynamics with per-tip off), computed at the first step.
     stroke_color: Option<[f32; 4]>,
     next_index: u64,
@@ -588,7 +819,7 @@ pub struct DabBuilder {
 
 impl DabBuilder {
     pub fn new(brush: &BrushSettings) -> Self {
-        Self { brush: brush.clone(), seed: brush.seed, stroke_color: None, next_index: 0 }
+        Self { brush: brush.clone(), seed: brush.seed, lut: DynamicsLut::new(brush), stroke_color: None, next_index: 0 }
     }
 
     pub fn step_len(&self, p: &StrokePoint) -> f64 {
@@ -607,7 +838,13 @@ impl DabBuilder {
         } else {
             1
         };
-        let base_d = base_diameter(b, s);
+        let base_d = if sd.enabled && sd.size.control != Control::Off {
+            base_diameter(b, s)
+        } else if b.pressure_size {
+            b.size * self.lut.size_from_pressure(s.point.pressure)
+        } else {
+            base_diameter(b, s)
+        };
         for _ in 0..count {
             let i = self.next_index;
             self.next_index += 1;
@@ -642,7 +879,7 @@ impl DabBuilder {
                     roundness = (roundness * k).clamp(0.01, 1.0);
                 }
                 if sd.brush_projection {
-                    angle += s.point.rotation;
+                    angle += self.lut.rotation_from_azimuth(s.point.rotation);
                     if tilt > 0.0 {
                         proj_angle = (-s.point.tilt_y).atan2(s.point.tilt_x);
                         proj_scale = tilt.to_radians().cos().max(0.05);
@@ -653,7 +890,12 @@ impl DabBuilder {
             // Scatter.
             let mut c = Point::new(s.point.x, s.point.y);
             if sc.enabled && sc.scatter.jitter > 0.0 {
-                let cv = dynamic_value(&sc.scatter, s);
+                let cv = if sc.scatter.control == Control::PenTilt {
+                    let tilt = s.point.tilt_x.hypot(s.point.tilt_y);
+                    self.lut.scatter_from_tilt(tilt)
+                } else {
+                    dynamic_value(&sc.scatter, s)
+                };
                 let amt = f64::from(sc.scatter.jitter * cv * radius);
                 let (ox, oy) = (rand_signed(seed, i, stream::SCATTER_X) as f64 * amt, rand_signed(seed, i, stream::SCATTER_Y) as f64 * amt);
                 if sc.both_axes {
@@ -670,12 +912,20 @@ impl DabBuilder {
             let tr = &b.transfer;
             let (mut opacity, mut flow) = (1.0, b.flow);
             if tr.enabled {
-                opacity = scalar(&tr.opacity, s, r(stream::OPACITY));
+                if tr.opacity.control == Control::PenTilt {
+                    let tilt = s.point.tilt_x.hypot(s.point.tilt_y);
+                    let cv = self.lut.opacity_from_tilt(tilt);
+                    let min = tr.opacity.minimum.clamp(0.0, 1.0);
+                    let v = (min + (1.0 - min) * cv) * (1.0 - tr.opacity.jitter.clamp(0.0, 1.0) * r(stream::OPACITY));
+                    opacity = v.max(min);
+                } else {
+                    opacity = scalar(&tr.opacity, s, r(stream::OPACITY));
+                }
                 flow *= scalar(&tr.flow, s, r(stream::FLOW));
             }
             let (wet, mix) = if tr.enabled { (scalar(&tr.wetness, s, r(stream::WET)), scalar(&tr.mix, s, r(stream::MIX))) } else { (1.0, 1.0) };
             if b.pressure_opacity && !(tr.enabled && tr.opacity.control != Control::Off) {
-                opacity *= s.point.pressure.clamp(0.0, 1.0);
+                opacity *= self.lut.opacity_from_pressure(s.point.pressure);
             }
             // Colour.
             let color = if b.color_dynamics.enabled {

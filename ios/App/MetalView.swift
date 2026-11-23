@@ -67,6 +67,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         var stamp: TimeInterval
     }
     private var penQueue: [PenItem] = []
+    private var lastQueuedLocation: CGPoint?
     private var smoothedPressure: Float = 0
 
     // Fingers: one finger is decided on by the Rust side (tap, scroll, pan or draw);
@@ -768,9 +769,26 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     /// Adds a Pencil sample. It is sent immediately without artificial delay.
     private func queuePen(_ touch: UITouch, phase: Int32, event: UIEvent?, mods: UInt32) {
+        if phase == 0 {
+            lastQueuedLocation = touch.preciseLocation(in: self)
+        }
         var samples: [UITouch] = [touch]
         if phase == 1, let more = event?.coalescedTouches(for: touch), !more.isEmpty { samples = more }
+        let zoom = handle != nil ? Double(pc_canvas_zoom(handle)) : 1.0
+        // Canvas-space aware sample rejection: 0.5 pt at 1.0x, scaling down with zoom to preserve sub-pixel detail
+        let minScreenDist = min(0.5, 0.5 * max(zoom, 0.01))
         for c in samples {
+            let loc = c.preciseLocation(in: self)
+            if phase == 1, let prev = lastQueuedLocation {
+                let dx = loc.x - prev.x
+                let dy = loc.y - prev.y
+                if (dx * dx + dy * dy) < (minScreenDist * minScreenDist) {
+                    continue
+                }
+            }
+            if phase == 1 {
+                lastQueuedLocation = loc
+            }
             let maxForce = c.maximumPossibleForce
             let normForce = max(0.0009765625, min(1.0, maxForce > 0 ? (c.force / maxForce) : 0.5))
             let waiting = c.estimationUpdateIndex != nil && c.estimatedPropertiesExpectingUpdates.contains(.force)
@@ -778,7 +796,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             if #available(iOS 17.5, *) { roll = c.rollAngle }
             penQueue.append(PenItem(
                 phase: phase,
-                location: c.preciseLocation(in: self),
+                location: loc,
                 force: normForce,
                 altitude: c.altitudeAngle,
                 azimuth: c.azimuthUnitVector(in: self),
@@ -788,6 +806,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 ready: !waiting,
                 time: CACurrentMediaTime(),
                 stamp: c.timestamp))
+        }
+        if phase != 1 {
+            lastQueuedLocation = nil
         }
         flushPen(all: true)
     }
@@ -902,20 +923,34 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     /// Extra points along a smooth (centripetal Catmull-Rom) curve from `p1` to `p2`, so a fast
     /// stroke is drawn as a curve rather than as straight chords. `p0` and `p3` are the
-    /// neighbouring samples; a missing neighbour is mirrored.
+    /// neighbouring samples; a missing neighbour uses one-sided forward/backward tangents.
     private func emitSegment(_ p0: PenPoint?, _ p1: PenPoint, _ p2: PenPoint, _ p3: PenPoint?, mods: UInt32) {
         let dx = p2.x - p1.x, dy = p2.y - p1.y
         let length = (dx * dx + dy * dy).squareRoot()
-        if length < 2.0 { return }
-        let count = min(12, Int((length / 2.0).rounded(.up)) - 1)
+        let zoom = handle != nil ? Double(pc_canvas_zoom(handle)) : 1.0
+        let canvasLength = length / max(zoom, 0.01)
+        if length < 1.0 || canvasLength < 0.5 { return }
+        let stepScreen = 2.0
+        let count = min(24, max(1, Int((length / stepScreen).rounded(.up)))) - 1
         if count < 1 { return }
+
+        // Centripetal Catmull-Rom (alpha = 0.5: Euclidean distance to power 0.5)
+        func dist(_ u: PenPoint, _ v: PenPoint) -> Double {
+            max(((u.x - v.x) * (u.x - v.x) + (u.y - v.y) * (u.y - v.y)).squareRoot().squareRoot(), 1e-6)
+        }
+        let dt12 = dist(p1, p2)
+        // One-sided end tangents: when p0 is missing, tangent at p1 is strictly the forward difference (p2 - p1)/dt12;
+        // when p3 is missing, tangent at p2 is strictly the backward difference (p2 - p1)/dt12.
         let a = p0 ?? PenPoint(x: 2 * p1.x - p2.x, y: 2 * p1.y - p2.y, pressure: p1.pressure, tiltX: p1.tiltX, tiltY: p1.tiltY, roll: p1.roll)
+        let dt01 = (p0 != nil) ? dist(a, p1) : dt12
         let d = p3 ?? PenPoint(x: 2 * p2.x - p1.x, y: 2 * p2.y - p1.y, pressure: p2.pressure, tiltX: p2.tiltX, tiltY: p2.tiltY, roll: p2.roll)
-        func dist(_ u: PenPoint, _ v: PenPoint) -> Double { max(((u.x - v.x) * (u.x - v.x) + (u.y - v.y) * (u.y - v.y)).squareRoot().squareRoot(), 1e-6) }
+        let dt23 = (p3 != nil) ? dist(p2, d) : dt12
+
         let t0 = 0.0
-        let t1 = t0 + dist(a, p1)
-        let t2 = t1 + dist(p1, p2)
-        let t3 = t2 + dist(p2, d)
+        let t1 = t0 + dt01
+        let t2 = t1 + dt12
+        let t3 = t2 + dt23
+
         func mix(_ u: (Double, Double), _ v: (Double, Double), _ w: Double) -> (Double, Double) {
             (u.0 * (1 - w) + v.0 * w, u.1 * (1 - w) + v.1 * w)
         }

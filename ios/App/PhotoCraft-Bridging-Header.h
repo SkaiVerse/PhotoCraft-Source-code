@@ -33,6 +33,7 @@ void pc_long_press(void *h, float x, float y);
 void pc_click(void *h, float x, float y, int button, uint32_t mods);
 void pc_rotate(void *h, float radians, float x, float y);
 float pc_canvas_rotation(void *h);
+float pc_canvas_zoom(void *h);
 void pc_set_touch_shift(void *h, int on);
 void pc_select_tool(void *h, const char *name);
 int pc_show_brush_options(void *h, float x, float y);

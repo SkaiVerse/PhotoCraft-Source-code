@@ -603,7 +603,36 @@ pub(super) fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter
     if let Some((sample, pred_screen_pos)) = app.stylus.feed.predicted() {
         if d.tool.is_brushlike() || strokes_live(d.tool) {
             let last_screen = xf.to_screen(last[0] as f32, last[1] as f32);
-            let dist = (pred_screen_pos - last_screen).length();
+            let brush = &app.session.tools.brush;
+            let strength = brush.smoothing.stabilization.max(brush.smoothing.streamline);
+            let pred_pos = if strength > 0.0 {
+                let dx = (pred_screen_pos.x - last_screen.x) as f64;
+                let dy = (pred_screen_pos.y - last_screen.y) as f64;
+                let len = (dx * dx + dy * dy).sqrt();
+                if len > 1e-4 {
+                    let mut dir = if d.points.len() >= 2 {
+                        let p2 = d.points[d.points.len() - 1];
+                        let p1 = d.points[d.points.len() - 2];
+                        let s2 = xf.to_screen(p2[0] as f32, p2[1] as f32);
+                        let s1 = xf.to_screen(p1[0] as f32, p1[1] as f32);
+                        let ddx = (s2.x - s1.x) as f64;
+                        let ddy = (s2.y - s1.y) as f64;
+                        let slen = (ddx * ddx + ddy * ddy).sqrt();
+                        if slen > 1e-4 { Some([ddx / slen, ddy / slen]) } else { None }
+                    } else {
+                        None
+                    };
+                    let pt = photocraft_paint::StrokePoint::new(pred_screen_pos.x as f64, pred_screen_pos.y as f64, sample.pressure);
+                    let last_pt = photocraft_paint::StrokePoint::new(last_screen.x as f64, last_screen.y as f64, sample.pressure);
+                    let damped = photocraft_paint::apply_directional_damping(pt, last_pt, &mut dir, strength);
+                    egui::pos2(damped.x as f32, damped.y as f32)
+                } else {
+                    pred_screen_pos
+                }
+            } else {
+                pred_screen_pos
+            };
+            let dist = (pred_pos - last_screen).length();
             if dist > 0.5 && dist < 400.0 {
                 let fg = app.session.tools.foreground;
                 let stroke_col = egui::Color32::from_rgba_unmultiplied(
@@ -614,7 +643,7 @@ pub(super) fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter
                 );
                 let brush_radius = (app.session.tools.brush.size * xf.zoom / 2.0).max(1.0);
                 let line_width = (brush_radius * 2.0 * sample.pressure.clamp(0.1, 1.0)).clamp(1.5, (brush_radius * 2.0).max(1.5));
-                painter.line_segment([last_screen, pred_screen_pos], egui::Stroke::new(line_width, stroke_col));
+                painter.line_segment([last_screen, pred_pos], egui::Stroke::new(line_width, stroke_col));
             }
         }
     }
