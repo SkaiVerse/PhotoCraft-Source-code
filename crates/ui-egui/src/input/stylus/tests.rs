@@ -409,3 +409,27 @@ fn the_eraser_end_ends_the_artboard_placing_mode() {
     assert_eq!(app.ui.tool, Tool::Artboard);
     assert!(!app.ui.artboard_tool.adding);
 }
+
+#[test]
+fn predicted_touch_is_ephemeral_and_cleared_across_frames() {
+    let mut s = Stylus::default();
+    let pos = egui::pos2(120.0, 150.0);
+    let sample = PenSample { pressure: 0.75, tilt_x: 10.0, tilt_y: 20.0, rotation: 45.0, eraser: false };
+
+    // Set predicted touch
+    s.feed.set_predicted(Some((sample, pos)));
+    assert!(s.feed.predicted().is_some(), "Predicted touch should be active");
+    let (p_sample, p_pos) = s.feed.predicted().unwrap();
+    assert_eq!(p_pos, pos);
+    assert_eq!(p_sample.pressure, 0.75);
+
+    // Advancing frame should auto-clear predicted touches so they never leak into permanent strokes
+    s.update_for_frame(1, &[]);
+    assert!(s.feed.predicted().is_none(), "Predicted touch must be cleared on frame advance");
+
+    // Multiple points with identical coordinates but updated pressure (estimated property updates)
+    s.feed.set(Some(PenSample { pressure: 0.2, ..Default::default() }));
+    assert_eq!(s.feed.get().unwrap().pressure, 0.2);
+    s.feed.update_latest(PenSample { pressure: 0.85, ..Default::default() });
+    assert_eq!(s.feed.get().unwrap().pressure, 0.85);
+}

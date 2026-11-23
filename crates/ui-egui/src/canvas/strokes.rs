@@ -572,6 +572,13 @@ impl PhotocraftApp {
     pub fn live_stroke_busy(&self) -> bool {
         live_stroke_busy(self)
     }
+
+    /// Cancel and discard any active live stroke or drag without committing any pixels.
+    pub fn cancel_active_stroke(&mut self) {
+        self.live_stroke = None;
+        self.session.clear_live_stroke();
+        self.drag = None;
+    }
 }
 
 /// The points the live retouching stroke has rendered.

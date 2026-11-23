@@ -979,12 +979,33 @@ impl Host {
                 }
             }
         }
+        if cancelled {
+            // When cancelled or a multi-touch gesture interrupts, discard and roll back any unfinalized wet stroke.
+            self.app.cancel_active_stroke();
+            self.post(1, egui::Event::PointerGone);
+            return;
+        }
         match g.mode {
             GMode::Pending => {
                 let quick = g.t0.elapsed() < Duration::from_millis(500);
                 if !cancelled && !g.consumed && quick {
                     if g.on_canvas {
                         self.ctx.data_mut(|d| d.remove::<Vec<u64>>(photocraft_ui_egui::layer_row_ui::swipe_select_key()));
+                        let tool = self.app.ui.tool;
+                        let is_pen_tool = matches!(
+                            tool,
+                            photocraft_ui_egui::Tool::Pen
+                                | photocraft_ui_egui::Tool::CurvaturePen
+                                | photocraft_ui_egui::Tool::FreeformPen
+                                | photocraft_ui_egui::Tool::AddAnchorPoint
+                                | photocraft_ui_egui::Tool::DeleteAnchorPoint
+                                | photocraft_ui_egui::Tool::ConvertPoint
+                        );
+                        if tool.is_brushlike() || is_pen_tool {
+                            // Under pencil-only drawing / finger-draw lock, finger touches on the canvas
+                            // are restricted strictly to navigation/gestures and never place Pen anchors or strokes.
+                            return;
+                        }
                     } else if let Some(lt) = g.layer_touch {
                         // Tapping any single layer row clears multi-selection and selects only that tapped layer
                         self.ctx.data_mut(|d| d.remove::<Vec<u64>>(photocraft_ui_egui::layer_row_ui::swipe_select_key()));

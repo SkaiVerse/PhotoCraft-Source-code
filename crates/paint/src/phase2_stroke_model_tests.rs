@@ -92,3 +92,43 @@ fn test_stabilization_and_streamline_serde() {
     assert_eq!(legacy.stabilization, 0.0);
     assert_eq!(legacy.streamline, 0.0);
 }
+
+#[test]
+fn test_duplicate_points_and_rapid_pressure_spikes() {
+    let p0 = StrokePoint::new(10.0, 10.0, 0.5);
+    let mut dir = Some([1.0, 0.0]);
+
+    // 1. Duplicate points (identical x, y)
+    let p_dup = StrokePoint::new(10.0, 10.0, 0.8);
+    let damped_dup = apply_directional_damping(p_dup, p0, &mut dir, 0.5);
+    assert_eq!(damped_dup.x, 10.0);
+    assert_eq!(damped_dup.y, 10.0);
+    assert!(damped_dup.pressure.is_finite());
+    assert!(damped_dup.pressure >= 0.0009765625 && damped_dup.pressure <= 1.0);
+
+    // 2. Pressure spikes: NaN, infinity, negative, and extreme values
+    let p_nan = StrokePoint::new(15.0, 10.0, f32::NAN);
+    let damped_nan = apply_directional_damping(p_nan, p0, &mut dir, 0.5);
+    assert!(damped_nan.pressure.is_finite(), "Pressure must be sanitized from NaN");
+    assert!(damped_nan.pressure >= 0.0009765625 && damped_nan.pressure <= 1.0);
+
+    let p_inf = StrokePoint::new(20.0, 10.0, f32::INFINITY);
+    let damped_inf = apply_directional_damping(p_inf, p0, &mut dir, 0.5);
+    assert!(damped_inf.pressure.is_finite(), "Pressure must be sanitized from Infinity");
+    assert!(damped_inf.pressure >= 0.0009765625 && damped_inf.pressure <= 1.0);
+
+    // 3. DynamicsLut evaluation under pressure spikes and NaNs
+    let b = BrushSettings {
+        size: 24.0,
+        pressure_size: true,
+        pressure_opacity: true,
+        ..Default::default()
+    };
+    let lut = DynamicsLut::new(&b);
+    let s_nan = lut.size_from_pressure(f32::NAN);
+    assert!(s_nan.is_finite(), "LUT size lookup on NaN must be finite");
+    let s_inf = lut.size_from_pressure(f32::INFINITY);
+    assert!(s_inf.is_finite(), "LUT size lookup on Infinity must be finite");
+    let o_neg = lut.opacity_from_pressure(-10.0);
+    assert!(o_neg.is_finite(), "LUT opacity lookup on negative pressure must be finite");
+}

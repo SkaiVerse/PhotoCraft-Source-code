@@ -76,6 +76,16 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private var ignoredTouches = Set<UITouch>()
     private var fingerTouch: UITouch?
     private var fingerLast = CGPoint.zero
+    /// Multi-touch tap arbitration: track peak simultaneous touches during gesture.
+    private var maxTouchCount: Int = 0
+    private var touchStartTime: TimeInterval = 0
+    private var touchStartLocations: [ObjectIdentifier: CGPoint] = [:]
+    private var multiTouchExceededSlop = false
+    /// Transient buffer for single finger to avoid committing brush/pen dabs before multi-touch arbitration settles.
+    private var pendingFingerTouch: UITouch?
+    private var pendingFingerPos = CGPoint.zero
+    private var pendingFingerMods: UInt32 = 0
+    private var fingerDispatchTimer: Timer?
     /// A fingertip resting on the screen while the Pencil draws: holds Shift (keeps proportions).
     private var constrainTouch: UITouch?
 
@@ -92,6 +102,11 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if let t = pencilTouch, t.phase == .ended || t.phase == .cancelled { pencilTouch = nil }
         directTouches = directTouches.filter { $0.phase != .ended && $0.phase != .cancelled }
         ignoredTouches = ignoredTouches.filter { $0.phase != .ended && $0.phase != .cancelled }
+        if let p = pendingFingerTouch, p.phase == .ended || p.phase == .cancelled {
+            fingerDispatchTimer?.invalidate()
+            fingerDispatchTimer = nil
+            pendingFingerTouch = nil
+        }
         if let f = fingerTouch, f.phase == .ended || f.phase == .cancelled { cancelFinger() }
         if let c = constrainTouch, c.phase == .ended || c.phase == .cancelled { releaseConstrain() }
     }
@@ -567,20 +582,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         longPress.delegate = self
         addGestureRecognizer(longPress)
 
-        // Two fingers tap: Undo. Three fingers tap: Redo.
-        let twoTap = UITapGestureRecognizer(target: self, action: #selector(twoFingerTap(_:)))
-        twoTap.numberOfTouchesRequired = 2
-        twoTap.allowedTouchTypes = direct
-        twoTap.cancelsTouchesInView = false
-        twoTap.delegate = self
-        addGestureRecognizer(twoTap)
-
-        let threeTap = UITapGestureRecognizer(target: self, action: #selector(threeFingerTap(_:)))
-        threeTap.numberOfTouchesRequired = 3
-        threeTap.allowedTouchTypes = direct
-        threeTap.cancelsTouchesInView = false
-        threeTap.delegate = self
-        addGestureRecognizer(threeTap)
+        // Note: Two-finger Undo and three-finger Redo are tracked directly in the touch-routing state machine
+        // (finish / touchesEnded) using maxTouchCount to prevent 2-finger Undo from firing during 3-finger Redo.
     }
 
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
@@ -759,8 +762,22 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if let h = handle { pc_set_touch_shift(h, 0) }
     }
 
+    private func dispatchPendingFinger() {
+        guard let t = pendingFingerTouch, let h = handle else { return }
+        pendingFingerTouch = nil
+        fingerDispatchTimer = nil
+        if directTouches.count == 1 && maxTouchCount == 1 {
+            fingerTouch = t
+            fingerLast = pendingFingerPos
+            pc_finger(h, 0, Float(pendingFingerPos.x), Float(pendingFingerPos.y), pendingFingerMods)
+        }
+    }
+
     /// Drops a finger that was acting as the pointer (a second finger or the Pencil arrived).
     private func cancelFinger() {
+        fingerDispatchTimer?.invalidate()
+        fingerDispatchTimer = nil
+        pendingFingerTouch = nil
         if fingerTouch != nil, let h = handle {
             pc_finger(h, 3, Float(fingerLast.x), Float(fingerLast.y), 0)
         }
@@ -936,15 +953,21 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
         // Centripetal Catmull-Rom (alpha = 0.5: Euclidean distance to power 0.5)
         func dist(_ u: PenPoint, _ v: PenPoint) -> Double {
-            max(((u.x - v.x) * (u.x - v.x) + (u.y - v.y) * (u.y - v.y)).squareRoot().squareRoot(), 1e-6)
+            max(((u.x - v.x) * (u.x - v.x) + (u.y - v.y) * (u.y - v.y)).squareRoot().squareRoot(), 0.7071)
         }
         let dt12 = dist(p1, p2)
-        // One-sided end tangents: when p0 is missing, tangent at p1 is strictly the forward difference (p2 - p1)/dt12;
-        // when p3 is missing, tangent at p2 is strictly the backward difference (p2 - p1)/dt12.
-        let a = p0 ?? PenPoint(x: 2 * p1.x - p2.x, y: 2 * p1.y - p2.y, pressure: p1.pressure, tiltX: p1.tiltX, tiltY: p1.tiltY, roll: p1.roll)
-        let dt01 = (p0 != nil) ? dist(a, p1) : dt12
-        let d = p3 ?? PenPoint(x: 2 * p2.x - p1.x, y: 2 * p2.y - p1.y, pressure: p2.pressure, tiltX: p2.tiltX, tiltY: p2.tiltY, roll: p2.roll)
-        let dt23 = (p3 != nil) ? dist(p2, d) : dt12
+
+        // One-sided end tangents: when p0 is missing or too close to p1 (< 0.5 pt), tangent at p1 is strictly
+        // the forward difference (p2 - p1)/dt12; when p3 is missing or too close to p2 (< 0.5 pt), tangent at p2
+        // is strictly the backward difference (p2 - p1)/dt12. This eliminates division-by-zero tangent spikes
+        // and wild overshoots from duplicate or near-duplicate points.
+        let len01 = p0 != nil ? ((p0!.x - p1.x) * (p0!.x - p1.x) + (p0!.y - p1.y) * (p0!.y - p1.y)).squareRoot() : 0.0
+        let a = (p0 != nil && len01 >= 0.5) ? p0! : PenPoint(x: 2 * p1.x - p2.x, y: 2 * p1.y - p2.y, pressure: p1.pressure, tiltX: p1.tiltX, tiltY: p1.tiltY, roll: p1.roll)
+        let dt01 = (p0 != nil && len01 >= 0.5) ? dist(a, p1) : dt12
+
+        let len23 = p3 != nil ? ((p3!.x - p2.x) * (p3!.x - p2.x) + (p3!.y - p2.y) * (p3!.y - p2.y)).squareRoot() : 0.0
+        let d = (p3 != nil && len23 >= 0.5) ? p3! : PenPoint(x: 2 * p2.x - p1.x, y: 2 * p2.y - p1.y, pressure: p2.pressure, tiltX: p2.tiltX, tiltY: p2.tiltY, roll: p2.roll)
+        let dt23 = (p3 != nil && len23 >= 0.5) ? dist(p2, d) : dt12
 
         let t0 = 0.0
         let t1 = t0 + dt01
@@ -956,6 +979,11 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         }
         var rollDelta = p2.roll - p1.roll
         if rollDelta > 180 { rollDelta -= 360 } else if rollDelta < -180 { rollDelta += 360 }
+
+        let chordMidX = (p1.x + p2.x) * 0.5
+        let chordMidY = (p1.y + p2.y) * 0.5
+        let maxDevSq = (length * 1.5 + 8.0) * (length * 1.5 + 8.0)
+
         for i in 1...count {
             let u = Double(i) / Double(count + 1)
             let t = t1 + (t2 - t1) * u
@@ -966,9 +994,14 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             let B2 = mix(A2, A3, (t - t1) / (t3 - t1))
             let C = mix(B1, B2, (t - t1) / (t2 - t1))
             if !C.0.isFinite || !C.1.isFinite { continue }
+            let devX = C.0 - chordMidX
+            let devY = C.1 - chordMidY
+            if (devX * devX + devY * devY) > maxDevSq { continue }
+
             let f = Float(u)
+            let midPressure = max(0.0009765625, min(1.0, p1.pressure + (p2.pressure - p1.pressure) * f))
             let mid = PenPoint(x: C.0, y: C.1,
-                               pressure: p1.pressure + (p2.pressure - p1.pressure) * f,
+                               pressure: midPressure,
                                tiltX: p1.tiltX + (p2.tiltX - p1.tiltX) * f,
                                tiltY: p1.tiltY + (p2.tiltY - p1.tiltY) * f,
                                roll: p1.roll + rollDelta * f)
@@ -981,6 +1014,12 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         pruneTouches()
         keyboardDismissed = false
         let mods = modBits(event?.modifierFlags ?? [])
+        if directTouches.isEmpty {
+            maxTouchCount = 0
+            touchStartTime = CACurrentMediaTime()
+            multiTouchExceededSlop = false
+            touchStartLocations.removeAll()
+        }
         for t in touches {
             let p = t.location(in: self)
             switch t.type {
@@ -1010,13 +1049,21 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                     continue
                 }
                 directTouches.insert(t)
-                if directTouches.count == 1 {
-                    fingerTouch = t
-                    fingerLast = p
-                    pc_finger(h, 0, Float(p.x), Float(p.y), mods)
-                } else {
-                    // A second finger means scrolling, pinching or a tap gesture, never a press.
+                touchStartLocations[ObjectIdentifier(t)] = p
+                maxTouchCount = max(maxTouchCount, directTouches.count)
+                if maxTouchCount >= 2 {
+                    // Multi-touch gesture (2-finger undo/pan/zoom/rotate or 3-finger redo):
+                    // Discard any pending or active single-finger touch immediately so zero pixels are stamped!
                     cancelFinger()
+                } else if directTouches.count == 1 {
+                    // Buffer initial single-finger touch briefly (45ms) to arbitrate against a 2nd or 3rd finger landing.
+                    pendingFingerTouch = t
+                    pendingFingerPos = p
+                    pendingFingerMods = mods
+                    fingerDispatchTimer?.invalidate()
+                    fingerDispatchTimer = Timer.scheduledTimer(withTimeInterval: 0.045, repeats: false) { [weak self] _ in
+                        self?.dispatchPendingFinger()
+                    }
                 }
             }
         }
@@ -1041,11 +1088,33 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                             if #available(iOS 17.5, *) { roll = Float(pt.rollAngle * 180 / CGFloat.pi) }
                             pc_pen_predicted(h, Float(loc.x), Float(loc.y), Float(normForce), tx, ty, roll)
                         }
+                    } else {
+                        pc_pen_predicted_clear(h)
                     }
                 }
             case .indirectPointer:
                 pc_pointer_moved(h, Float(p.x), Float(p.y))
             default:
+                if let start = touchStartLocations[ObjectIdentifier(t)] {
+                    let dx = p.x - start.x, dy = p.y - start.y
+                    if (dx * dx + dy * dy) > (15.0 * 15.0) {
+                        multiTouchExceededSlop = true
+                    }
+                }
+                if t === pendingFingerTouch {
+                    let dx = p.x - pendingFingerPos.x, dy = p.y - pendingFingerPos.y
+                    if (dx * dx + dy * dy) > (8.0 * 8.0) {
+                        // Dragging deliberately: commit single finger now and forward move
+                        fingerDispatchTimer?.invalidate()
+                        fingerDispatchTimer = nil
+                        dispatchPendingFinger()
+                        if fingerTouch != nil {
+                            fingerLast = p
+                            pc_finger(h, 1, Float(p.x), Float(p.y), mods)
+                        }
+                    }
+                    continue
+                }
                 guard t === fingerTouch else { continue }
                 fingerLast = p
                 pc_finger(h, 1, Float(p.x), Float(p.y), mods)
@@ -1074,10 +1143,37 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                     releaseConstrain()
                     continue
                 }
+                if t === pendingFingerTouch {
+                    fingerDispatchTimer?.invalidate()
+                    fingerDispatchTimer = nil
+                    pendingFingerTouch = nil
+                    if !cancelled && maxTouchCount == 1 {
+                        // Quick single-finger tap that lifted before the 45ms timer
+                        pc_finger(h, 0, Float(pendingFingerPos.x), Float(pendingFingerPos.y), pendingFingerMods)
+                        pc_finger(h, 2, Float(p.x), Float(p.y), mods)
+                    }
+                }
                 directTouches.remove(t)
-                guard t === fingerTouch else { continue }
-                pc_finger(h, cancelled ? 3 : 2, Float(p.x), Float(p.y), mods)
-                fingerTouch = nil
+                if t === fingerTouch {
+                    pc_finger(h, cancelled ? 3 : 2, Float(p.x), Float(p.y), mods)
+                    fingerTouch = nil
+                }
+                if directTouches.isEmpty {
+                    // All fingers have lifted: resolve multi-touch tap gestures
+                    let tapDuration = CACurrentMediaTime() - touchStartTime
+                    if !cancelled && !multiTouchExceededSlop && tapDuration < 0.45 && !pencilNear {
+                        if maxTouchCount == 3 {
+                            pcLog("gesture: 3-finger tap -> Redo")
+                            tapKey(0x1D, mods: 8 | 1) // ⇧⌘Z
+                        } else if maxTouchCount == 2 {
+                            pcLog("gesture: 2-finger tap -> Undo")
+                            tapKey(0x1D, mods: 8)     // ⌘Z
+                        }
+                    }
+                    maxTouchCount = 0
+                    touchStartLocations.removeAll()
+                    multiTouchExceededSlop = false
+                }
             }
         }
     }

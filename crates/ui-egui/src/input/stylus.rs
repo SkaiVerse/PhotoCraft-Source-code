@@ -208,6 +208,8 @@ impl Stylus {
     /// pen samples.
     pub fn update_for_frame(&mut self, frame: u64, events: &[egui::Event]) {
         if self.updated_frame.replace(frame) != Some(frame) {
+            // Ephemeral predicted touches must never leak across frames.
+            self.feed.set_predicted(None);
             self.update(events);
         }
     }

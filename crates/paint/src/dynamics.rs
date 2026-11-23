@@ -141,10 +141,12 @@ pub fn apply_directional_damping(
     }
     let ff = alpha_par as f32;
     let dr = (raw.rotation - prev.rotation + 540.0).rem_euclid(360.0) - 180.0;
+    let raw_p = if raw.pressure.is_finite() { raw.pressure.clamp(0.0009765625, 1.0) } else { prev.pressure };
+    let new_p = (prev.pressure + (raw_p - prev.pressure) * ff).clamp(0.0009765625, 1.0);
     StrokePoint {
         x: prev.x + damped_dx,
         y: prev.y + damped_dy,
-        pressure: prev.pressure + (raw.pressure - prev.pressure) * ff,
+        pressure: new_p,
         tilt_x: prev.tilt_x + (raw.tilt_x - prev.tilt_x) * ff,
         tilt_y: prev.tilt_y + (raw.tilt_y - prev.tilt_y) * ff,
         rotation: (prev.rotation + dr * ff).rem_euclid(360.0),
@@ -633,7 +635,8 @@ pub fn dynamic_color(b: &BrushSettings, s: &StepInput, seed: u64, index: u64) ->
 
 #[inline]
 fn sample_lut_256(table: &[f32; 256], x: f32) -> f32 {
-    let t = x.clamp(0.0, 1.0) * 255.0;
+    let x_safe = if x.is_finite() { x.clamp(0.0, 1.0) } else { 0.0 };
+    let t = x_safe * 255.0;
     let idx = t.floor() as usize;
     if idx >= 255 {
         return table[255];
