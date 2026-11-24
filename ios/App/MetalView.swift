@@ -838,7 +838,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if phase != 1 {
             lastQueuedLocation = nil
         }
-        flushPen(all: true)
+        flushPen(all: phase != 0)
     }
 
     /// iPadOS refines the Pencil's pressure a few milliseconds after the touch. Matching the
@@ -872,6 +872,17 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         let now = CACurrentMediaTime()
         while penQueueHead < penQueue.count {
             let item = penQueue[penQueueHead]
+            // Hold dab #1 in transient predicted pass until first finalized force estimate arrives
+            // (or up to 2 samples, or 35ms timeout) to eliminate uncalibrated force dots/blots.
+            if item.phase == 0 && !item.ready && (penQueue.count - penQueueHead) < 2 && (now - item.time < 0.035) && !all {
+                if let h = handle {
+                    let (tx, ty) = self.tilt(altitude: Double(item.altitude), azimuth: item.azimuth)
+                    var roll: Float = 0
+                    if #available(iOS 17.5, *) { roll = Float(item.roll * 180 / CGFloat.pi) }
+                    pc_pen_predicted(h, Float(item.location.x), Float(item.location.y), Float(item.force), tx, ty, roll)
+                }
+                break
+            }
             if item.ready || all || now - item.time > 0.004 {
                 penQueueHead += 1
                 sendPen(item)

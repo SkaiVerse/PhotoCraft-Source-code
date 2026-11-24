@@ -1474,8 +1474,9 @@ pub unsafe extern "C" fn pc_pen(
         let m = h.modifiers;
         // The shell sends the Pencil's normalized force (0.0009765625 to 1.0); full pressure is reached
         // at `pressure_divisor`.
+        let raw_p = (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0);
         let sample = PenSample {
-            pressure: (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0),
+            pressure: photocraft_paint::calibrate_stylus_pressure(raw_p).clamp(0.0009765625, 1.0),
             tilt_x,
             tilt_y,
             rotation: rotation.rem_euclid(360.0),
@@ -1532,10 +1533,11 @@ pub unsafe extern "C" fn pc_pen_predicted(
     rotation: f32,
 ) {
     if let Some(h) = unsafe { host(h) } {
-        if h.pen_down {
+        if h.pen_down || h.on_canvas(x, y) {
             let pos = h.pt(x, y);
+            let raw_p = (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0);
             let sample = PenSample {
-                pressure: (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0),
+                pressure: photocraft_paint::calibrate_stylus_pressure(raw_p).clamp(0.0009765625, 1.0),
                 tilt_x,
                 tilt_y,
                 rotation: rotation.rem_euclid(360.0),
@@ -1565,8 +1567,9 @@ pub unsafe extern "C" fn pc_pen_update_estimate(
 ) {
     if let Some(h) = unsafe { host(h) } {
         if h.pen_down {
+            let raw_p = (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0);
             let sample = PenSample {
-                pressure: (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0),
+                pressure: photocraft_paint::calibrate_stylus_pressure(raw_p).clamp(0.0009765625, 1.0),
                 tilt_x,
                 tilt_y,
                 rotation: rotation.rem_euclid(360.0),

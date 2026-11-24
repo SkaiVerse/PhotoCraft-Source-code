@@ -665,6 +665,10 @@ pub struct BrushSettings {
     pub shape_azimuth: bool,
     #[serde(alias = "shapeScatter")]
     pub shape_scatter: f32,
+    #[serde(alias = "dynamicsVelocitySize")]
+    pub dynamics_velocity_size: f32,
+    #[serde(alias = "dynamicsVelocityOpacity")]
+    pub dynamics_velocity_opacity: f32,
 }
 
 impl Default for BrushSettings {
@@ -725,6 +729,8 @@ impl Default for BrushSettings {
             dynamics_tilt_opacity: 0.0,
             shape_azimuth: false,
             shape_scatter: 0.0,
+            dynamics_velocity_size: 0.0,
+            dynamics_velocity_opacity: 0.0,
         }
     }
 }

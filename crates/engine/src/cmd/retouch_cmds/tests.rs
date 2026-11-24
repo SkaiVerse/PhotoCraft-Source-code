@@ -591,6 +591,7 @@ fn protect_detail_sharpens_with_every_stamp_of_a_count_but_not_with_airbrush_rep
                 direction: 0.0,
                 initial_direction: 0.0,
                 step: 0,
+                velocity: 0.0,
             };
             photocraft_paint::dynamics::DabBuilder::new(&b).build(&step, &mut dabs);
             dabs.len() == 4 && dabs[1..].iter().any(|d| d.radius > dabs[0].radius + 3.0)

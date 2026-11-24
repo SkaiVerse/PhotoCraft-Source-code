@@ -96,6 +96,100 @@ fn pose_differs(brush: &StrokePoint, p: &StrokePoint, eps: f32) -> bool {
         || (p.wheel - brush.wheel).abs() > eps
 }
 
+/// Global Apple Pencil concave pressure calibration curve:
+/// Saturates full output (1.0) at 0.70 of hardware max force (clamp(p / 0.70, 0.0, 1.0))
+/// and applies a concave gamma lift (pow(p_scaled, 0.60)) so light sketching registers
+/// effortlessly while retaining full dynamic range.
+#[inline]
+pub fn calibrate_stylus_pressure(raw_force: f32) -> f32 {
+    let p_scaled = (raw_force.max(0.0) / 0.70).min(1.0);
+    p_scaled.powf(0.60)
+}
+
+/// Damped circular angle filter with shortest-arc angular interpolation across [-pi, pi].
+/// `current`: current filtered angle in radians [-pi, pi].
+/// `target`: new target angle in radians [-pi, pi].
+/// `alpha`: damping factor in [0.0, 1.0] (0.0 = keep current, 1.0 = instant target).
+#[inline]
+pub fn filter_circular_angle(current: f32, target: f32, alpha: f32) -> f32 {
+    let pi = std::f32::consts::PI;
+    let two_pi = 2.0 * pi;
+    let diff = (target - current + pi).rem_euclid(two_pi) - pi;
+    let filtered = current + diff * alpha.clamp(0.0, 1.0);
+    (filtered + pi).rem_euclid(two_pi) - pi
+}
+
+/// Perpendicular motion filtering: dampens hand wobble perpendicular to the travel vector
+/// without dragging the stroke behind the nib or shrinking tight loops / collapsing corners.
+pub fn filter_perpendicular_motion(
+    raw: StrokePoint,
+    prev: StrokePoint,
+    dir: &mut Option<[f64; 2]>,
+    strength: f32,
+) -> StrokePoint {
+    let s = (strength as f64).clamp(0.0, 1.0);
+    if s <= 0.0 {
+        return raw;
+    }
+    let dx = raw.x - prev.x;
+    let dy = raw.y - prev.y;
+    let dist = (dx * dx + dy * dy).sqrt();
+    if dist < 1e-6 {
+        return StrokePoint { x: prev.x, y: prev.y, ..raw };
+    }
+    let raw_u = [dx / dist, dy / dist];
+    let (damped_dx, damped_dy) = if let Some(u) = *dir {
+        let dot = raw_u[0] * u[0] + raw_u[1] * u[1]; // cosine of heading change
+        // Corner-collapse protection: when heading changes sharply (dot < 0.3),
+        // ease off damping so corner apexes and tight loops do not shrink or collapse.
+        let corner_factor = if dot < 0.3 {
+            (dot.max(0.0) / 0.3).powi(2)
+        } else {
+            1.0
+        };
+        let eff_s = s * corner_factor;
+        let alpha_par = 1.0 - 0.5 * eff_s;
+        let alpha_perp = 1.0 - 0.875 * eff_s;
+
+        let par_len = dx * u[0] + dy * u[1];
+        let par_x = par_len * u[0];
+        let par_y = par_len * u[1];
+        let perp_x = dx - par_x;
+        let perp_y = dy - par_y;
+        (par_x * alpha_par + perp_x * alpha_perp, par_y * alpha_par + perp_y * alpha_perp)
+    } else {
+        *dir = Some(raw_u);
+        (dx, dy)
+    };
+
+    let new_len = (damped_dx * damped_dx + damped_dy * damped_dy).sqrt();
+    if new_len > 1e-6 {
+        let new_u = [damped_dx / new_len, damped_dy / new_len];
+        *dir = Some(if let Some(u) = *dir {
+            let blend_x = u[0] * 0.75 + new_u[0] * 0.25;
+            let blend_y = u[1] * 0.75 + new_u[1] * 0.25;
+            let blen = (blend_x * blend_x + blend_y * blend_y).sqrt().max(1e-6);
+            [blend_x / blen, blend_y / blen]
+        } else {
+            new_u
+        });
+    }
+    let ff = (1.0 - 0.5 * s) as f32;
+    let dr = (raw.rotation - prev.rotation + 540.0).rem_euclid(360.0) - 180.0;
+    let raw_p = if raw.pressure.is_finite() { raw.pressure.clamp(0.0009765625, 1.0) } else { prev.pressure };
+    let new_p = (prev.pressure + (raw_p - prev.pressure) * ff).clamp(0.0009765625, 1.0);
+    StrokePoint {
+        x: prev.x + damped_dx,
+        y: prev.y + damped_dy,
+        pressure: new_p,
+        tilt_x: prev.tilt_x + (raw.tilt_x - prev.tilt_x) * ff,
+        tilt_y: prev.tilt_y + (raw.tilt_y - prev.tilt_y) * ff,
+        rotation: (prev.rotation + dr * ff).rem_euclid(360.0),
+        wheel: prev.wheel + (raw.wheel - prev.wheel) * ff,
+        time: raw.time,
+    }
+}
+
 /// Directional damping with 0.125 base gain + EMA for stabilization and streamline.
 pub fn apply_directional_damping(
     raw: StrokePoint,
@@ -306,6 +400,8 @@ pub struct StepInput {
     pub initial_direction: f32,
     /// Sequential step number (0 = first).
     pub step: u64,
+    /// Estimated stroke velocity in px/ms.
+    pub velocity: f32,
 }
 
 /// Walks a polyline and emits steps every `step_len(point)` pixels, plus airbrush steps in time.
@@ -330,6 +426,7 @@ pub struct PathWalker {
     grid: Option<f64>,
     /// The grid cell of the last pixel-grid step, so the next segment joins it (#8040).
     cell: Option<(f64, f64)>,
+    velocity: f32,
 }
 
 impl PathWalker {
@@ -347,6 +444,7 @@ impl PathWalker {
             speed_acc: 0.0,
             grid: None,
             cell: None,
+            velocity: 0.0,
         }
     }
 
@@ -434,7 +532,13 @@ impl PathWalker {
         if let Some(g) = self.grid {
             self.cell = Some((grid_cell(point.x, g), grid_cell(point.y, g)));
         }
-        let s = StepInput { point, direction: self.dir, initial_direction: self.initial_dir.unwrap_or(self.dir), step: self.step };
+        let s = StepInput {
+            point,
+            direction: self.dir,
+            initial_direction: self.initial_dir.unwrap_or(self.dir),
+            step: self.step,
+            velocity: self.velocity,
+        };
         self.step += 1;
         out(s);
     }
@@ -449,10 +553,17 @@ impl PathWalker {
         let (dx, dy) = (p.x - a.x, p.y - a.y);
         let len = (dx * dx + dy * dy).sqrt();
         if len > 1e-9 {
-            self.dir = (-dy).atan2(dx) as f32;
+            let target_dir = (-dy).atan2(dx) as f32;
             if self.initial_dir.is_none() {
-                self.initial_dir = Some(self.dir);
+                self.dir = target_dir;
+                self.initial_dir = Some(target_dir);
+            } else {
+                let alpha = (len as f32 / 6.0).clamp(0.20, 0.75);
+                self.dir = filter_circular_angle(self.dir, target_dir, alpha);
             }
+            let dt = (p.time - a.time).max(0.0);
+            let instant_speed = if dt > 0.0 { (len / dt) as f32 } else { (len / 16.0) as f32 };
+            self.velocity = self.velocity * 0.7 + instant_speed * 0.3;
         }
         if let Some(f) = self.pending_first.take() {
             self.emit_first(f, out);
@@ -855,7 +966,7 @@ pub fn base_diameter(b: &BrushSettings, s: &StepInput) -> f32 {
 
 /// Distance to the next step at `p`: the diameter there times the spacing.
 fn step_len_for(brush: &BrushSettings, p: &StrokePoint) -> f64 {
-    let s = StepInput { point: *p, direction: 0.0, initial_direction: 0.0, step: 0 };
+    let s = StepInput { point: *p, direction: 0.0, initial_direction: 0.0, step: 0, velocity: 0.0 };
     let d = base_diameter(brush, &s).max(1.0);
     f64::from(d * brush.spacing.max(0.01)).max(0.5)
 }
@@ -924,6 +1035,11 @@ impl DabBuilder {
                 if b.taper_size != 0.0 || (b.taper_size == 0.0 && b.taper_opacity == 0.0) {
                     diameter *= taper_factor;
                 }
+            }
+            if b.dynamics_velocity_size > 0.0 {
+                let norm_v = (s.velocity / 2.0).clamp(0.0, 1.0);
+                let v_size_mult = 1.0 - b.dynamics_velocity_size.clamp(0.0, 1.0) * 0.40 * norm_v;
+                diameter = (diameter * v_size_mult).max(0.5);
             }
             let mut angle = b.angle;
             if b.shape_azimuth {
@@ -1021,6 +1137,11 @@ impl DabBuilder {
                 if b.taper_opacity != 0.0 || (b.taper_size == 0.0 && b.taper_opacity == 0.0) {
                     opacity *= taper_factor;
                 }
+            }
+            if b.dynamics_velocity_opacity > 0.0 {
+                let norm_v = (s.velocity / 2.0).clamp(0.0, 1.0);
+                let v_op_mult = 1.0 - b.dynamics_velocity_opacity.clamp(0.0, 1.0) * 0.35 * norm_v;
+                opacity = (opacity * v_op_mult).clamp(0.0, 1.0);
             }
             // Colour.
             let color = if b.color_dynamics.enabled {
@@ -1133,6 +1254,44 @@ pub fn apply_pose(b: &BrushSettings, mut p: StrokePoint) -> StrokePoint {
     p
 }
 
+/// Retroactively taper the final segment of dabs based on exit velocity and tangent across final samples.
+/// Scales dab diameter (radius) and opacity smoothly down to a point along the exit tangent,
+/// eliminating blunt pill-caps on fast flicks.
+pub fn apply_retroactive_liftoff_taper(
+    dabs: &mut [Dab],
+    recent_points: &[StrokePoint],
+) {
+    if dabs.is_empty() || recent_points.len() < 2 {
+        return;
+    }
+    let n_pts = recent_points.len();
+    let sample_window = n_pts.min(5);
+    let pts = &recent_points[n_pts - sample_window..];
+
+    let dx = pts[pts.len() - 1].x - pts[0].x;
+    let dy = pts[pts.len() - 1].y - pts[0].y;
+    let chord_len = (dx * dx + dy * dy).sqrt();
+    if chord_len < 1e-4 {
+        return;
+    }
+
+    let taper_count = (dabs.len().min(8) as f32).round().max(2.0) as usize;
+    let taper_count = taper_count.min(dabs.len());
+    if taper_count == 0 {
+        return;
+    }
+
+    let start_idx = dabs.len() - taper_count;
+    for (i, dab) in dabs[start_idx..].iter_mut().enumerate() {
+        let progress = (i + 1) as f32 / taper_count as f32;
+        let taper_scale = (1.0 - progress * 0.90).clamp(0.05, 1.0);
+        let smooth_taper = (taper_scale * std::f32::consts::PI * 0.5).sin();
+
+        dab.radius = (dab.radius * smooth_taper).max(0.2);
+        dab.opacity = (dab.opacity * smooth_taper).clamp(0.0, 1.0);
+    }
+}
+
 /// Incremental dab generation for a whole brush (primary and optional dual dabs).
 #[derive(Clone, Debug)]
 pub struct DabGenerator {
@@ -1145,6 +1304,8 @@ pub struct DabGenerator {
     /// The brush the step length is read from, apart from the builder so the walker can read it
     /// while its callback has the builder.
     step_brush: std::sync::Arc<BrushSettings>,
+    recent_points: [StrokePoint; 5],
+    recent_count: usize,
 }
 
 impl DabGenerator {
@@ -1176,11 +1337,18 @@ impl DabGenerator {
             dual: dual_on.then(|| DualBuilder::new(&brush)),
             scratch: Vec::new(),
             step_brush: std::sync::Arc::new(brush),
+            recent_points: [StrokePoint::default(); 5],
+            recent_count: 0,
         }
     }
 
     fn walk(&mut self, pts: &[StrokePoint], dabs: &mut Vec<Dab>, dual: &mut Vec<Dab>) {
         for p in pts {
+            for i in 0..4 {
+                self.recent_points[i] = self.recent_points[i + 1];
+            }
+            self.recent_points[4] = *p;
+            self.recent_count = (self.recent_count + 1).min(5);
             let p = apply_pose(&self.builder.brush, *p);
             // Each step becomes its dabs as the walker emits it: a long segment never holds its
             // step list (the pixel-grid mode can emit 1e7 steps for one).

@@ -40,7 +40,10 @@ pub use brush::{
     Scattering, SectionLocks, ShapeDynamics, Smoothing, Texture, TipShape, Transfer,
 };
 pub use curve::ResponseCurve;
-pub use dynamics::{DynamicsLut, apply_directional_damping};
+pub use dynamics::{
+    DynamicsLut, apply_directional_damping, apply_retroactive_liftoff_taper,
+    calibrate_stylus_pressure, filter_circular_angle, filter_perpendicular_motion,
+};
 pub use mip_cache::{mip_cache_bytes, purge_mip_cache};
 pub use mixer::MixerSettings;
 pub use render::{BrushContext, StrokeRenderer, UnionLive, grid_center, grid_square, render_stroke, render_stroke_clipped};
