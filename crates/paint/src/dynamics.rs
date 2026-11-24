@@ -119,6 +119,48 @@ pub fn filter_circular_angle(current: f32, target: f32, alpha: f32) -> f32 {
     (filtered + pi).rem_euclid(two_pi) - pi
 }
 
+/// Magnetic rotation snapping:
+/// Snaps angle `deg` to the nearest cardinal orientation (0°, 90°, 180°, -90° / 270°)
+/// if within `detent_threshold_deg` (e.g. 4.0°). Outside that window, breaks out smoothly.
+/// Returns (adjusted_deg, is_snapped).
+pub fn apply_magnetic_rotation(deg: f32, detent_threshold_deg: f32) -> (f32, bool) {
+    if !deg.is_finite() {
+        return (0.0, false);
+    }
+    let threshold = if detent_threshold_deg.is_finite() {
+        detent_threshold_deg.max(0.0)
+    } else {
+        4.0
+    };
+
+    // Wrap to (-180, 180]
+    let mut w = (deg as f64) % 360.0;
+    if w > 180.0 {
+        w -= 360.0;
+    } else if w <= -180.0 {
+        w += 360.0;
+    }
+    let w_f32 = w as f32;
+
+    let cardinals = [0.0f32, 90.0, -90.0, 180.0];
+    for &c in &cardinals {
+        let diff = if c == 180.0 {
+            (180.0 - w_f32.abs()).abs()
+        } else {
+            (w_f32 - c).abs()
+        };
+        if diff <= threshold {
+            let snapped = if c == 180.0 {
+                if w_f32 < 0.0 { -180.0 } else { 180.0 }
+            } else {
+                c
+            };
+            return (snapped, true);
+        }
+    }
+    (w_f32, false)
+}
+
 /// Height-map "paper tooth" grain modulation:
 /// Evaluates paper tooth coverage driven by calibrated pressure and grainDepth:
 /// mask = clamp((pressure * depth - (1.0 - grainHeight)) / softness, 0.0, 1.0).

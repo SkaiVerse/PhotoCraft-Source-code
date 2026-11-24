@@ -104,6 +104,24 @@ pub(crate) use selection::{floating_outline, selection_drag_delta};
 pub(crate) use start_screen::start_screen_drop_hint;
 pub(crate) use strokes::multiple_color_target;
 pub use strokes::paint_target;
+pub fn restart_live_stroke(app: &mut PhotocraftApp) {
+    app.live_stroke = strokes::begin_live_stroke(app);
+}
+
+pub fn active_drag_stroke_points(app: &PhotocraftApp) -> Option<Vec<[f64; 3]>> {
+    let d = app.drag.as_ref()?;
+    if !matches!(d.tool, Tool::Brush | Tool::Pencil | Tool::Eraser) {
+        return None;
+    }
+    Some(d.points.clone())
+}
+
+pub fn update_drag_stroke_points_and_restart(app: &mut PhotocraftApp, points: Vec<[f64; 3]>) -> bool {
+    let Some(d) = app.drag.as_mut() else { return false };
+    d.points = points;
+    app.live_stroke = strokes::begin_live_stroke(app);
+    true
+}
 pub(crate) use strokes::{
     ClonePreviewCache, CommittedStroke, LiveStroke, cancel_mixer_on_context_change, freehand_tool, spread_ms, strokes_live, unsmoothed_line,
 };
@@ -686,7 +704,9 @@ fn update_canvas_navigation(app: &mut PhotocraftApp, view: &mut View, input: Can
             view.zoom_anchor = None;
             let next = view.rotation + crate::rotate_view::screen_delta(delta, input.xf.flip);
             if next.is_finite() {
-                view.rotation = crate::rotate_view::wrap_deg(next);
+                let wrapped = crate::rotate_view::wrap_deg(next);
+                let (mag, _) = photocraft_paint::apply_magnetic_rotation(wrapped, 4.0);
+                view.rotation = mag;
             }
         }
     }

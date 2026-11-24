@@ -572,3 +572,242 @@ fn test_live_fast_path_stroke_synchronization() {
     assert!(!fast_stroke_active, "Pen lift must exit fast-path");
     assert!(!cached_prims_valid, "Cached prims must be cleared on stroke commit");
 }
+
+#[test]
+fn test_quickshape_classification_straight_line() {
+    use crate::quickshape::{QuickShapeKind, classify_quickshape};
+
+    // Synthesize a nearly straight line with slight hand jitter
+    let mut pts = Vec::new();
+    for i in 0..30 {
+        let t = i as f64 / 29.0;
+        let wobble = if i % 2 == 0 { 0.8 } else { -0.8 };
+        let x = t * 200.0;
+        let y = t * 100.0 + wobble;
+        pts.push([x, y, 0.5]);
+    }
+
+    let classified = classify_quickshape(&pts, false);
+    assert!(classified.is_some(), "Straight line with slight jitter should be classified");
+    match classified.unwrap() {
+        QuickShapeKind::Line { start, end } => {
+            assert!((start[0] - 0.0).abs() < 1e-3);
+            assert!((end[0] - 200.0).abs() < 1e-3);
+        }
+        other => panic!("Expected Line, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_quickshape_classification_circular_arc() {
+    use crate::quickshape::{QuickShapeKind, classify_quickshape};
+    use std::f64::consts::PI;
+
+    // Synthesize a circular arc: R = 60 centered at (100, 100) from 0 to 120 degrees
+    let mut pts = Vec::new();
+    for i in 0..40 {
+        let t = i as f64 / 39.0;
+        let angle = t * (2.0 * PI / 3.0);
+        let wobble = if i % 2 == 0 { 0.5 } else { -0.5 };
+        let r = 60.0 + wobble;
+        let x = 100.0 + r * angle.cos();
+        let y = 100.0 + r * angle.sin();
+        pts.push([x, y, 0.6]);
+    }
+
+    let classified = classify_quickshape(&pts, false);
+    assert!(classified.is_some(), "Circular arc should be classified");
+    match classified.unwrap() {
+        QuickShapeKind::Arc { center, radius, .. } => {
+            assert!((center[0] - 100.0).abs() < 5.0, "Center x: {}", center[0]);
+            assert!((center[1] - 100.0).abs() < 5.0, "Center y: {}", center[1]);
+            assert!((radius - 60.0).abs() < 3.0, "Radius: {}", radius);
+        }
+        other => panic!("Expected Arc, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_quickshape_classification_circle_and_ellipse() {
+    use crate::quickshape::{QuickShapeKind, classify_quickshape};
+    use std::f64::consts::PI;
+
+    // 1. Circle: R = 50 centered at (150, 150)
+    let mut circle_pts = Vec::new();
+    for i in 0..50 {
+        let t = i as f64 / 50.0;
+        let angle = t * 2.0 * PI;
+        let wobble = if i % 3 == 0 { 0.6 } else { -0.4 };
+        let r = 50.0 + wobble;
+        let x = 150.0 + r * angle.cos();
+        let y = 150.0 + r * angle.sin();
+        circle_pts.push([x, y, 0.7]);
+    }
+
+    let circle_classified = classify_quickshape(&circle_pts, false);
+    assert!(circle_classified.is_some(), "Closed circle should be classified");
+    match circle_classified.unwrap() {
+        QuickShapeKind::Circle { center, radius } => {
+            assert!((center[0] - 150.0).abs() < 4.0, "Circle center x: {}", center[0]);
+            assert!((center[1] - 150.0).abs() < 4.0, "Circle center y: {}", center[1]);
+            assert!((radius - 50.0).abs() < 3.0, "Circle radius: {}", radius);
+        }
+        other => panic!("Expected Circle, got {:?}", other),
+    }
+
+    // 2. Ellipse: rx = 70, ry = 35 centered at (200, 200)
+    let mut ellipse_pts = Vec::new();
+    for i in 0..60 {
+        let t = i as f64 / 60.0;
+        let angle = t * 2.0 * PI;
+        let wobble = if i % 2 == 0 { 0.5 } else { -0.5 };
+        let x = 200.0 + (70.0 + wobble) * angle.cos();
+        let y = 200.0 + (35.0 + wobble) * angle.sin();
+        ellipse_pts.push([x, y, 0.7]);
+    }
+
+    let ellipse_classified = classify_quickshape(&ellipse_pts, false);
+    assert!(ellipse_classified.is_some(), "Closed ellipse should be classified");
+    match ellipse_classified.unwrap() {
+        QuickShapeKind::Ellipse { center, radius_x, radius_y, .. } => {
+            assert!((center[0] - 200.0).abs() < 6.0, "Ellipse center x: {}", center[0]);
+            assert!((center[1] - 200.0).abs() < 6.0, "Ellipse center y: {}", center[1]);
+            let (max_r, min_r) = if radius_x > radius_y { (radius_x, radius_y) } else { (radius_y, radius_x) };
+            assert!((max_r - 70.0).abs() < 8.0, "Major radius: {}", max_r);
+            assert!((min_r - 35.0).abs() < 8.0, "Minor radius: {}", min_r);
+        }
+        QuickShapeKind::Circle { .. } => panic!("Unconstrained ellipse should not be a circle"),
+        other => panic!("Expected Ellipse, got {:?}", other),
+    }
+
+    // 3. Constrained Ellipse -> Snaps to perfect Circle
+    let constrained_classified = classify_quickshape(&ellipse_pts, true);
+    assert!(constrained_classified.is_some(), "Constrained ellipse should snap to Circle");
+    match constrained_classified.unwrap() {
+        QuickShapeKind::Circle { center, radius } => {
+            assert!((center[0] - 200.0).abs() < 6.0);
+            assert!((center[1] - 200.0).abs() < 6.0);
+            // Radius is average of major and minor
+            assert!((radius - 52.5).abs() < 8.0, "Constrained radius: {}", radius);
+        }
+        other => panic!("Expected constrained Circle, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_quickshape_classification_rejected_squiggle() {
+    use crate::quickshape::classify_quickshape;
+
+    // 1. Erratic random squiggle / zig-zag that does not match any geometry
+    let mut squiggle = Vec::new();
+    let mut x = 50.0;
+    let mut y = 50.0;
+    for i in 0..40 {
+        x += if i % 2 == 0 { 25.0 } else { -18.0 };
+        y += if i % 3 == 0 { 30.0 } else { -20.0 };
+        squiggle.push([x, y, 0.5]);
+    }
+    assert_eq!(classify_quickshape(&squiggle, false), None, "Erratic squiggle must be rejected as None");
+
+    // 2. Short taps and specks (< 6 points or length < 15 pt)
+    let short_tap = vec![[10.0, 10.0, 0.5], [11.0, 10.5, 0.5], [10.5, 11.0, 0.5]];
+    assert_eq!(classify_quickshape(&short_tap, false), None, "Short taps must never trigger QuickShape");
+}
+
+#[test]
+fn test_quickshape_15_degree_constrained_snapping() {
+    use crate::quickshape::snap_line_angle_15_deg;
+    use std::f64::consts::PI;
+
+    let start = [100.0, 100.0];
+    let len = 100.0;
+
+    // 17 degrees -> should snap to 15 degrees
+    let angle_17 = 17.0 * PI / 180.0;
+    let end_17 = [start[0] + len * angle_17.cos(), start[1] + len * angle_17.sin()];
+    let snapped_15 = snap_line_angle_15_deg(start, end_17);
+    let snapped_angle = (snapped_15[1] - start[1]).atan2(snapped_15[0] - start[0]);
+    let expected_15 = 15.0 * PI / 180.0;
+    assert!((snapped_angle - expected_15).abs() < 1e-4, "17 deg should snap to 15 deg");
+    let snapped_len = (snapped_15[0] - start[0]).hypot(snapped_15[1] - start[1]);
+    assert!((snapped_len - len).abs() < 1e-4, "Length should be strictly preserved");
+
+    // 28 degrees -> should snap to 30 degrees
+    let angle_28 = 28.0 * PI / 180.0;
+    let end_28 = [start[0] + len * angle_28.cos(), start[1] + len * angle_28.sin()];
+    let snapped_30 = snap_line_angle_15_deg(start, end_28);
+    let snapped_angle_30 = (snapped_30[1] - start[1]).atan2(snapped_30[0] - start[0]);
+    let expected_30 = 30.0 * PI / 180.0;
+    assert!((snapped_angle_30 - expected_30).abs() < 1e-4, "28 deg should snap to 30 deg");
+
+    // -6 degrees -> should snap to 0 degrees
+    let angle_neg6 = -6.0 * PI / 180.0;
+    let end_neg6 = [start[0] + len * angle_neg6.cos(), start[1] + len * angle_neg6.sin()];
+    let snapped_0 = snap_line_angle_15_deg(start, end_neg6);
+    let snapped_angle_0 = (snapped_0[1] - start[1]).atan2(snapped_0[0] - start[0]);
+    assert!(snapped_angle_0.abs() < 1e-4, "-6 deg should snap to 0 deg");
+}
+
+#[test]
+fn test_magnetic_rotation_angle_snapping_detent_and_breakout() {
+    use crate::dynamics::apply_magnetic_rotation;
+
+    let detent = 4.0;
+
+    // 1. Cardinal 0°
+    let (snap_pos, is_snap) = apply_magnetic_rotation(2.5, detent);
+    assert!(is_snap);
+    assert_eq!(snap_pos, 0.0, "2.5° should snap to 0° within 4° detent");
+
+    let (snap_neg, is_snap) = apply_magnetic_rotation(-3.8, detent);
+    assert!(is_snap);
+    assert_eq!(snap_neg, 0.0, "-3.8° should snap to 0° within 4° detent");
+
+    let (breakout_pos, is_snap) = apply_magnetic_rotation(4.1, detent);
+    assert!(!is_snap);
+    assert!((breakout_pos - 4.1).abs() < 1e-4, "4.1° should break out smoothly");
+
+    let (breakout_neg, is_snap) = apply_magnetic_rotation(-4.5, detent);
+    assert!(!is_snap);
+    assert!((breakout_neg - (-4.5)).abs() < 1e-4, "-4.5° should break out smoothly");
+
+    // 2. Cardinal 90°
+    let (snap_90, is_snap) = apply_magnetic_rotation(88.0, detent);
+    assert!(is_snap);
+    assert_eq!(snap_90, 90.0, "88° should snap to 90°");
+
+    let (snap_90_hi, is_snap) = apply_magnetic_rotation(93.5, detent);
+    assert!(is_snap);
+    assert_eq!(snap_90_hi, 90.0, "93.5° should snap to 90°");
+
+    let (break_90, is_snap) = apply_magnetic_rotation(95.0, detent);
+    assert!(!is_snap);
+    assert!((break_90 - 95.0).abs() < 1e-4, "95° should break out from 90°");
+
+    // 3. Cardinal -90° (270°)
+    let (snap_neg90, is_snap) = apply_magnetic_rotation(-87.5, detent);
+    assert!(is_snap);
+    assert_eq!(snap_neg90, -90.0, "-87.5° should snap to -90°");
+
+    let (break_neg90, is_snap) = apply_magnetic_rotation(-95.0, detent);
+    assert!(!is_snap);
+    assert!((break_neg90 - (-95.0)).abs() < 1e-4, "-95° should break out from -90°");
+
+    // 4. Cardinal 180° / -180°
+    let (snap_180, is_snap) = apply_magnetic_rotation(178.0, detent);
+    assert!(is_snap);
+    assert_eq!(snap_180, 180.0, "178° should snap to 180°");
+
+    let (snap_neg180, is_snap) = apply_magnetic_rotation(-178.5, detent);
+    assert!(is_snap);
+    assert_eq!(snap_neg180, -180.0, "-178.5° should snap to -180°");
+
+    let (break_180, is_snap) = apply_magnetic_rotation(175.0, detent);
+    assert!(!is_snap);
+    assert!((break_180 - 175.0).abs() < 1e-4, "175° should break out from 180°");
+
+    // 5. Non-finite safety
+    let (nan_angle, is_snap) = apply_magnetic_rotation(f32::NAN, detent);
+    assert!(!is_snap);
+    assert_eq!(nan_angle, 0.0, "NaN angle must safely return 0.0 without NaN propagation");
+}

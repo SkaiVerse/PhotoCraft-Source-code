@@ -572,6 +572,9 @@ struct Host {
     fast_stroke_active: bool,
     cached_prims: Option<Arc<Vec<egui::ClippedPrimitive>>>,
     cached_screen: Option<([u32; 2], f32)>,
+    quickshape_active: bool,
+    quickshape_kind: Option<photocraft_paint::QuickShapeKind>,
+    quickshape_raw: Vec<[f64; 3]>,
 }
 
 #[derive(Default)]
@@ -751,6 +754,9 @@ impl Host {
             fast_stroke_active: false,
             cached_prims: None,
             cached_screen: None,
+            quickshape_active: false,
+            quickshape_kind: None,
+            quickshape_raw: Vec::new(),
         })
     }
 
@@ -1520,6 +1526,9 @@ pub unsafe extern "C" fn pc_pen(
         }
         match phase {
             0 => {
+                h.quickshape_active = false;
+                h.quickshape_kind = None;
+                h.quickshape_raw.clear();
                 if h.on_canvas(x, y) {
                     h.gesture = None;
                     h.pen_down = true;
@@ -1546,6 +1555,9 @@ pub unsafe extern "C" fn pc_pen(
                 }
             }
             _ => {
+                h.quickshape_active = false;
+                h.quickshape_kind = None;
+                h.quickshape_raw.clear();
                 h.fast_stroke_active = false;
                 h.cached_prims = None;
                 h.cached_screen = None;
@@ -2098,4 +2110,92 @@ pub unsafe extern "C" fn pc_sync_live_stroke_commit(h: *mut c_void) {
         h.cached_screen = None;
         h.wake();
     }
+}
+
+/// Triggers QuickShape classification on the active brush/pencil/eraser stroke.
+/// Returns 1 if a primitive was classified and snapped, or 0 if rejected / not eligible.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_quickshape_trigger(h: *mut c_void, constrain: c_int) -> c_int {
+    if let Some(h) = unsafe { host(h) } {
+        if !h.pen_down {
+            return 0;
+        }
+        let Some(points) = photocraft_ui_egui::active_drag_stroke_points(&h.app) else { return 0 };
+        if points.len() < 6 {
+            return 0;
+        }
+        if let Some(kind) = photocraft_paint::classify_quickshape(&points, constrain != 0) {
+            h.quickshape_raw = points;
+            h.quickshape_kind = Some(kind.clone());
+            h.quickshape_active = true;
+
+            // Generate snapped stroke points
+            let snapped = photocraft_paint::generate_quickshape_stroke(&kind, &h.quickshape_raw, constrain != 0);
+            photocraft_ui_egui::update_drag_stroke_points_and_restart(&mut h.app, snapped);
+
+            h.fast_stroke_active = false;
+            h.cached_prims = None;
+            h.cached_screen = None;
+            h.ctx.request_repaint();
+            return 1;
+        }
+    }
+    0
+}
+
+/// Interactively updates the endpoint or scale of an active QuickShape as the Apple Pencil drags before liftoff.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_quickshape_update(h: *mut c_void, x: f32, y: f32, constrain: c_int) -> c_int {
+    if let Some(h) = unsafe { host(h) } {
+        if !h.quickshape_active {
+            return 0;
+        }
+        let Some(kind) = h.quickshape_kind.clone() else { return 0 };
+        let pos = h.pt(x, y);
+        let doc_pt = if let Some(xf) = photocraft_ui_egui::ViewXform::active(&h.app) {
+            xf.to_doc(pos)
+        } else {
+            [pos.x as f64, pos.y as f64]
+        };
+
+        let (new_kind, updated_pts) = photocraft_paint::update_quickshape_drag(
+            &kind,
+            &h.quickshape_raw,
+            doc_pt,
+            constrain != 0,
+        );
+        h.quickshape_kind = Some(new_kind);
+        photocraft_ui_egui::update_drag_stroke_points_and_restart(&mut h.app, updated_pts);
+
+        h.fast_stroke_active = false;
+        h.cached_prims = None;
+        h.cached_screen = None;
+        h.ctx.request_repaint();
+        return 1;
+    }
+    0
+}
+
+/// Commits the active QuickShape into document / tile-delta undo stack.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_quickshape_commit(h: *mut c_void) {
+    if let Some(h) = unsafe { host(h) } {
+        h.quickshape_active = false;
+        h.quickshape_kind = None;
+        h.quickshape_raw.clear();
+        h.fast_stroke_active = false;
+        h.cached_prims = None;
+        h.cached_screen = None;
+        h.wake();
+    }
+}
+
+/// Magnetic rotation query: snaps angle within detent window (default 4.0°) to cardinal orientations.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_apply_magnetic_rotation(angle_deg: f32, detent_deg: f32, snapped: *mut c_int) -> f32 {
+    let (res, is_snap) = photocraft_paint::apply_magnetic_rotation(angle_deg, detent_deg);
+    if !snapped.is_null() {
+        unsafe { *snapped = is_snap as c_int };
+    }
+    res
 }

@@ -28,6 +28,7 @@ pub mod outline;
 mod pattern_cache;
 pub mod presets;
 pub mod procedural;
+pub mod quickshape;
 pub mod render;
 pub mod replace;
 pub mod retouch;
@@ -41,12 +42,15 @@ pub use brush::{
 };
 pub use curve::ResponseCurve;
 pub use dynamics::{
-    DynamicsLut, apply_directional_damping, apply_retroactive_liftoff_taper,
+    DynamicsLut, apply_directional_damping, apply_magnetic_rotation, apply_retroactive_liftoff_taper,
     blend_wet_mix, calibrate_stylus_pressure, eval_height_map_grain,
     filter_circular_angle, filter_perpendicular_motion,
 };
 pub use mip_cache::{mip_cache_bytes, purge_mip_cache};
 pub use mixer::MixerSettings;
+pub use quickshape::{
+    QuickShapeKind, classify_quickshape, generate_quickshape_stroke, snap_line_angle_15_deg, update_quickshape_drag,
+};
 pub use render::{BrushContext, StrokeRenderer, UnionLive, grid_center, grid_square, render_stroke, render_stroke_clipped};
 pub use tile::{GrayTile, StoredTile};
 

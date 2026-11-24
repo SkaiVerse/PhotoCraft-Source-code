@@ -217,6 +217,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         guard let h = handle else { return }
         if !suspendFocus && !isFirstResponder { _ = becomeFirstResponder() }
         repeatHeldKey()
+        updateInertia()
         pruneTouches()
         flushPen(all: false)
         let flags = pc_frame(h)
@@ -414,6 +415,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        stopInertia()
         var rest = Set<UIPress>()
         for p in presses where !handlePress(p, down: true) { rest.insert(p) }
         if !rest.isEmpty { super.pressesBegan(rest, with: event) }
@@ -679,6 +681,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     }
 
     @objc private func pointerScroll(_ g: UIPanGestureRecognizer) {
+        stopInertia()
         guard let h = handle, g.state != .ended, g.state != .cancelled, g.state != .failed else { return }
         let t = g.translation(in: self)
         g.setTranslation(.zero, in: self)
@@ -690,12 +693,124 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private var twistEngaged = false
     private var twistSent: CGFloat = 0
 
+    // Canvas Inertia & Glide Physics
+    private var inertialPanVelocity: CGPoint?
+    private var inertialPanLastTime: CFTimeInterval?
+    private var inertialPinchVelocity: CGFloat?
+    private var inertialPinchCenter: CGPoint?
+    private var inertialPinchLastTime: CFTimeInterval?
+    private var inertialTwistVelocity: CGFloat?
+    private var inertialTwistLastTime: CFTimeInterval?
+    private var wasSnappedToCardinal: Bool = false
+    private let snapHaptic = UIImpactFeedbackGenerator(style: .light)
+
+    private func stopInertia() {
+        inertialPanVelocity = nil
+        inertialPanLastTime = nil
+        inertialPinchVelocity = nil
+        inertialPinchCenter = nil
+        inertialPinchLastTime = nil
+        inertialTwistVelocity = nil
+        inertialTwistLastTime = nil
+    }
+
+    private func updateInertia() {
+        guard let h = handle else { return }
+        let now = CACurrentMediaTime()
+
+        // 1. Pan inertial glide
+        if let v = inertialPanVelocity {
+            let last = inertialPanLastTime ?? now
+            let dt = min(0.033, max(0.001, now - last))
+            inertialPanLastTime = now
+            let decay = exp(-5.0 * dt)
+            let dx = v.x * CGFloat(dt)
+            let dy = v.y * CGFloat(dt)
+            if abs(dx) > 0.05 || abs(dy) > 0.05 {
+                pc_scroll(h, Float(dx), Float(dy), 0)
+            }
+            let nextVx = v.x * CGFloat(decay)
+            let nextVy = v.y * CGFloat(decay)
+            if hypot(nextVx, nextVy) > 15.0 {
+                inertialPanVelocity = CGPoint(x: nextVx, y: nextVy)
+            } else {
+                inertialPanVelocity = nil
+                inertialPanLastTime = nil
+            }
+        }
+
+        // 2. Pinch zoom inertial glide
+        if let pv = inertialPinchVelocity, let center = inertialPinchCenter {
+            let last = inertialPinchLastTime ?? now
+            let dt = min(0.033, max(0.001, now - last))
+            inertialPinchLastTime = now
+            let decay = exp(-6.0 * dt)
+            let scaleFactor = 1.0 + pv * CGFloat(dt)
+            if scaleFactor > 0.01 && abs(scaleFactor - 1.0) > 0.0005 {
+                pc_zoom(h, Float(scaleFactor), Float(center.x), Float(center.y))
+            }
+            let nextPv = pv * CGFloat(decay)
+            if abs(nextPv) > 0.08 {
+                inertialPinchVelocity = nextPv
+            } else {
+                inertialPinchVelocity = nil
+                inertialPinchCenter = nil
+                inertialPinchLastTime = nil
+            }
+        }
+
+        // 3. Twist rotate inertial glide
+        if let tv = inertialTwistVelocity {
+            let last = inertialTwistLastTime ?? now
+            let dt = min(0.033, max(0.001, now - last))
+            inertialTwistLastTime = now
+            let decay = exp(-6.0 * dt)
+            let dRot = tv * CGFloat(dt)
+            if abs(dRot) > 0.001 {
+                let cx = Float(bounds.midX)
+                let cy = Float(bounds.midY)
+                pc_rotate(h, Float(dRot), cx, cy)
+            }
+            let nextTv = tv * CGFloat(decay)
+            if abs(nextTv) > 0.05 {
+                inertialTwistVelocity = nextTv
+            } else {
+                inertialTwistVelocity = nil
+                inertialTwistLastTime = nil
+            }
+        }
+    }
+
+    // QuickShape (Draw-and-Hold Geometry Snap)
+    private var quickShapeTimer: Timer?
+    private var quickShapeStartPos: CGPoint?
+    private var quickShapeActive: Bool = false
+
+    private func triggerQuickShape() {
+        guard let h = handle, pencilTouch != nil, !quickShapeActive else { return }
+        let isConstrained = constrainTouch != nil ? 1 : 0
+        if pc_quickshape_trigger(h, Int32(isConstrained)) == 1 {
+            quickShapeActive = true
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        }
+    }
+
     @objc private func twoFingerScroll(_ g: UIPanGestureRecognizer) {
         guard let h = handle else { return }
         if g.state == .began {
             cancelFinger()
+            stopInertia()
         }
-        if g.state == .ended || g.state == .cancelled {
+        if g.state == .ended {
+            let vel = g.velocity(in: self)
+            if hypot(vel.x, vel.y) > 60.0 {
+                inertialPanVelocity = vel
+                inertialPanLastTime = CACurrentMediaTime()
+            }
+            pc_pointer_gone(h)
+            return
+        }
+        if g.state == .cancelled {
             pc_pointer_gone(h)
             return
         }
@@ -716,8 +831,11 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         switch g.state {
         case .began:
             cancelFinger()
+            stopInertia()
             twistEngaged = false
             twistSent = 0
+            wasSnappedToCardinal = false
+            snapHaptic.prepare()
         case .changed:
             let total = g.rotation   // radians since the twist began, clockwise is positive
             if !twistEngaged {
@@ -733,7 +851,27 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             let cx = Float(bounds.midX)
             let cy = Float(bounds.midY)
             pc_rotate(h, Float(delta), cx, cy)
-        case .ended, .cancelled:
+
+            // Soft magnetic detent check with haptic feedback
+            var isSnapped: Int32 = 0
+            let currentRot = pc_canvas_rotation(h)
+            _ = pc_apply_magnetic_rotation(currentRot, 4.0, &isSnapped)
+            if isSnapped != 0 {
+                if !wasSnappedToCardinal {
+                    snapHaptic.impactOccurred()
+                    wasSnappedToCardinal = true
+                }
+            } else {
+                wasSnappedToCardinal = false
+            }
+        case .ended:
+            let vel = g.velocity
+            if abs(vel) > 0.10 {
+                inertialTwistVelocity = vel
+                inertialTwistLastTime = CACurrentMediaTime()
+            }
+            twistEngaged = false
+        case .cancelled:
             twistEngaged = false
         default: break
         }
@@ -744,13 +882,22 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         switch g.state {
         case .began:
             cancelFinger()
+            stopInertia()
             pinchTotal = 1
         case .changed:
             let p = g.location(in: self)
             pinchTotal *= g.scale
             pc_zoom(h, Float(g.scale), Float(p.x), Float(p.y))
             g.scale = 1
-        case .ended, .cancelled:
+        case .ended:
+            let vel = g.velocity
+            if abs(vel) > 0.15 {
+                inertialPinchVelocity = vel
+                inertialPinchCenter = g.location(in: self)
+                inertialPinchLastTime = CACurrentMediaTime()
+            }
+            pc_pointer_gone(h)
+        case .cancelled:
             pc_pointer_gone(h)
         default: break
         }
@@ -770,7 +917,12 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     private func releaseConstrain() {
         constrainTouch = nil
-        if let h = handle { pc_set_touch_shift(h, 0) }
+        if let h = handle {
+            pc_set_touch_shift(h, 0)
+            if quickShapeActive, let p = pencilTouch?.location(in: self) {
+                _ = pc_quickshape_update(h, Float(p.x), Float(p.y), 0)
+            }
+        }
     }
 
     private func dispatchPendingFinger() {
@@ -1059,24 +1211,34 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             let p = t.location(in: self)
             switch t.type {
             case .pencil:
+                stopInertia()
                 // Anything already resting on the screen is a palm.
                 for d in directTouches { ignoredTouches.insert(d) }
                 directTouches.removeAll()
                 cancelFinger()
                 pencilTouch = t
                 pencilLastSeen = CACurrentMediaTime()
+                quickShapeTimer?.invalidate()
+                quickShapeTimer = nil
+                quickShapeActive = false
+                quickShapeStartPos = t.location(in: self)
                 penQueue.removeAll()
                 queuePen(t, phase: 0, event: event, mods: mods)
             case .indirectPointer:
+                stopInertia()
                 pointerButton = (event?.buttonMask.contains(.secondary) ?? false) ? 1 : 0
                 pc_pointer_moved(h, Float(p.x), Float(p.y))
                 pc_pointer_button(h, Float(p.x), Float(p.y), pointerButton, 1, mods)
             default:
+                stopInertia()
                 // One fingertip on the screen while the Pencil or primary finger is drawing,
                 // creating a shape, or transforming: keeps proportions (Shift modifier).
                 if (pencilTouch != nil || fingerTouch != nil) && constrainTouch == nil && t !== fingerTouch && t.majorRadius < 32 {
                     constrainTouch = t
                     pc_set_touch_shift(h, 1)
+                    if quickShapeActive, let p = pencilTouch?.location(in: self) {
+                        _ = pc_quickshape_update(h, Float(p.x), Float(p.y), 1)
+                    }
                     continue
                 }
                 if pencilNear {
@@ -1112,6 +1274,28 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             switch t.type {
             case .pencil:
                 if t === pencilTouch {
+                    let loc = t.location(in: self)
+                    let isConstrained = constrainTouch != nil ? 1 : 0
+                    if quickShapeActive {
+                        _ = pc_quickshape_update(h, Float(loc.x), Float(loc.y), Int32(isConstrained))
+                    } else {
+                        if let start = quickShapeStartPos {
+                            let dist = hypot(loc.x - start.x, loc.y - start.y)
+                            if dist > 3.0 {
+                                quickShapeStartPos = loc
+                                quickShapeTimer?.invalidate()
+                                quickShapeTimer = Timer.scheduledTimer(withTimeInterval: 0.400, repeats: false) { [weak self] _ in
+                                    self?.triggerQuickShape()
+                                }
+                            }
+                        } else {
+                            quickShapeStartPos = loc
+                            quickShapeTimer?.invalidate()
+                            quickShapeTimer = Timer.scheduledTimer(withTimeInterval: 0.400, repeats: false) { [weak self] _ in
+                                self?.triggerQuickShape()
+                            }
+                        }
+                    }
                     queuePen(t, phase: 1, event: event, mods: mods)
                     if let predicted = event?.predictedTouches(for: t), !predicted.isEmpty {
                         for pt in predicted {
@@ -1166,6 +1350,12 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             switch t.type {
             case .pencil:
                 if t === pencilTouch {
+                    quickShapeTimer?.invalidate()
+                    quickShapeTimer = nil
+                    if quickShapeActive {
+                        pc_quickshape_commit(h)
+                        quickShapeActive = false
+                    }
                     pc_pen_predicted_clear(h)
                     queuePen(t, phase: cancelled ? 3 : 2, event: event, mods: mods)
                     pencilTouch = nil

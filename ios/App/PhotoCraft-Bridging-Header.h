@@ -59,5 +59,9 @@ void pc_telemetry_set_enabled(void *h, int enabled);
 int pc_telemetry_get(void *h, float *frame_time_ms, float *touch_present_ms, float *gpu_tile_mem_mb, float *last_undo_ms);
 int pc_is_fast_stroke_active(void *h);
 void pc_sync_live_stroke_commit(void *h);
+int pc_quickshape_trigger(void *h, int constrain);
+int pc_quickshape_update(void *h, float x, float y, int constrain);
+void pc_quickshape_commit(void *h);
+float pc_apply_magnetic_rotation(float angle_deg, float detent_deg, int *snapped);
 
 #endif
