@@ -200,6 +200,9 @@ workflows:
           set -eo pipefail
           set -o pipefail
           cd ios
+          if ! xcrun metal -v >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
           xcodebuild -project PhotoCraft.xcodeproj -scheme PhotoCraft \
             -configuration Release -sdk iphoneos \
             -destination 'generic/platform=iOS' \
