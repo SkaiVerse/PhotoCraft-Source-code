@@ -119,6 +119,48 @@ pub fn filter_circular_angle(current: f32, target: f32, alpha: f32) -> f32 {
     (filtered + pi).rem_euclid(two_pi) - pi
 }
 
+/// Height-map "paper tooth" grain modulation:
+/// Evaluates paper tooth coverage driven by calibrated pressure and grainDepth:
+/// mask = clamp((pressure * depth - (1.0 - grainHeight)) / softness, 0.0, 1.0).
+/// Light pressure catches only paper peaks while heavier pressure fills valleys.
+/// Guarded against division-by-zero (softness floor: 1e-4) and NaN/Inf propagation.
+#[inline]
+pub fn eval_height_map_grain(pressure: f32, depth: f32, grain_height: f32, softness: f32) -> f32 {
+    let s = if softness.is_finite() { softness.max(1e-4) } else { 1e-4 };
+    let p = if pressure.is_finite() { pressure.clamp(0.0, 1.0) } else { 0.0 };
+    let d = if depth.is_finite() { depth.clamp(0.0, 1.0) } else { 0.0 };
+    let gh = if grain_height.is_finite() { grain_height.clamp(0.0, 1.0) } else { 0.0 };
+    ((p * d - (1.0 - gh)) / s).clamp(0.0, 1.0)
+}
+
+/// Wet Mix / Color Pickup (Painterly Brushes):
+/// Blends active brush color with underlying canvas color in linear premultiplied space.
+/// Returns brush color unmodified when wet mix is disabled (charge == 0, pull == 0, mix == 0).
+#[inline]
+pub fn blend_wet_mix(
+    brush_color: [f32; 4],
+    canvas_color: [f32; 4],
+    charge: f32,
+    pull: f32,
+    mix_ratio: f32,
+    progress: f32,
+) -> [f32; 4] {
+    if pull <= 0.0 && mix_ratio <= 0.0 {
+        return brush_color;
+    }
+    let p = if progress.is_finite() { progress.clamp(0.0, 1.0) } else { 0.0 };
+    let c = if charge.is_finite() { charge.clamp(0.0, 1.0) } else { 0.0 };
+    let pl = if pull.is_finite() { pull.clamp(0.0, 1.0) } else { 0.0 };
+    let mx = if mix_ratio.is_finite() { mix_ratio.clamp(0.0, 1.0) } else { 0.0 };
+    let effective_pickup = (pl.max(mx) * (1.0 - c * (1.0 - p))).clamp(0.0, 1.0);
+    [
+        (1.0 - effective_pickup) * brush_color[0] + effective_pickup * canvas_color[0],
+        (1.0 - effective_pickup) * brush_color[1] + effective_pickup * canvas_color[1],
+        (1.0 - effective_pickup) * brush_color[2] + effective_pickup * canvas_color[2],
+        (1.0 - effective_pickup) * brush_color[3] + effective_pickup * canvas_color[3],
+    ]
+}
+
 /// Perpendicular motion filtering: dampens hand wobble perpendicular to the travel vector
 /// without dragging the stroke behind the nib or shrinking tight loops / collapsing corners.
 pub fn filter_perpendicular_motion(
@@ -1172,8 +1214,9 @@ impl DabBuilder {
                 index: i,
                 proj_angle,
                 proj_scale,
-                wet,
-                mix,
+                wet: if b.wet_charge > 0.0 { b.wet_charge } else { wet },
+                mix: if b.wet_mix > 0.0 { b.wet_mix } else if b.wet_pull > 0.0 { b.wet_pull } else { mix },
+                pressure: s.point.pressure,
             });
         }
     }
@@ -1229,6 +1272,7 @@ impl DualBuilder {
                 proj_scale: 1.0,
                 wet: 1.0,
                 mix: 1.0,
+                pressure: s.point.pressure,
             });
         }
     }

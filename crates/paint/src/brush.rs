@@ -669,6 +669,14 @@ pub struct BrushSettings {
     pub dynamics_velocity_size: f32,
     #[serde(alias = "dynamicsVelocityOpacity")]
     pub dynamics_velocity_opacity: f32,
+    #[serde(alias = "grainSoftness")]
+    pub grain_softness: f32,
+    #[serde(alias = "wetCharge")]
+    pub wet_charge: f32,
+    #[serde(alias = "wetPull")]
+    pub wet_pull: f32,
+    #[serde(alias = "wetMix")]
+    pub wet_mix: f32,
 }
 
 impl Default for BrushSettings {
@@ -731,6 +739,10 @@ impl Default for BrushSettings {
             shape_scatter: 0.0,
             dynamics_velocity_size: 0.0,
             dynamics_velocity_opacity: 0.0,
+            grain_softness: 0.0,
+            wet_charge: 0.0,
+            wet_pull: 0.0,
+            wet_mix: 0.0,
         }
     }
 }

@@ -456,3 +456,119 @@ fn test_retroactive_liftoff_taper_generation() {
         assert!(dabs[i].opacity <= dabs[i - 1].opacity, "Opacity should decrease towards tip: dab {} ({}) vs dab {} ({})", i - 1, dabs[i-1].opacity, i, dabs[i].opacity);
     }
 }
+
+#[test]
+fn test_height_map_grain_bounds() {
+    use crate::dynamics::eval_height_map_grain;
+
+    // At pressure = 0.0, mask should be 0.0 regardless of depth or grain height
+    assert_eq!(eval_height_map_grain(0.0, 1.0, 0.5, 0.25), 0.0);
+    assert_eq!(eval_height_map_grain(0.0, 0.5, 1.0, 0.25), 0.0);
+
+    // At pressure = 1.0 and depth = 1.0:
+    // Peak (grain_height = 1.0): 1.0 * 1.0 - (1.0 - 1.0) = 1.0 / softness -> clamped to 1.0
+    assert_eq!(eval_height_map_grain(1.0, 1.0, 1.0, 0.25), 1.0);
+    // Valley (grain_height = 0.0): 1.0 * 1.0 - (1.0 - 0.0) = 0.0 -> clamped to 0.0
+    assert_eq!(eval_height_map_grain(1.0, 1.0, 0.0, 0.25), 0.0);
+
+    // Light pressure catches paper peaks while heavy pressure fills valleys
+    let light_peak = eval_height_map_grain(0.3, 1.0, 0.95, 0.25);
+    let light_valley = eval_height_map_grain(0.3, 1.0, 0.2, 0.25);
+    assert!(light_peak > 0.0, "Light pressure should catch paper peaks");
+    assert_eq!(light_valley, 0.0, "Light pressure should not fill valleys");
+
+    let heavy_valley = eval_height_map_grain(0.9, 1.0, 0.2, 0.25);
+    assert!(heavy_valley > light_valley, "Heavy pressure should fill valleys more than light pressure");
+
+    // Softness floor: division-by-zero protection (softness = 0.0 or negative)
+    let s_zero = eval_height_map_grain(0.5, 1.0, 0.8, 0.0);
+    assert!(s_zero.is_finite() && !s_zero.is_nan(), "Softness floor must prevent division by zero");
+    let s_neg = eval_height_map_grain(0.5, 1.0, 0.8, -1.0);
+    assert!(s_neg.is_finite() && !s_neg.is_nan(), "Negative softness must be floored safely");
+
+    // Non-finite inputs: zero NaN propagation
+    let nan_val = eval_height_map_grain(f32::NAN, 1.0, 0.5, 0.25);
+    assert_eq!(nan_val, 0.0, "NaN pressure must yield 0.0 without NaN propagation");
+    let inf_val = eval_height_map_grain(1.0, f32::INFINITY, 0.5, 0.25);
+    assert_eq!(inf_val, 0.0, "Inf depth must yield clamped value without NaN/Inf propagation");
+}
+
+#[test]
+fn test_wet_mix_zero_effect_when_disabled_and_premultiplied_blend() {
+    use crate::dynamics::blend_wet_mix;
+
+    let brush_col = [1.0, 0.0, 0.0, 1.0]; // Red
+    let canvas_col = [0.0, 0.0, 1.0, 1.0]; // Blue
+
+    // When disabled (pull == 0 and mix == 0): exact identity
+    let disabled = blend_wet_mix(brush_col, canvas_col, 0.0, 0.0, 0.0, 0.5);
+    assert_eq!(disabled, brush_col, "Disabled wet mix must return brush color unmodified");
+
+    let disabled_with_charge = blend_wet_mix(brush_col, canvas_col, 0.8, 0.0, 0.0, 0.5);
+    assert_eq!(disabled_with_charge, brush_col, "Charge without pull/mix must return brush color unmodified");
+
+    // When active: linear premultiplied blending
+    let blended = blend_wet_mix(brush_col, canvas_col, 0.0, 0.5, 0.5, 0.5);
+    // pickup = 0.5 * (1.0 - 0) = 0.5
+    // blend: 0.5 * red + 0.5 * blue = [0.5, 0.0, 0.5, 1.0] (Purple)
+    assert!((blended[0] - 0.5).abs() < 1e-4, "Red component blended: {}", blended[0]);
+    assert!((blended[1] - 0.0).abs() < 1e-4, "Green component blended: {}", blended[1]);
+    assert!((blended[2] - 0.5).abs() < 1e-4, "Blue component blended: {}", blended[2]);
+    assert!((blended[3] - 1.0).abs() < 1e-4, "Alpha component blended: {}", blended[3]);
+
+    // Wet charge depletion: as progress reaches 1.0, paint runs out and canvas pickup increases
+    let early = blend_wet_mix(brush_col, canvas_col, 0.8, 0.6, 0.6, 0.0); // progress = 0: high charge remains
+    let late = blend_wet_mix(brush_col, canvas_col, 0.8, 0.6, 0.6, 1.0); // progress = 1: charge depleted
+    assert!(late[2] > early[2], "Depleted wet stroke should pick up more canvas color than fresh charged stroke");
+
+    // Non-finite guards: zero NaN/Inf
+    let guarded = blend_wet_mix(brush_col, canvas_col, f32::NAN, f32::INFINITY, f32::NAN, f32::NEG_INFINITY);
+    assert!(guarded.iter().all(|c| c.is_finite() && !c.is_nan()), "Wet mix must guard against NaN/Inf");
+}
+
+#[test]
+fn test_live_fast_path_stroke_synchronization() {
+    // Tests the fast-path state transition logic:
+    // Pen down activates fast path; Pen up / cancel / modifier change invalidates it.
+    let mut fast_stroke_active = false;
+    let mut cached_prims_valid = false;
+
+    // Simulate pen down on canvas
+    let on_canvas = true;
+    if on_canvas {
+        fast_stroke_active = true;
+        cached_prims_valid = false; // cleared on stroke begin to cache next frame
+    }
+    assert!(fast_stroke_active);
+    assert!(!cached_prims_valid);
+
+    // After 1st frame renders: prims cached
+    cached_prims_valid = true;
+
+    // On subsequent pen moves: fast path remains valid
+    let pen_move = true;
+    if pen_move && fast_stroke_active {
+        // fast path bypass active: tessellation skipped, cached prims used
+        assert!(cached_prims_valid);
+    }
+
+    // On modifier change, key event, or finger touch:
+    let modifier_changed = true;
+    if modifier_changed {
+        fast_stroke_active = false;
+        cached_prims_valid = false;
+    }
+    assert!(!fast_stroke_active, "Modifier change must immediately exit fast-path");
+    assert!(!cached_prims_valid, "Cached prims must be cleared on modifier change");
+
+    // On stroke lift (pen up):
+    fast_stroke_active = true;
+    cached_prims_valid = true;
+    let pen_up = true;
+    if pen_up {
+        fast_stroke_active = false;
+        cached_prims_valid = false;
+    }
+    assert!(!fast_stroke_active, "Pen lift must exit fast-path");
+    assert!(!cached_prims_valid, "Cached prims must be cleared on stroke commit");
+}

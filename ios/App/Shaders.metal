@@ -214,3 +214,71 @@ fragment half4 fs_composite_blend_mode(
     half4 src = sourceTex.sample(s, in.texCoord);
     return composite_blend(mode, b, src, opacity);
 }
+
+// PhotoCraft Procreate-Feel Pass 2: Height-Map "Paper Tooth" Grain & Wet Mix Fast Path
+
+// Height-map paper tooth grain modulation (World-Locked)
+// Evaluates paper tooth coverage driven by calibrated pressure and grainDepth:
+// mask = clamp((pressure * depth - (1.0 - grainHeight)) / softness, 0.0, 1.0)
+inline half eval_height_map_grain(half pressure, half depth, half grain_height, half softness) {
+    half s = max(softness, 1e-4h);
+    half p = clamp(pressure, 0.0h, 1.0h);
+    half d = clamp(depth, 0.0h, 1.0h);
+    half gh = clamp(grain_height, 0.0h, 1.0h);
+    return clamp((p * d - (1.0h - gh)) / s, 0.0h, 1.0h);
+}
+
+// Wet Mix / Color Pickup (Painterly Brushes)
+// Samples underlying canvas color and blends into active brush color using linear premultiplied math.
+// Completely on-GPU: zero CPU readbacks (no getBytes).
+inline half4 eval_wet_mix(
+    half4 brush_color_pre,
+    half4 canvas_color_pre,
+    half charge,
+    half pull,
+    half mix_ratio,
+    half progress
+) {
+    if (pull <= 0.0h && mix_ratio <= 0.0h) {
+        return brush_color_pre;
+    }
+    half effective_pickup = clamp(max(pull, mix_ratio) * (1.0h - charge * clamp(1.0h - progress, 0.0h, 1.0h)), 0.0h, 1.0h);
+    return mix(brush_color_pre, canvas_color_pre, effective_pickup);
+}
+
+fragment half4 fs_paint_dab(
+    VertexOut in [[stage_in]],
+    texture2d<half> canvasTex [[texture(0)]],
+    texture2d<half> grainTex [[texture(1)]],
+    constant float2 &worldCoord [[buffer(0)]],
+    constant float &textureScale [[buffer(1)]],
+    constant half &pressure [[buffer(2)]],
+    constant half &depth [[buffer(3)]],
+    constant half &softness [[buffer(4)]],
+    constant half4 &dabColor [[buffer(5)]],
+    constant half4 &wetMixParams [[buffer(6)]] // x: charge, y: pull, z: mix, w: progress
+) {
+    constexpr sampler sRepeat(address::repeat, filter::linear);
+    constexpr sampler sClamp(address::clamp_to_edge, filter::linear);
+
+    // World-locked paper grain UV: invariant under canvas pan, zoom, and rotation
+    float2 worldUV = worldCoord / max(textureScale, 0.01f);
+    half grainHeight = grainTex.sample(sRepeat, worldUV).r;
+
+    half grainMask = (depth > 0.0h)
+        ? eval_height_map_grain(pressure, depth, grainHeight, softness)
+        : 1.0h;
+
+    // Linear premultiplied color
+    half4 baseColor = half4(dabColor.rgb * dabColor.a, dabColor.a);
+
+    // Wet mix color pickup from underlying canvas without CPU readbacks
+    half4 finalColor = baseColor;
+    if (wetMixParams.y > 0.0h || wetMixParams.z > 0.0h) {
+        half4 canvasColor = canvasTex.sample(sClamp, in.texCoord);
+        finalColor = eval_wet_mix(baseColor, canvasColor, wetMixParams.x, wetMixParams.y, wetMixParams.z, wetMixParams.w);
+    }
+
+    half finalAlpha = finalColor.a * grainMask;
+    return half4(finalColor.rgb * grainMask, finalAlpha);
+}

@@ -228,7 +228,8 @@ fn dry_media(base: &BrushSettings) -> Vec<BrushPreset> {
                 taper_end_length: 0.18,
                 texture_scale: 1.37,
                 grain_depth: 1.0,
-                stroke_space_grain: true,
+                stroke_space_grain: false,
+                grain_softness: 0.25,
                 ..base.clone()
             },
         ),
@@ -287,6 +288,9 @@ fn wet_media(base: &BrushSettings) -> Vec<BrushPreset> {
                     depth: 0.3,
                     ..Default::default()
                 },
+                wet_charge: 0.85,
+                wet_pull: 0.50,
+                wet_mix: 0.60,
                 ..base.clone()
             },
         ),
@@ -299,6 +303,9 @@ fn wet_media(base: &BrushSettings) -> Vec<BrushPreset> {
                 spacing: 0.05,
                 shape_dynamics: ShapeDynamics { enabled: true, angle: Dynamic::controlled(Control::Direction), ..Default::default() },
                 transfer: transfer(Dynamic::default(), Dynamic { control: Control::Fade, fade_steps: 600, minimum: 0.35, ..Default::default() }),
+                wet_charge: 0.70,
+                wet_pull: 0.40,
+                wet_mix: 0.50,
                 ..base.clone()
             },
         ),

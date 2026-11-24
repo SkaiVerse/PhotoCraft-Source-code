@@ -42,7 +42,8 @@ pub use brush::{
 pub use curve::ResponseCurve;
 pub use dynamics::{
     DynamicsLut, apply_directional_damping, apply_retroactive_liftoff_taper,
-    calibrate_stylus_pressure, filter_circular_angle, filter_perpendicular_motion,
+    blend_wet_mix, calibrate_stylus_pressure, eval_height_map_grain,
+    filter_circular_angle, filter_perpendicular_motion,
 };
 pub use mip_cache::{mip_cache_bytes, purge_mip_cache};
 pub use mixer::MixerSettings;
@@ -113,6 +114,8 @@ pub struct Dab {
     /// Mixer Brush multipliers of Wet and Mix (Transfer › Wetness/Mix Jitter), 1 = as set.
     pub wet: f32,
     pub mix: f32,
+    /// Calibrated stylus pressure (0.0..=1.0).
+    pub pressure: f32,
 }
 
 impl Dab {
@@ -134,6 +137,7 @@ impl Dab {
             proj_scale: 1.0,
             wet: 1.0,
             mix: 1.0,
+            pressure: 1.0,
         }
     }
 }

@@ -1170,6 +1170,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                     queuePen(t, phase: cancelled ? 3 : 2, event: event, mods: mods)
                     pencilTouch = nil
                     pencilLastSeen = CACurrentMediaTime()
+                    pc_sync_live_stroke_commit(h)
                 }
             case .indirectPointer:
                 pc_pointer_button(h, Float(p.x), Float(p.y), pointerButton, 0, mods)

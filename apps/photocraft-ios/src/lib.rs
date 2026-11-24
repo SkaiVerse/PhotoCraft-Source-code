@@ -569,6 +569,9 @@ struct Host {
     /// Events held back a few frames (a click's release, the pointer leaving).
     posts: Vec<(u8, egui::Event)>,
     telemetry: HostTelemetry,
+    fast_stroke_active: bool,
+    cached_prims: Option<Arc<Vec<egui::ClippedPrimitive>>>,
+    cached_screen: Option<([u32; 2], f32)>,
 }
 
 #[derive(Default)]
@@ -745,6 +748,9 @@ impl Host {
             gesture: None,
             posts: Vec::new(),
             telemetry: HostTelemetry::default(),
+            fast_stroke_active: false,
+            cached_prims: None,
+            cached_screen: None,
         })
     }
 
@@ -1225,7 +1231,33 @@ impl Host {
 
         let ppp_out = full.pixels_per_point;
         let shapes = std::mem::take(&mut full.shapes);
-        let prims = ctx.tessellate(shapes, ppp_out);
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: ppp_out,
+        };
+
+        // Decouple live drawing from full egui tessellation:
+        // When an Apple Pencil stroke is actively moving on the canvas (without UI interaction),
+        // reuse the cached UI mesh so live paint dabs render immediately with minimum latency.
+        let can_fast_path = self.fast_stroke_active
+            && self.pen_down
+            && self.gesture.is_none()
+            && self.cached_prims.is_some()
+            && self.cached_screen.as_ref().map(|&(sz, ppp)| sz == screen.size_in_pixels && (ppp - screen.pixels_per_point).abs() < 1e-3).unwrap_or(false);
+
+        let prims = if can_fast_path {
+            self.cached_prims.as_ref().unwrap().clone()
+        } else {
+            let p = Arc::new(ctx.tessellate(shapes, ppp_out));
+            if self.fast_stroke_active && self.pen_down && self.gesture.is_none() {
+                self.cached_prims = Some(p.clone());
+                self.cached_screen = Some((screen.size_in_pixels, screen.pixels_per_point));
+            } else {
+                self.cached_prims = None;
+                self.cached_screen = None;
+            }
+            p
+        };
 
         let rs = self.rs.clone();
         {
@@ -1264,10 +1296,6 @@ impl Host {
             let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
             let mut encoder =
                 rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("photocraft") });
-            let screen = egui_wgpu::ScreenDescriptor {
-                size_in_pixels: [self.config.width, self.config.height],
-                pixels_per_point: ppp_out,
-            };
             let extra = {
                 let mut renderer = rs.renderer.write();
                 renderer.update_buffers(&rs.device, &rs.queue, &mut encoder, &prims, &screen)
@@ -1440,6 +1468,11 @@ pub unsafe extern "C" fn pc_pointer_gone(h: *mut c_void) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_pointer_button(h: *mut c_void, x: f32, y: f32, button: c_int, pressed: c_int, mods: u32) {
     if let Some(h) = unsafe { host(h) } {
+        if h.fast_stroke_active {
+            h.fast_stroke_active = false;
+            h.cached_prims = None;
+            h.cached_screen = None;
+        }
         h.set_modifiers(to_mods(mods));
         let pos = h.pt(x, y);
         let button = match button {
@@ -1490,10 +1523,16 @@ pub unsafe extern "C" fn pc_pen(
                 if h.on_canvas(x, y) {
                     h.gesture = None;
                     h.pen_down = true;
+                    h.fast_stroke_active = true;
+                    h.cached_prims = None;
+                    h.cached_screen = None;
                     h.feed.set(Some(sample));
                     h.push(egui::Event::PointerMoved(pos));
                     h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
                 } else {
+                    h.fast_stroke_active = false;
+                    h.cached_prims = None;
+                    h.cached_screen = None;
                     h.feed.set(None);
                     h.gesture_begin(x, y, true);
                 }
@@ -1507,12 +1546,16 @@ pub unsafe extern "C" fn pc_pen(
                 }
             }
             _ => {
+                h.fast_stroke_active = false;
+                h.cached_prims = None;
+                h.cached_screen = None;
                 if h.pen_down {
                     h.pen_down = false;
                     h.push(egui::Event::PointerMoved(pos));
                     h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
                     // The stroke's last samples keep their pressure; nothing is held after this.
                     h.feed.set(None);
+                    h.feed.set_predicted(None);
                 } else if h.gesture.is_some_and(|g| g.pen) {
                     h.gesture_end(x, y, phase == 3);
                 }
@@ -1645,6 +1688,11 @@ pub unsafe extern "C" fn pc_pen_hover_end(h: *mut c_void) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_finger(h: *mut c_void, phase: c_int, x: f32, y: f32, mods: u32) {
     if let Some(h) = unsafe { host(h) } {
+        if h.fast_stroke_active {
+            h.fast_stroke_active = false;
+            h.cached_prims = None;
+            h.cached_screen = None;
+        }
         h.set_modifiers(to_mods(mods));
         match phase {
             0 => h.gesture_begin(x, y, false),
@@ -1696,6 +1744,11 @@ pub unsafe extern "C" fn pc_long_press(h: *mut c_void, x: f32, y: f32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_select_tool(h: *mut c_void, name: *const c_char) {
     if let Some(h) = unsafe { host(h) } {
+        if h.fast_stroke_active {
+            h.fast_stroke_active = false;
+            h.cached_prims = None;
+            h.cached_screen = None;
+        }
         if let Some(s) = unsafe { from_c(name) } {
             let tool = match s.as_str() {
                 "select" | "pathSelection" | "path_selection" => Some(photocraft_ui_egui::Tool::PathSelection),
@@ -1721,6 +1774,11 @@ pub unsafe extern "C" fn pc_select_tool(h: *mut c_void, name: *const c_char) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_show_brush_options(h: *mut c_void, x: f32, y: f32) -> c_int {
     if let Some(h) = unsafe { host(h) } {
+        if h.fast_stroke_active {
+            h.fast_stroke_active = false;
+            h.cached_prims = None;
+            h.cached_screen = None;
+        }
         let tool = h.app.ui.tool;
         if photocraft_ui_egui::paint_mouse::has_brush_picker(tool) {
             if h.app.ui.brush_picker.is_some() {
@@ -1763,6 +1821,11 @@ pub unsafe extern "C" fn pc_click(h: *mut c_void, x: f32, y: f32, button: c_int,
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_set_touch_shift(h: *mut c_void, on: c_int) {
     if let Some(h) = unsafe { host(h) } {
+        if h.fast_stroke_active {
+            h.fast_stroke_active = false;
+            h.cached_prims = None;
+            h.cached_screen = None;
+        }
         h.touch_shift = on != 0;
         h.refresh_mods();
         h.wake();
@@ -1774,6 +1837,11 @@ pub unsafe extern "C" fn pc_set_touch_shift(h: *mut c_void, on: c_int) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_rotate(h: *mut c_void, radians: f32, x: f32, y: f32) {
     if let Some(h) = unsafe { host(h) } {
+        if h.fast_stroke_active {
+            h.fast_stroke_active = false;
+            h.cached_prims = None;
+            h.cached_screen = None;
+        }
         if !radians.is_finite() || radians == 0.0 {
             return;
         }
@@ -1786,6 +1854,11 @@ pub unsafe extern "C" fn pc_rotate(h: *mut c_void, radians: f32, x: f32, y: f32)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_scroll(h: *mut c_void, dx: f32, dy: f32, mods: u32) {
     if let Some(h) = unsafe { host(h) } {
+        if h.fast_stroke_active {
+            h.fast_stroke_active = false;
+            h.cached_prims = None;
+            h.cached_screen = None;
+        }
         h.set_modifiers(to_mods(mods));
         h.wheel(dx, dy);
     }
@@ -1795,6 +1868,11 @@ pub unsafe extern "C" fn pc_scroll(h: *mut c_void, dx: f32, dy: f32, mods: u32) 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_zoom(h: *mut c_void, factor: f32, x: f32, y: f32) {
     if let Some(h) = unsafe { host(h) } {
+        if h.fast_stroke_active {
+            h.fast_stroke_active = false;
+            h.cached_prims = None;
+            h.cached_screen = None;
+        }
         if !factor.is_finite() || factor <= 0.0 {
             return;
         }
@@ -1807,6 +1885,11 @@ pub unsafe extern "C" fn pc_zoom(h: *mut c_void, factor: f32, x: f32, y: f32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_key(h: *mut c_void, hid: u32, pressed: c_int, repeat: c_int, mods: u32) {
     if let Some(h) = unsafe { host(h) } {
+        if h.fast_stroke_active {
+            h.fast_stroke_active = false;
+            h.cached_prims = None;
+            h.cached_screen = None;
+        }
         h.set_modifiers(to_mods(mods));
         let Some(key) = hid_to_key(hid) else { return };
         let m = h.modifiers;
@@ -1994,5 +2077,25 @@ pub unsafe extern "C" fn pc_telemetry_get(
         1
     } else {
         0
+    }
+}
+
+/// Returns 1 if low-latency live stroke fast path is currently active.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_is_fast_stroke_active(h: *mut c_void) -> c_int {
+    match unsafe { host(h) } {
+        Some(h) => h.fast_stroke_active as c_int,
+        None => 0,
+    }
+}
+
+/// Immediately sync and commit finalized wet stroke back into document and tile-delta undo stack.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_sync_live_stroke_commit(h: *mut c_void) {
+    if let Some(h) = unsafe { host(h) } {
+        h.fast_stroke_active = false;
+        h.cached_prims = None;
+        h.cached_screen = None;
+        h.wake();
     }
 }

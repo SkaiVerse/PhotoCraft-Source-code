@@ -1698,7 +1698,12 @@ impl GeneralTip<'_> {
                     ctx.texture_at(x, y)
                 };
                 let depth = if b.grain_depth > 0.0 { b.grain_depth } else { d.depth };
-                val = texture_combine(b.texture.mode, val, tex_val, depth);
+                if b.grain_depth > 0.0 {
+                    let softness = if b.grain_softness > 0.0 { b.grain_softness } else { 0.25 };
+                    val *= crate::dynamics::eval_height_map_grain(d.pressure, depth, tex_val, softness);
+                } else {
+                    val = texture_combine(b.texture.mode, val, tex_val, depth);
+                }
             }
             if wet {
                 val *= wet_factor(rn);
