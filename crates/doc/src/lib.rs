@@ -1175,14 +1175,6 @@ impl Document {
         self.walk().len()
     }
 
-    /// Compute the dynamic layer cap based on device memory and canvas dimensions:
-    /// clamp(floor(os_proc_available_memory() * 0.5 / bytesPerPaintedLayer), 8, 512)
-    pub fn dynamic_layer_cap(&self) -> usize {
-        let bpp = self.pixel_format().bytes_per_pixel();
-        let avail = photocraft_raster::dynamic_layers::os_proc_available_memory();
-        photocraft_raster::dynamic_layers::compute_dynamic_layer_cap(avail, self.size.width, self.size.height, bpp)
-    }
-
     pub fn path_of(&self, id: LayerId) -> Option<LayerPath> {
         fn rec(layers: &[Layer], id: LayerId, path: &mut LayerPath) -> bool {
             for (i, l) in layers.iter().enumerate() {

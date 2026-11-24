@@ -231,12 +231,8 @@ impl PhotocraftApp {
                 }
             }
             Err(e) => {
-                if e.contains("Maximum layer limit reached") {
-                    notices::error(self, e.clone());
-                } else {
-                    self.ui.status = e.clone();
-                    self.ui.status_error = true;
-                }
+                self.ui.status = e.clone();
+                self.ui.status_error = true;
             }
         }
         if suppress_events {

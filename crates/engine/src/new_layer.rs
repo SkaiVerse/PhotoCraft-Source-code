@@ -42,7 +42,6 @@ pub fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let NewLayer { clip, mode, opacity, label, neutral, below, name } = parse(p)?;
     let place = if below { crate::layer_place::Place::Below } else { crate::layer_place::Place::Auto };
     let id = s.edit("New Layer", |doc, active| {
-        crate::dynamic_layers::check_layer_limit(doc, 1)?;
         let name = name.clone().unwrap_or_else(|| doc.next_layer_name("Layer"));
         let mut layer = Layer::raster(name, doc.pixel_format());
         layer.blend = mode;

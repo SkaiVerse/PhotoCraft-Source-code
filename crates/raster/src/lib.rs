@@ -16,9 +16,9 @@ mod shift;
 pub use shift::TranslateSteps;
 pub use dynamic_layers::{
     CompressedTileDelta512, DynamicLayerStorage512, MetalTile512, StrokeTileDelta512,
-    TileBitmask512, TileStorageMode, compute_dynamic_layer_cap, handle_memory_pressure,
+    TileBitmask512, TileStorageMode, handle_memory_pressure,
     last_undo_duration_ms, os_proc_available_memory, total_resident_gpu_tile_memory_bytes,
-    MAX_DYNAMIC_LAYER_CAP, MEMORY_PRESSURE_THRESHOLD, MIN_DYNAMIC_LAYER_CAP, TILE_SIZE_512,
+    MEMORY_PRESSURE_THRESHOLD, TILE_SIZE_512,
 };
 
 use std::collections::BTreeMap;

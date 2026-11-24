@@ -9,8 +9,6 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use photocraft_geom::Rect;
 
 pub const TILE_SIZE_512: u32 = 512;
-pub const MIN_DYNAMIC_LAYER_CAP: usize = 8;
-pub const MAX_DYNAMIC_LAYER_CAP: usize = 512;
 pub const MEMORY_PRESSURE_THRESHOLD: u64 = 256 << 20; // 256 MB
 
 static MEMORY_OVERRIDE: AtomicU64 = AtomicU64::new(0);
@@ -34,20 +32,6 @@ pub fn os_proc_available_memory() -> u64 {
         }
     }
     crate::memory::measure().available_bytes
-}
-
-/// Compute the maximum allowed layer count dynamically based on available device memory:
-/// clamp(floor(os_proc_available_memory() * 0.5 / bytesPerPaintedLayer), 8, 512)
-pub fn compute_dynamic_layer_cap(available_mem: u64, width: u32, height: u32, bpp: usize) -> usize {
-    let bytes_per_layer = (width as u64)
-        .saturating_mul(height as u64)
-        .saturating_mul(bpp as u64);
-    if bytes_per_layer == 0 {
-        return MAX_DYNAMIC_LAYER_CAP;
-    }
-    let usable_memory = (available_mem as f64) * 0.5;
-    let computed = (usable_memory / (bytes_per_layer as f64)).floor() as i64;
-    computed.clamp(MIN_DYNAMIC_LAYER_CAP as i64, MAX_DYNAMIC_LAYER_CAP as i64) as usize
 }
 
 /// Compact per-layer bitmask tracking empty vs. populated 512x512 tiles.
@@ -813,35 +797,6 @@ pub fn handle_memory_pressure() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_dynamic_layer_cap_clamping_8_to_512() {
-        // Zero or negative usable memory clamps to MIN (8)
-        assert_eq!(compute_dynamic_layer_cap(0, 4000, 3000, 4), 8);
-        assert_eq!(compute_dynamic_layer_cap(10 << 20, 4000, 3000, 4), 8); // 10 MB on 48 MB layer
-
-        // Moderate memory produces proportional layer cap
-        // 4 GB available, 2048x2048 RGBA8 layer = 16 MB.
-        // usable = 2 GB = 2048 MB -> 2048 / 16 = 128 layers
-        let cap = compute_dynamic_layer_cap(4 << 30, 2048, 2048, 4);
-        assert_eq!(cap, 128);
-
-        // Huge memory clamps to MAX (512)
-        // 64 GB available on small 512x512 RGBA8 (1 MB) -> floor(32 GB / 1 MB) = 32768 -> clamped to 512
-        assert_eq!(compute_dynamic_layer_cap(64 << 30, 512, 512, 4), 512);
-
-        // Degenerate canvas size returns MAX
-        assert_eq!(compute_dynamic_layer_cap(1 << 30, 0, 0, 4), 512);
-        assert_eq!(compute_dynamic_layer_cap(1 << 30, 100, 0, 4), 512);
-
-        // Strict bounds verification
-        for mem in [0, 10 << 20, 100 << 20, 1 << 30, 4 << 30, 16 << 30, 128 << 30] {
-            for (w, h) in [(0, 0), (100, 100), (1920, 1080), (4096, 4096), (8192, 8192)] {
-                let c = compute_dynamic_layer_cap(mem, w, h, 4);
-                assert!((8..=512).contains(&c), "Cap {c} must be in [8, 512] for mem={mem}, size={w}x{h}");
-            }
-        }
-    }
 
     #[test]
     fn test_empty_tile_bitmask_tracking() {

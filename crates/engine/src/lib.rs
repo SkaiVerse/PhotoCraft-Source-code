@@ -18,7 +18,6 @@ pub mod color_channels;
 mod crop_fill;
 pub mod display_color;
 pub mod doc_path;
-pub mod dynamic_layers;
 pub mod filters;
 pub mod filters_ext;
 mod group_options;

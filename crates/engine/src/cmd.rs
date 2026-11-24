@@ -550,7 +550,6 @@ fn build() -> Vec<CommandSpec> {
                 let below = crate::group_options::below("layer.new.group", p)?;
                 let place = if below { crate::layer_place::Place::Below } else { crate::layer_place::Place::Auto };
                 let id = s.edit("New Group", |doc, active| {
-                    crate::dynamic_layers::check_layer_limit(doc, 1)?;
                     let name = opts.name.clone().unwrap_or_else(|| doc.next_layer_name("Group"));
                     let mut group = Layer::group(name, vec![]);
                     opts.apply(&mut group);
@@ -607,7 +606,6 @@ fn build() -> Vec<CommandSpec> {
                 let mut typed = None;
                 let mut shift = (0, 0);
                 let nid = s.edit("Duplicate Layer", |doc, active| {
-                    crate::dynamic_layers::check_layer_limit(doc, 1)?;
                     let mut dup = layer_copy(doc, id, add_copy)?;
                     if let Some(name) = name.as_ref().filter(|n| **n != dup.name) {
                         dup.name.clone_from(name);

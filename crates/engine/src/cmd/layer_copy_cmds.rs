@@ -316,7 +316,6 @@ fn copy_to_document(s: &mut Session, p: &Value) -> Result<Value> {
     s.set_active(dest);
     let label = if ids.len() == 1 { "Duplicate Layer" } else { "Duplicate Layers" };
     let edited = s.edit(label, |doc, active| {
-        crate::dynamic_layers::check_layer_limit(doc, copies.layers.len())?;
         doc.patterns.extend(patterns);
         land_text_styles(doc, styles);
         let mut above = *active;
