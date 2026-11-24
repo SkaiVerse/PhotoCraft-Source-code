@@ -129,6 +129,13 @@ impl StylusFeed {
     pub fn drain(&self) -> Vec<PenSample> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).queue.drain(..).collect()
     }
+
+    /// Drains samples directly into an existing buffer without heap reallocations.
+    pub fn drain_into(&self, target: &mut Vec<PenSample>) {
+        target.clear();
+        let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        target.extend(g.queue.drain(..));
+    }
 }
 
 /// Per-app stylus state.
@@ -222,7 +229,7 @@ impl Stylus {
         if let Some(last) = self.frame.last() {
             self.prev = Some(*last);
         }
-        self.frame = self.feed.drain();
+        self.feed.drain_into(&mut self.frame);
         self.current = None;
         for e in events {
             if let egui::Event::Touch { id, phase, force, .. } = e {

@@ -800,21 +800,55 @@ impl DynamicsLut {
         let norm = (azimuth_deg.rem_euclid(360.0) / 360.0).clamp(0.0, 1.0);
         sample_lut_256(&self.azimuth_to_rotation, norm)
     }
+
+    /// Direct $O(1)$ zero-allocation evaluation of size factor from pressure.
+    #[inline]
+    pub fn eval_pressure_size(b: &BrushSettings, pressure: f32) -> f32 {
+        let t = pressure.clamp(0.0, 1.0);
+        let sd = &b.shape_dynamics;
+        if b.dynamics_pressure_size > 0.0 {
+            let curve_val = b.dynamics_pressure_size_curve.eval(t);
+            let gain = b.dynamics_pressure_size.clamp(0.0, 1.0);
+            (1.0 - gain) + gain * curve_val
+        } else if sd.enabled && sd.size.control == Control::PenPressure {
+            let min = sd.size.minimum.clamp(0.0, 1.0);
+            min + (1.0 - min) * sd.size.curve.eval(t)
+        } else if b.pressure_size {
+            sd.size.curve.eval(t)
+        } else {
+            1.0
+        }
+    }
+
+    /// Direct $O(1)$ zero-allocation evaluation of opacity factor from pressure.
+    #[inline]
+    pub fn eval_pressure_opacity(b: &BrushSettings, pressure: f32) -> f32 {
+        let t = pressure.clamp(0.0, 1.0);
+        let tr = &b.transfer;
+        if b.dynamics_pressure_opacity > 0.0 {
+            let curve_val = b.dynamics_pressure_opacity_curve.eval(t);
+            let gain = b.dynamics_pressure_opacity.clamp(0.0, 1.0);
+            (1.0 - gain) + gain * curve_val
+        } else if tr.enabled && tr.opacity.control == Control::PenPressure {
+            let min = tr.opacity.minimum.clamp(0.0, 1.0);
+            min + (1.0 - min) * tr.opacity.curve.eval(t)
+        } else if b.pressure_opacity {
+            tr.opacity.curve.eval(t)
+        } else {
+            1.0
+        }
+    }
 }
 
 /// Base (pre-jitter) diameter at a step: size × size control (pressure etc.). Drives spacing.
 pub fn base_diameter(b: &BrushSettings, s: &StepInput) -> f32 {
     let sd = &b.shape_dynamics;
     let mut f = 1.0;
-    if b.dynamics_pressure_size > 0.0 {
-        let lut = DynamicsLut::new(b);
-        f = lut.size_from_pressure(s.point.pressure);
+    if b.dynamics_pressure_size > 0.0 || b.pressure_size {
+        f = DynamicsLut::eval_pressure_size(b, s.point.pressure);
     } else if sd.enabled && sd.size.control != Control::Off {
         let min = sd.size.minimum.clamp(0.0, 1.0);
         f = min + (1.0 - min) * dynamic_value(&sd.size, s);
-    } else if b.pressure_size {
-        let lut = DynamicsLut::new(b);
-        f = lut.size_from_pressure(s.point.pressure);
     }
     b.size * f
 }

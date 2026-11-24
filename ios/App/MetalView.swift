@@ -67,6 +67,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         var stamp: TimeInterval
     }
     private var penQueue: [PenItem] = []
+    private var penQueueHead = 0
     private var lastQueuedLocation: CGPoint?
     private var smoothedPressure: Float = 0
 
@@ -109,6 +110,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         }
         if let f = fingerTouch, f.phase == .ended || f.phase == .cancelled { cancelFinger() }
         if let c = constrainTouch, c.phase == .ended || c.phase == .cancelled { releaseConstrain() }
+        if penQueueHead >= penQueue.count { penQueue.removeAll(keepingCapacity: true); penQueueHead = 0 }
     }
 
     // UITextInputTraits (no autocorrect while typing)
@@ -125,6 +127,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         isMultipleTouchEnabled = true
         backgroundColor = UIColor(red: 0.09, green: 0.09, blue: 0.10, alpha: 1)
         metalLayer.colorspace = CGColorSpace(name: CGColorSpace.displayP3)
+        metalLayer.framebufferOnly = true
+        metalLayer.presentsWithTransaction = false
+        metalLayer.maximumDrawableCount = 3
         inputAssistantItem.leadingBarButtonGroups = []
         inputAssistantItem.trailingBarButtonGroups = []
         setupGestures()
@@ -178,6 +183,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         contentScaleFactor = s
         metalLayer.contentsScale = s
         metalLayer.colorspace = CGColorSpace(name: CGColorSpace.displayP3)
+        metalLayer.framebufferOnly = true
+        metalLayer.presentsWithTransaction = false
+        metalLayer.maximumDrawableCount = 3
         let layerPtr = Unmanaged.passUnretained(metalLayer).toOpaque()
         handle = pc_create(layerPtr, UInt32(bounds.width * s), UInt32(bounds.height * s), Float(s), makeCallbacks())
         if handle == nil {
@@ -840,11 +848,15 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         for t in touches where t.type == .pencil {
             let maxForce = t.maximumPossibleForce
             let normForce = max(0.0009765625, min(1.0, maxForce > 0 ? (t.force / maxForce) : 0.5))
-            if let index = t.estimationUpdateIndex,
-               let i = penQueue.firstIndex(where: { $0.index == index }) {
-                penQueue[i].force = normForce
-                penQueue[i].altitude = t.altitudeAngle
-                if !t.estimatedPropertiesExpectingUpdates.contains(.force) { penQueue[i].ready = true }
+            if let index = t.estimationUpdateIndex {
+                for i in penQueueHead..<penQueue.count {
+                    if penQueue[i].index == index {
+                        penQueue[i].force = normForce
+                        penQueue[i].altitude = t.altitudeAngle
+                        if !t.estimatedPropertiesExpectingUpdates.contains(.force) { penQueue[i].ready = true }
+                        break
+                    }
+                }
             }
             if t === pencilTouch {
                 let (tx, ty) = self.tilt(altitude: t.altitudeAngle, azimuth: t.azimuthUnitVector(in: self))
@@ -858,9 +870,18 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     private func flushPen(all: Bool) {
         let now = CACurrentMediaTime()
-        while let first = penQueue.first, first.ready || all || now - first.time > 0.004 {
-            penQueue.removeFirst()
-            sendPen(first)
+        while penQueueHead < penQueue.count {
+            let item = penQueue[penQueueHead]
+            if item.ready || all || now - item.time > 0.004 {
+                penQueueHead += 1
+                sendPen(item)
+            } else {
+                break
+            }
+        }
+        if penQueueHead >= penQueue.count {
+            penQueue.removeAll(keepingCapacity: true)
+            penQueueHead = 0
         }
     }
 

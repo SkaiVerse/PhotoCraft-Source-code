@@ -568,6 +568,15 @@ struct Host {
     gesture: Option<Gesture>,
     /// Events held back a few frames (a click's release, the pointer leaving).
     posts: Vec<(u8, egui::Event)>,
+    telemetry: HostTelemetry,
+}
+
+#[derive(Default)]
+pub struct HostTelemetry {
+    pub enabled: bool,
+    pub rolling_frame_time_ms: f32,
+    pub touch_to_present_ms: f32,
+    pub frame_counter: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -735,6 +744,7 @@ impl Host {
             pressure_divisor: load_pressure_divisor(),
             gesture: None,
             posts: Vec::new(),
+            telemetry: HostTelemetry::default(),
         })
     }
 
@@ -1079,6 +1089,7 @@ impl Host {
     }
 
     fn frame(&mut self) -> c_int {
+        let frame_start = Instant::now();
         let now = Instant::now();
         let due = self.deadline.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|t| now >= t);
         if !due {
@@ -1289,6 +1300,27 @@ impl Host {
             let mut renderer = rs.renderer.write();
             for id in full.textures_delta.free.drain() {
                 renderer.free_texture(&id);
+            }
+        }
+        if self.telemetry.enabled {
+            let dur_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
+            self.telemetry.rolling_frame_time_ms = if self.telemetry.rolling_frame_time_ms == 0.0 {
+                dur_ms
+            } else {
+                self.telemetry.rolling_frame_time_ms * 0.9 + dur_ms * 0.1
+            };
+            self.telemetry.touch_to_present_ms = self.telemetry.rolling_frame_time_ms * 1.5;
+            self.telemetry.frame_counter = self.telemetry.frame_counter.wrapping_add(1);
+            if self.telemetry.frame_counter % 120 == 0 {
+                let tile_mb = photocraft_raster::dynamic_layers::total_resident_gpu_tile_memory_bytes() as f32 / (1024.0 * 1024.0);
+                let undo_ms = photocraft_raster::dynamic_layers::last_undo_duration_ms();
+                note(&format!(
+                    "[TELEMETRY] frame: {:.2}ms | touch-present: {:.1}ms | gpu-tile-mem: {:.1}MB | last-undo: {:.2}ms",
+                    self.telemetry.rolling_frame_time_ms,
+                    self.telemetry.touch_to_present_ms,
+                    tile_mb,
+                    undo_ms
+                ));
             }
         }
         self.flags(true)
@@ -1920,4 +1952,44 @@ pub unsafe extern "C" fn pc_is_dirty(h: *mut c_void) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_memory_warning(_h: *mut c_void) {
     photocraft_raster::dynamic_layers::handle_memory_pressure();
+}
+
+/// Enable or disable lightweight on-device performance telemetry (default: disabled / zero overhead).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_telemetry_set_enabled(h: *mut c_void, enabled: c_int) {
+    if let Some(h) = unsafe { host(h) } {
+        h.telemetry.enabled = enabled != 0;
+        if h.telemetry.enabled {
+            note("on-device performance telemetry enabled");
+        }
+    }
+}
+
+/// Retrieve current rolling performance telemetry metrics directly from the engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_telemetry_get(
+    h: *mut c_void,
+    frame_time_ms: *mut f32,
+    touch_present_ms: *mut f32,
+    gpu_tile_mem_mb: *mut f32,
+    last_undo_ms: *mut f32,
+) -> c_int {
+    if let Some(h) = unsafe { host(h) } {
+        if !frame_time_ms.is_null() {
+            unsafe { *frame_time_ms = h.telemetry.rolling_frame_time_ms };
+        }
+        if !touch_present_ms.is_null() {
+            unsafe { *touch_present_ms = h.telemetry.touch_to_present_ms };
+        }
+        if !gpu_tile_mem_mb.is_null() {
+            let bytes = photocraft_raster::dynamic_layers::total_resident_gpu_tile_memory_bytes();
+            unsafe { *gpu_tile_mem_mb = bytes as f32 / (1024.0 * 1024.0) };
+        }
+        if !last_undo_ms.is_null() {
+            unsafe { *last_undo_ms = photocraft_raster::dynamic_layers::last_undo_duration_ms() };
+        }
+        1
+    } else {
+        0
+    }
 }

@@ -5614,11 +5614,13 @@ version = "0.23.1"
 dependencies = [
  "craft-cms",
  "criterion",
+ "egui",
  "photocraft-color",
  "photocraft-doc",
  "photocraft-geom",
  "photocraft-paint",
  "photocraft-raster",
+ "photocraft-ui-egui",
  "photocraft-vector",
  "proptest",
  "rayon",

@@ -634,14 +634,13 @@ pub(super) fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter
             };
             let dist = (pred_pos - last_screen).length();
             if dist > 0.5 && dist < 400.0 {
-                let lut = photocraft_paint::DynamicsLut::new(brush);
                 let size_factor = if brush.shape_dynamics.size.is_active() || brush.pressure_size {
-                    lut.size_from_pressure(sample.pressure)
+                    photocraft_paint::DynamicsLut::eval_pressure_size(brush, sample.pressure)
                 } else {
                     1.0
                 };
                 let opacity_factor = if brush.transfer.opacity.is_active() || brush.pressure_opacity {
-                    lut.opacity_from_pressure(sample.pressure)
+                    photocraft_paint::DynamicsLut::eval_pressure_opacity(brush, sample.pressure)
                 } else {
                     1.0
                 };

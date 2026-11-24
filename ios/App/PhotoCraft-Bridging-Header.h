@@ -55,5 +55,7 @@ int pc_frame(void *h);
 void pc_save_state(void *h);
 int pc_is_dirty(void *h);
 void pc_memory_warning(void *h);
+void pc_telemetry_set_enabled(void *h, int enabled);
+int pc_telemetry_get(void *h, float *frame_time_ms, float *touch_present_ms, float *gpu_tile_mem_mb, float *last_undo_ms);
 
 #endif

@@ -412,6 +412,16 @@ impl MetalTile512 {
     }
 
     #[inline]
+    pub fn byte_len(&self) -> usize {
+        self.cell.byte_len()
+    }
+
+    #[inline]
+    pub fn cell_ptr(&self) -> usize {
+        Arc::as_ptr(&self.cell) as usize
+    }
+
+    #[inline]
     pub fn read_bytes(&self) -> Result<Vec<u8>, String> {
         self.cell.read_bytes()
     }
@@ -549,6 +559,32 @@ impl DynamicLayerStorage512 {
         }
     }
 
+    /// Estimated resident GPU texture memory in bytes for this layer's populated tiles.
+    pub fn resident_memory_bytes(&self) -> usize {
+        let mut bytes = 0;
+        for tile in self.tiles.values() {
+            if tile.is_resident() {
+                bytes += tile.byte_len();
+            }
+        }
+        bytes
+    }
+
+    /// Estimated unique resident GPU texture memory in bytes, deduplicating shared CoW tiles.
+    pub fn unique_resident_memory_bytes(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut bytes = 0;
+        for tile in self.tiles.values() {
+            if tile.is_resident() {
+                let ptr = tile.cell_ptr();
+                if seen.insert(ptr) {
+                    bytes += tile.byte_len();
+                }
+            }
+        }
+        bytes
+    }
+
     /// Evict cold/resident tiles to compressed temporary disk storage.
     pub fn evict_cold_tiles(&mut self, scratch_dir: &Path, prefix: &str) -> usize {
         let mut freed = 0;
@@ -665,6 +701,7 @@ impl DynamicLayerStorage512 {
 
     /// Restore the layer storage to the exact prior state captured by `delta` (Undo).
     pub fn restore_delta(&mut self, delta: &StrokeTileDelta512) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
         for d in &delta.deltas {
             match &d.prior_compressed {
                 Some(compressed) => {
@@ -680,6 +717,8 @@ impl DynamicLayerStorage512 {
             }
         }
         self.bitmask = delta.prior_bitmask.clone();
+        let dur_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        record_last_undo_duration_ms(dur_ms);
         Ok(())
     }
 }
@@ -701,7 +740,45 @@ pub struct StrokeTileDelta512 {
     pub prior_bitmask: TileBitmask512,
 }
 
+static LAST_UNDO_DURATION_US: AtomicU64 = AtomicU64::new(0);
+
+/// Record duration of the last undo / redo operation in milliseconds.
+pub fn record_last_undo_duration_ms(ms: f32) {
+    LAST_UNDO_DURATION_US.store((ms * 1000.0).max(0.0) as u64, Ordering::Relaxed);
+}
+
+/// Retrieve duration of the last undo / redo operation in milliseconds.
+pub fn last_undo_duration_ms() -> f32 {
+    LAST_UNDO_DURATION_US.load(Ordering::Relaxed) as f32 / 1000.0
+}
+
 static REGISTERED_STORAGES: Mutex<Vec<std::sync::Weak<Mutex<DynamicLayerStorage512>>>> = Mutex::new(Vec::new());
+
+/// Total resident GPU tile memory across all registered storages in bytes (deduplicating CoW tiles).
+pub fn total_resident_gpu_tile_memory_bytes() -> usize {
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0;
+    let reg = {
+        let mut g = REGISTERED_STORAGES.lock().unwrap_or_else(PoisonError::into_inner);
+        g.retain(|w| w.strong_count() > 0);
+        g.clone()
+    };
+    for weak in reg {
+        if let Some(storage_arc) = weak.upgrade() {
+            if let Ok(storage) = storage_arc.try_lock() {
+                for tile in storage.tiles.values() {
+                    if tile.is_resident() {
+                        let ptr = tile.cell_ptr();
+                        if seen.insert(ptr) {
+                            total += tile.byte_len();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    total
+}
 
 /// Register a layer storage instance for automatic memory pressure eviction.
 pub fn register_layer_storage(storage: &Arc<Mutex<DynamicLayerStorage512>>) {
