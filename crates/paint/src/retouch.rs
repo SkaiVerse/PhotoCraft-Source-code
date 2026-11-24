@@ -189,6 +189,40 @@ pub fn over_native(fmt: &PixelFormat, dst: &mut [f32], src: &[f32], k: f32, lock
     }
 }
 
+/// Linear-space premultiplied source-over blending for RGB surfaces.
+/// Performs dab stamping and wet-stroke accumulation in linear working space with premultiplied alpha,
+/// eliminating dark muddy halos/fringes along soft edges and complementary color overlaps (e.g. saturated red over green).
+#[inline]
+pub fn over_native_linear(dst: &mut [f32], src: &[f32], k: f32, lock_transparency: bool) {
+    if dst.len() < 4 || src.len() < 4 {
+        return;
+    }
+    let da = dst[3].clamp(0.0, 1.0);
+    let sa = (src[3] * k).clamp(0.0, 1.0);
+    if sa <= 0.0 {
+        return;
+    }
+    if lock_transparency {
+        for c in 0..3 {
+            dst[c] += (src[c] - dst[c]) * sa;
+        }
+        return;
+    }
+    let oa = (sa + da * (1.0 - sa)).clamp(0.0, 1.0);
+    if oa > 0.0 {
+        for c in 0..3 {
+            let lin_src = photocraft_color::convert::srgb_to_linear(src[c].clamp(0.0, 1.0));
+            let lin_dst = photocraft_color::convert::srgb_to_linear(dst[c].clamp(0.0, 1.0));
+            let p_src = lin_src * sa;
+            let p_dst = lin_dst * da;
+            let p_out = p_src + p_dst * (1.0 - sa);
+            let lin_out = (p_out / oa).clamp(0.0, 1.0);
+            dst[c] = photocraft_color::convert::linear_to_srgb(lin_out);
+        }
+    }
+    dst[3] = oa;
+}
+
 /// Composite a paint image through a coverage map onto `target`.
 ///
 /// `paint` must cover `rect`; `cov` has one value per pixel of `rect`. The per-pixel weight is

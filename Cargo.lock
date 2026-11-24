@@ -5787,6 +5787,7 @@ dependencies = [
 name = "photocraft-ios"
 version = "0.23.1"
 dependencies = [
+ "craft-cms",
  "craft-image-codecs",
  "eframe",
  "egui",

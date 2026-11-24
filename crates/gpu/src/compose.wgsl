@@ -123,13 +123,13 @@ const M_DISSOLVE: i32 = 2;
 const EDGE: f32 = 1e-4;
 fn color_burn(cb: f32, cs: f32) -> f32 {
     if (cb >= 1.0 - EDGE) { return 1.0; }
-    if (cs <= 0.0) { return 0.0; }
-    return 1.0 - min((1.0 - cb) / cs, 1.0);
+    if (cs <= EDGE) { return 0.0; }
+    return 1.0 - min((1.0 - cb) / max(cs, 1e-6), 1.0);
 }
 fn color_dodge(cb: f32, cs: f32) -> f32 {
     if (cb <= EDGE) { return 0.0; }
-    if (cs >= 1.0) { return 1.0; }
-    return min(cb / (1.0 - cs), 1.0);
+    if (cs >= 1.0 - EDGE) { return 1.0; }
+    return min(cb / max(1.0 - cs, 1e-6), 1.0);
 }
 fn hard_light(cb: f32, cs: f32) -> f32 {
     if (cs <= 0.5) { return cb * 2.0 * cs; }
@@ -147,20 +147,20 @@ fn soft_light_ps(cb: f32, cs: f32) -> f32 {
 fn vivid_light_ps(cb: f32, cs: f32) -> f32 {
     if (cs <= 0.5) {
         if (cs <= 0.0) { return 0.0; }
-        return 1.0 - min((1.0 - cb) / (2.0 * cs), 1.0);
+        return 1.0 - min((1.0 - cb) / max(2.0 * cs, 1e-6), 1.0);
     }
     if (cs >= 1.0) { return 1.0; }
-    return min(cb / (2.0 * (1.0 - cs)), 1.0);
+    return min(cb / max(2.0 * (1.0 - cs), 1e-6), 1.0);
 }
 fn vivid_light_generic(cb: f32, cs: f32) -> f32 {
     if (cs <= 0.5) {
         if (cb >= 1.0 - EDGE) { return 1.0; }
         if (cs <= 0.0) { return 0.0; }
-        return 1.0 - min((1.0 - cb) / (2.0 * cs), 1.0);
+        return 1.0 - min((1.0 - cb) / max(2.0 * cs, 1e-6), 1.0);
     }
     if (cb <= EDGE) { return 0.0; }
     if (cs >= 1.0) { return 1.0; }
-    return min(cb / (2.0 * (1.0 - cs)), 1.0);
+    return min(cb / max(2.0 * (1.0 - cs), 1e-6), 1.0);
 }
 
 // f32::MAX exactly. The decimal 3.40282347e38 is just above it: naga rounds it down, but browsers'
@@ -235,11 +235,11 @@ fn clip_color(c: vec3<f32>, top: f32) -> vec3<f32> {
     var out = c;
     if (n < 0.0) {
         let d = l - n;
-        if (l > 0.0 && d > 0.0) { out = l + (out - l) * l / d; } else { out = vec3(l); }
+        if (l > 0.0 && d > 1e-6) { out = l + (out - l) * l / d; } else { out = vec3(l); }
     }
     if (x > top) {
         let d = x - l;
-        if (l < top && d > 0.0) { out = l + (out - l) * (top - l) / d; } else { out = vec3(l); }
+        if (l < top && d > 1e-6) { out = l + (out - l) * (top - l) / d; } else { out = vec3(l); }
     }
     return out;
 }
@@ -248,7 +248,7 @@ fn sat(c: vec3<f32>) -> f32 { return max(max(c.r, c.g), c.b) - min(min(c.r, c.g)
 fn set_sat(c: vec3<f32>, s: f32) -> vec3<f32> {
     let mx = max(max(c.r, c.g), c.b);
     let mn = min(min(c.r, c.g), c.b);
-    if (mx > mn) { return (c - mn) * s / (mx - mn); }
+    if (mx - mn > 1e-6) { return (c - mn) * s / (mx - mn); }
     return vec3(0.0);
 }
 

@@ -173,10 +173,12 @@ pub(crate) fn empty_in(layer: &Layer, rect: Rect) -> bool {
         return transparent_outside(layer) && bounds.inflate(effects::margin(layer)).intersect(&rect).is_empty();
     }
     // Fast path: use compact empty-tile bitmask to skip empty 512x512 tiles with zero overhead
-    if rect.x1 > 0 && rect.y1 > 0 {
-        let mask = layer.empty_tile_bitmask_512(rect.x1 as u32, rect.y1 as u32);
-        if (mask.is_empty() || !mask.intersects_rect(rect)) && transparent_outside(layer) {
-            return true;
+    if let LayerContent::Raster(s) = &layer.content {
+        if rect.x1 > 0 && rect.y1 > 0 && s.format().alpha && s.default_pixel().last().is_some_and(|a| *a <= 0.0) {
+            let mask = s.empty_tile_bitmask_512(rect.x1 as u32, rect.y1 as u32);
+            if (mask.is_empty() || !mask.intersects_rect(rect)) && transparent_outside(layer) {
+                return true;
+            }
         }
     }
     match &layer.content {

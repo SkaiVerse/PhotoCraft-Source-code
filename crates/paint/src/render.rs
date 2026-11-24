@@ -1388,7 +1388,11 @@ impl StrokeRenderer {
                                 px[a] = alpha;
                             }
                         } else if matches!(b.mode, BlendMode::Normal | BlendMode::Dissolve) {
-                            over_native(&fmt, px, &src[..n], k, lock_transparency);
+                            if fmt.mode == ColorMode::Rgb && a_idx == Some(3) {
+                                crate::retouch::over_native_linear(px, &src[..n], k, lock_transparency);
+                            } else {
+                                over_native(&fmt, px, &src[..n], k, lock_transparency);
+                            }
                         } else {
                             let d = to_rgba(&fmt, px);
                             let sr = to_rgba(&fmt, &src[..n]);

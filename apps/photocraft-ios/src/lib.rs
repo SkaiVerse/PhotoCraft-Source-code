@@ -694,6 +694,18 @@ impl Host {
         app.set_theme(&ctx, ThemeKind::Pro);
         app.set_wgpu(rs.clone());
         app.start_compositor(&ctx);
+
+        // Phase 7: Configure iPad display for Display P3 wide gamut without sRGB clamping
+        let p3_bytes = craft_cms::Builtin::DisplayP3.profile().to_bytes().to_vec();
+        let _ = app.session.color.set_displays(Ok(vec![
+            photocraft_engine::display_color::Display {
+                id: 1,
+                name: "iPad Retina Display (Display P3)".into(),
+                frame: [0.0, 0.0, width as f64 / scale.max(1.0) as f64, height as f64 / scale.max(1.0) as f64],
+                profile_name: Some("Display P3".into()),
+                icc: Some(Arc::new(p3_bytes)),
+            }
+        ]));
         let feed = app.stylus.feed.clone();
 
         Ok(Host {
@@ -1336,6 +1348,16 @@ pub unsafe extern "C" fn pc_resize(h: *mut c_void, width_px: u32, height_px: u32
             h.config.width = width_px.max(1);
             h.config.height = height_px.max(1);
             h.surface.configure(&h.rs.device, &h.config);
+            let p3_bytes = craft_cms::Builtin::DisplayP3.profile().to_bytes().to_vec();
+            let _ = h.app.session.color.set_displays(Ok(vec![
+                photocraft_engine::display_color::Display {
+                    id: 1,
+                    name: "iPad Retina Display (Display P3)".into(),
+                    frame: [0.0, 0.0, width_px as f64 / scale.max(1.0) as f64, height_px as f64 / scale.max(1.0) as f64],
+                    profile_name: Some("Display P3".into()),
+                    icc: Some(Arc::new(p3_bytes)),
+                }
+            ]));
             h.wake();
         }
     })

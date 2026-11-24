@@ -124,6 +124,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         super.init(frame: frame)
         isMultipleTouchEnabled = true
         backgroundColor = UIColor(red: 0.09, green: 0.09, blue: 0.10, alpha: 1)
+        metalLayer.colorspace = CGColorSpace(name: CGColorSpace.displayP3)
         inputAssistantItem.leadingBarButtonGroups = []
         inputAssistantItem.trailingBarButtonGroups = []
         setupGestures()
@@ -176,6 +177,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         let s = traitCollection.displayScale
         contentScaleFactor = s
         metalLayer.contentsScale = s
+        metalLayer.colorspace = CGColorSpace(name: CGColorSpace.displayP3)
         let layerPtr = Unmanaged.passUnretained(metalLayer).toOpaque()
         handle = pc_create(layerPtr, UInt32(bounds.width * s), UInt32(bounds.height * s), Float(s), makeCallbacks())
         if handle == nil {

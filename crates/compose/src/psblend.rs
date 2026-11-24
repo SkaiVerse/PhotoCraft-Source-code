@@ -227,6 +227,77 @@ pub fn composite(mode: BlendMode, backdrop: [f32; 4], source: [f32; 4], opacity:
     out
 }
 
+/// Linear-space premultiplied compositing:
+/// `backdrop_pre` and `source_pre` are premultiplied half4/f32 `[r*a, g*a, b*a, a]` in linear color space.
+/// Returns the resulting premultiplied linear color `[r*a, g*a, b*a, a]`.
+/// Eliminates dark muddy halos/fringes along soft edges and complementary color overlaps.
+#[inline]
+pub fn composite_linear_premultiplied(mode: BlendMode, backdrop_pre: [f32; 4], source_pre: [f32; 4], opacity: f32) -> [f32; 4] {
+    let ab = backdrop_pre[3].clamp(0.0, 1.0);
+    let as_ = (source_pre[3] * opacity).clamp(0.0, 1.0);
+    if as_ <= 0.0 {
+        return backdrop_pre;
+    }
+    let ao = (as_ + ab * (1.0 - as_)).clamp(0.0, 1.0);
+    if ao <= 1e-6 {
+        return [0.0; 4];
+    }
+    if mode == BlendMode::Normal {
+        let mut out = [0.0f32; 4];
+        for i in 0..3 {
+            out[i] = source_pre[i] * opacity + backdrop_pre[i] * (1.0 - as_);
+        }
+        out[3] = ao;
+        return out;
+    }
+    let cb = if ab > 1e-6 {
+        [backdrop_pre[0] / ab, backdrop_pre[1] / ab, backdrop_pre[2] / ab]
+    } else {
+        [0.0; 3]
+    };
+    let cs = if source_pre[3] > 1e-6 {
+        [source_pre[0] / source_pre[3], source_pre[1] / source_pre[3], source_pre[2] / source_pre[3]]
+    } else {
+        [0.0; 3]
+    };
+    let b = blend_rgb(mode, cb, cs);
+    let mut out = [0.0f32; 4];
+    for i in 0..3 {
+        let straight = ((1.0 - as_) * ab * cb[i] + (1.0 - ab) * as_ * cs[i] + as_ * ab * b[i]) / ao;
+        out[i] = if straight.is_finite() { straight * ao } else { 0.0 };
+    }
+    out[3] = ao;
+    out
+}
+
+/// Straight encoded RGB(A) → Linear Premultiplied RGBA `[r*a, g*a, b*a, a]`.
+#[inline]
+pub fn straight_to_linear_premultiplied(rgba: [f32; 4]) -> [f32; 4] {
+    let a = rgba[3].clamp(0.0, 1.0);
+    let lin_r = photocraft_color::convert::srgb_to_linear(rgba[0].clamp(0.0, 1.0));
+    let lin_g = photocraft_color::convert::srgb_to_linear(rgba[1].clamp(0.0, 1.0));
+    let lin_b = photocraft_color::convert::srgb_to_linear(rgba[2].clamp(0.0, 1.0));
+    [lin_r * a, lin_g * a, lin_b * a, a]
+}
+
+/// Linear Premultiplied RGBA `[r*a, g*a, b*a, a]` → Straight encoded RGB(A).
+#[inline]
+pub fn linear_premultiplied_to_straight(rgba_pre: [f32; 4]) -> [f32; 4] {
+    let a = rgba_pre[3].clamp(0.0, 1.0);
+    if a <= 1e-6 {
+        return [0.0; 4];
+    }
+    let lin_r = (rgba_pre[0] / a).clamp(0.0, 1.0);
+    let lin_g = (rgba_pre[1] / a).clamp(0.0, 1.0);
+    let lin_b = (rgba_pre[2] / a).clamp(0.0, 1.0);
+    [
+        photocraft_color::convert::linear_to_srgb(lin_r),
+        photocraft_color::convert::linear_to_srgb(lin_g),
+        photocraft_color::convert::linear_to_srgb(lin_b),
+        a,
+    ]
+}
+
 /// Normal mixing outside Lab, for callers that select the blend space once per buffer.
 #[inline]
 pub(crate) fn composite_normal_rgb(backdrop: [f32; 4], source: [f32; 4], opacity: f32) -> [f32; 4] {

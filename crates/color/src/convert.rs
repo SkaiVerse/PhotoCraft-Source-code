@@ -180,6 +180,60 @@ pub const SRGB_TO_XYZ_D50: [[f32; 3]; 3] = [[0.436_074, 0.385_064, 0.143_080], [
 /// D50 XYZ → linear sRGB (the inverse of [`SRGB_TO_XYZ_D50`]).
 pub const XYZ_D50_TO_SRGB: [[f32; 3]; 3] = [[3.133_856, -1.616_867, -0.490_615], [-0.978_768, 1.916_142, 0.033_454], [0.071_945, -0.228_991, 1.405_243]];
 
+/// Linear sRGB → Linear Display P3 (D65 white point). Rows sum to 1.0.
+pub const LINEAR_SRGB_TO_LINEAR_P3: [[f32; 3]; 3] = [
+    [0.822_462_1, 0.177_538_0, 0.000_000_0],
+    [0.033_194_1, 0.966_805_8, 0.000_000_0],
+    [0.017_082_7, 0.072_397_4, 0.910_519_9],
+];
+
+/// Linear Display P3 → Linear sRGB (D65 white point). Inverse of [`LINEAR_SRGB_TO_LINEAR_P3`].
+pub const LINEAR_P3_TO_LINEAR_SRGB: [[f32; 3]; 3] = [
+    [1.224_940_1, -0.224_940_2, 0.000_000_0],
+    [-0.042_056_9, 1.042_057_0, 0.000_000_0],
+    [-0.019_637_6, -0.078_636_1, 1.098_273_7],
+];
+
+/// Linear sRGB → Linear Display P3.
+#[inline]
+pub fn linear_srgb_to_linear_p3(c: [f32; 3]) -> [f32; 3] {
+    mat3_mul(&LINEAR_SRGB_TO_LINEAR_P3, c)
+}
+
+/// Linear Display P3 → Linear sRGB.
+#[inline]
+pub fn linear_p3_to_linear_srgb(c: [f32; 3]) -> [f32; 3] {
+    mat3_mul(&LINEAR_P3_TO_LINEAR_SRGB, c)
+}
+
+/// Display P3 transfer function: encoded → linear (same transfer curve as sRGB).
+#[inline]
+pub fn display_p3_to_linear(v: f32) -> f32 {
+    srgb_to_linear(v)
+}
+
+/// Display P3 transfer function: linear → encoded (same transfer curve as sRGB).
+#[inline]
+pub fn linear_to_display_p3(v: f32) -> f32 {
+    linear_to_srgb(v)
+}
+
+/// Encoded sRGB → Encoded Display P3 (zero double-gamma shift).
+#[inline]
+pub fn srgb_to_display_p3(rgb: [f32; 3]) -> [f32; 3] {
+    let lin = rgb.map(srgb_to_linear);
+    let p3_lin = linear_srgb_to_linear_p3(lin);
+    p3_lin.map(linear_to_srgb)
+}
+
+/// Encoded Display P3 → Encoded sRGB (zero double-gamma shift).
+#[inline]
+pub fn display_p3_to_srgb(p3: [f32; 3]) -> [f32; 3] {
+    let lin = p3.map(srgb_to_linear);
+    let srgb_lin = linear_p3_to_linear_srgb(lin);
+    srgb_lin.map(linear_to_srgb)
+}
+
 /// `m · v` for a row-major 3 × 3 matrix.
 #[inline]
 pub fn mat3_mul(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
