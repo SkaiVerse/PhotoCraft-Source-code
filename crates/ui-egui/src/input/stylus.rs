@@ -92,6 +92,8 @@ struct FeedState {
     predicted: Vec<(PenSample, egui::Pos2)>,
     /// Every sample set since the canvas last drained them, oldest first.
     queue: VecDeque<PenSample>,
+    /// Optional exact screen positions paired 1:1 with `queue`.
+    queue_pos: VecDeque<Option<egui::Pos2>>,
     /// Optional platform hardware timestamps (monotonic seconds) paired 1:1 with `queue`.
     queue_ts_s: VecDeque<Option<f64>>,
     /// Estimation metadata `(estimation_index, expecting_updates_mask)` paired 1:1 with `queue`.
@@ -120,8 +122,22 @@ impl StylusFeed {
     /// Push a stylus sample together with its real hardware timestamp (monotonic seconds) and
     /// iPadOS estimation metadata (`estimation_index`, `expecting_mask`).
     pub fn set_with_timestamp_est(&self, s: Option<PenSample>, timestamp_s: Option<f64>, estimation_index: u64, expecting_mask: u32) {
+        self.set_with_timestamp_est_pos(s, None, timestamp_s, estimation_index, expecting_mask);
+    }
+
+    /// Push a unified stylus packet containing sample, optional exact screen position,
+    /// hardware timestamp (monotonic seconds), and iPadOS estimation metadata.
+    pub fn set_with_timestamp_est_pos(
+        &self,
+        s: Option<PenSample>,
+        pos: Option<egui::Pos2>,
+        timestamp_s: Option<f64>,
+        estimation_index: u64,
+        expecting_mask: u32,
+    ) {
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let s = s.map(PenSample::sanitized);
+        let pos = pos.filter(|p| p.x.is_finite() && p.y.is_finite());
         let ts = timestamp_s.filter(|t| t.is_finite() && *t > 0.0);
         let est = if s.is_some() { (estimation_index, expecting_mask) } else { (0, 0) };
         g.latest = s;
@@ -130,10 +146,12 @@ impl StylusFeed {
         if let Some(s) = s {
             if g.queue.len() >= FEED_QUEUE {
                 g.queue.pop_front();
+                g.queue_pos.pop_front();
                 g.queue_ts_s.pop_front();
                 g.queue_est.pop_front();
             }
             g.queue.push_back(s);
+            g.queue_pos.push_back(pos);
             g.queue_ts_s.push_back(ts);
             g.queue_est.push_back(est);
         } else {
@@ -248,6 +266,7 @@ impl StylusFeed {
     /// The samples set since the last drain, oldest first.
     pub fn drain(&self) -> Vec<PenSample> {
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        g.queue_pos.clear();
         g.queue_ts_s.clear();
         g.queue_est.clear();
         g.queue.drain(..).collect()
@@ -257,6 +276,7 @@ impl StylusFeed {
     pub fn drain_into(&self, target: &mut Vec<PenSample>) {
         target.clear();
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        g.queue_pos.clear();
         g.queue_ts_s.clear();
         g.queue_est.clear();
         target.extend(g.queue.drain(..));
@@ -267,6 +287,7 @@ impl StylusFeed {
         target.clear();
         timestamps.clear();
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        g.queue_pos.clear();
         g.queue_est.clear();
         target.extend(g.queue.drain(..));
         timestamps.extend(g.queue_ts_s.drain(..));
@@ -283,7 +304,28 @@ impl StylusFeed {
         timestamps.clear();
         est.clear();
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        g.queue_pos.clear();
         target.extend(g.queue.drain(..));
+        timestamps.extend(g.queue_ts_s.drain(..));
+        est.extend(g.queue_est.drain(..));
+    }
+
+    /// Drains samples, optional exact screen positions, hardware timestamps, and estimation metadata
+    /// into caller buffers without reallocating.
+    pub fn drain_into_with_meta(
+        &self,
+        target: &mut Vec<PenSample>,
+        pos: &mut Vec<Option<egui::Pos2>>,
+        timestamps: &mut Vec<Option<f64>>,
+        est: &mut Vec<(u64, u32)>,
+    ) {
+        target.clear();
+        pos.clear();
+        timestamps.clear();
+        est.clear();
+        let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        target.extend(g.queue.drain(..));
+        pos.extend(g.queue_pos.drain(..));
         timestamps.extend(g.queue_ts_s.drain(..));
         est.extend(g.queue_est.drain(..));
     }
@@ -314,6 +356,8 @@ pub struct Stylus {
     lifted: bool,
     /// This frame's pen samples, oldest first (the feed's queue and the touch forces).
     frame: Vec<PenSample>,
+    /// Optional exact screen positions paired 1:1 with `frame`.
+    frame_pos: Vec<Option<egui::Pos2>>,
     /// Optional platform hardware timestamps (seconds) paired 1:1 with `frame`.
     frame_ts_s: Vec<Option<f64>>,
     /// Estimation metadata paired 1:1 with `frame`.
@@ -352,6 +396,8 @@ pub struct Stylus {
     pub(crate) clock_ms: f64,
     /// Current frame's ephemeral predicted touch trail (cleared on next frame advance).
     pub(crate) frame_predicted: Vec<(PenSample, egui::Pos2)>,
+    /// Predicted touch trail converted into doc-space `StrokePoint`s for `SplitStroke` preview.
+    pub(crate) frame_predicted_doc: Vec<photocraft_engine::paint::StrokePoint>,
     /// Asynchronous estimation refinement packets waiting to be applied to the live stroke.
     pub(crate) pending_updates: Vec<EstimateUpdate>,
 }
@@ -370,6 +416,7 @@ impl Default for Stylus {
             touch_pen: false,
             lifted: false,
             frame: Vec::new(),
+            frame_pos: Vec::new(),
             frame_ts_s: Vec::new(),
             frame_est: Vec::new(),
             prev: None,
@@ -388,6 +435,7 @@ impl Default for Stylus {
             times: Vec::new(),
             clock_ms: 0.0,
             frame_predicted: Vec::with_capacity(8),
+            frame_predicted_doc: Vec::with_capacity(8),
             pending_updates: Vec::with_capacity(16),
         }
     }
@@ -424,7 +472,7 @@ impl Stylus {
             self.prev_ts_s = self.frame_ts_s.last().copied().flatten();
             self.prev_est = self.frame_est.last().copied().unwrap_or((0, 0));
         }
-        self.feed.drain_into_with_timestamps_and_est(&mut self.frame, &mut self.frame_ts_s, &mut self.frame_est);
+        self.feed.drain_into_with_meta(&mut self.frame, &mut self.frame_pos, &mut self.frame_ts_s, &mut self.frame_est);
         self.current = None;
         self.current_ts_s = None;
         self.current_est = (0, 0);
@@ -459,6 +507,7 @@ impl Stylus {
                         if let Some(f) = force {
                             self.touch = Some(f);
                             self.frame.push(PenSample { pressure: f, ..Default::default() });
+                            self.frame_pos.push(None);
                             self.frame_ts_s.push(None);
                             self.frame_est.push((0, 0));
                         }
@@ -481,9 +530,11 @@ impl Stylus {
                 }
             }
             let new_frame = keep.iter().map(|&i| self.frame[i]).collect();
+            let new_pos = keep.iter().map(|&i| self.frame_pos.get(i).copied().flatten()).collect();
             let new_ts = keep.iter().map(|&i| self.frame_ts_s.get(i).copied().flatten()).collect();
             let new_est = keep.iter().map(|&i| self.frame_est.get(i).copied().unwrap_or((0, 0))).collect();
             self.frame = new_frame;
+            self.frame_pos = new_pos;
             self.frame_ts_s = new_ts;
             self.frame_est = new_est;
         }
@@ -574,6 +625,35 @@ impl Stylus {
             (_, Some(tb)) => Some(tb),
             _ => None,
         };
+    }
+
+    /// Return exact `(frame_index, screen_pos)` pairs when every sample queued this frame came with
+    /// an exact paired position (Apple Pencil coalesced unified packets), eliminating fractional
+    /// position-pressure resampling drift. If `press_origin` matches the first sample (consumed by
+    /// `ToolEvent::Down`), it is skipped from the move list so sample 0 isn't duplicated.
+    pub(crate) fn exact_frame_moves(&self, press_origin: Option<egui::Pos2>) -> Option<Vec<(usize, egui::Pos2)>> {
+        if !self.use_pressure || self.frame.is_empty() || self.frame.len() != self.frame_pos.len() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(self.frame.len());
+        for (i, pos_opt) in self.frame_pos.iter().enumerate() {
+            let pos = (*pos_opt)?;
+            if i == 0
+                && let Some(orig) = press_origin
+                && (pos - orig).length_sq() < 0.01
+            {
+                continue;
+            }
+            out.push((i, pos));
+        }
+        Some(out)
+    }
+
+    /// Select frame sample `idx` directly 1:1 without fractional interpolation.
+    pub(crate) fn select_exact(&mut self, idx: usize) {
+        self.current = self.frame.get(idx).copied().map(PenSample::sanitized);
+        self.current_ts_s = self.frame_ts_s.get(idx).copied().flatten();
+        self.current_est = self.frame_est.get(idx).copied().unwrap_or((0, 0));
     }
 
     /// Back to the current sample after a frame's moves.

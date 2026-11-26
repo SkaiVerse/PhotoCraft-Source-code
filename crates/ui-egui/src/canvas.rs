@@ -1289,12 +1289,17 @@ fn handle_canvas_tool_stroke(
         let d = xf.to_doc(p);
         // The press's own modifiers: a ⇧ that arrives with the click still connects the line.
         let press_mods = ui.input(|i| pointer_button_modifiers(&i.events, PointerButton::Primary)).unwrap_or(mods);
+        if app.stylus.exact_frame_moves(None).is_some() {
+            app.stylus.select_exact(0);
+            app.stylus.clock_ms = app.stylus.hardware_clock_ms().unwrap_or(now_ms);
+        }
         tool_input::tool_event_with_view(
             app,
             ToolEvent::Down { x: d[0], y: d[1], pressure: app.stylus.pressure() },
             press_mods,
             Some(tool_input::ToolViewContext::new(xf, Some(input.ctx.viewport_id()))),
         );
+        app.stylus.clear_selection();
         app.press_stroke = app.drag.is_some();
     }
     let press_stroke = app.press_stroke;
@@ -1345,41 +1350,92 @@ fn handle_canvas_tool_stroke(
         };
         let press_this_frame = events.iter().any(|e| matches!(e, egui::Event::PointerButton { button: b, pressed: true, .. } if *b == button));
         let down_at_start = !press_this_frame && (gesture_active_before || buttons.started);
-        let mut positions = if app.brush_resize.is_some() {
-            response.interact_pointer_pos().into_iter().collect()
-        } else if freehand_tool(tool) {
-            pointer_moves(&events, button, down_at_start)
-        } else if buttons.dragged {
-            response.interact_pointer_pos().into_iter().collect()
+        let press_origin = if press_this_frame {
+            ui.input(|i| i.pointer.press_origin()).filter(|p| rect.contains(*p))
         } else {
-            Vec::new()
+            None
         };
-        // A frame with no raw move still tracks a held gesture (a still pointer, a modifier
-        // change): fall back to the latest position, as the old code always did.
-        if positions.is_empty()
-            && (buttons.dragged || press_stroke_moving)
-            && let Some(p) = response.interact_pointer_pos().or(ui.input(|i| i.pointer.latest_pos()))
-        {
-            positions.push(p);
+        let exact_moves = if app.brush_resize.is_none() && freehand_tool(tool) {
+            app.stylus.exact_frame_moves(press_origin)
+        } else {
+            None
+        };
+        if let Some(exact) = exact_moves {
+            app.defer_live_stroke = true;
+            let base = app.stylus.last_point_ms().map_or(now_ms, |t| t.min(now_ms));
+            let n = exact.len();
+            for (k, (frame_idx, p)) in exact.into_iter().enumerate() {
+                app.stylus.select_exact(frame_idx);
+                app.stylus.clock_ms = app.stylus.hardware_clock_ms().unwrap_or_else(|| spread_ms(base, now_ms, k, n));
+                let d = xf.to_doc(p);
+                tool_input::tool_event_with_view(
+                    app,
+                    ToolEvent::Move { x: d[0], y: d[1], pressure: app.stylus.pressure() },
+                    mods,
+                    Some(tool_input::ToolViewContext::new(xf, Some(input.ctx.viewport_id()))),
+                );
+            }
+            app.stylus.clear_selection();
+            app.stylus.clock_ms = now_ms;
+            app.defer_live_stroke = false;
+        } else {
+            let mut positions = if app.brush_resize.is_some() {
+                response.interact_pointer_pos().into_iter().collect()
+            } else if freehand_tool(tool) {
+                pointer_moves(&events, button, down_at_start)
+            } else if buttons.dragged {
+                response.interact_pointer_pos().into_iter().collect()
+            } else {
+                Vec::new()
+            };
+            // A frame with no raw move still tracks a held gesture (a still pointer, a modifier
+            // change): fall back to the latest position, as the old code always did.
+            if positions.is_empty()
+                && (buttons.dragged || press_stroke_moving)
+                && let Some(p) = response.interact_pointer_pos().or(ui.input(|i| i.pointer.latest_pos()))
+            {
+                positions.push(p);
+            }
+            app.defer_live_stroke = true;
+            let base = app.stylus.last_point_ms().map_or(now_ms, |t| t.min(now_ms));
+            let n = positions.len();
+            for (k, p) in positions.into_iter().enumerate() {
+                // This move's share of the pen samples the frame brought (pressure, tilt, rotation, timestamp).
+                app.stylus.select(k, n);
+                app.stylus.clock_ms = app.stylus.hardware_clock_ms().unwrap_or_else(|| spread_ms(base, now_ms, k, n));
+                let d = xf.to_doc(p);
+                tool_input::tool_event_with_view(
+                    app,
+                    ToolEvent::Move { x: d[0], y: d[1], pressure: app.stylus.pressure() },
+                    mods,
+                    Some(tool_input::ToolViewContext::new(xf, Some(input.ctx.viewport_id()))),
+                );
+            }
+            app.stylus.clear_selection();
+            app.stylus.clock_ms = now_ms;
+            app.defer_live_stroke = false;
         }
-        app.defer_live_stroke = true;
-        let base = app.stylus.last_point_ms().map_or(now_ms, |t| t.min(now_ms));
-        let n = positions.len();
-        for (k, p) in positions.into_iter().enumerate() {
-            // This move's share of the pen samples the frame brought (pressure, tilt, rotation, timestamp).
-            app.stylus.select(k, n);
-            app.stylus.clock_ms = app.stylus.hardware_clock_ms().unwrap_or_else(|| spread_ms(base, now_ms, k, n));
-            let d = xf.to_doc(p);
-            tool_input::tool_event_with_view(
-                app,
-                ToolEvent::Move { x: d[0], y: d[1], pressure: app.stylus.pressure() },
-                mods,
-                Some(tool_input::ToolViewContext::new(xf, Some(input.ctx.viewport_id()))),
-            );
+        // Populate doc-space ephemeral predicted points for real-stamp rendering inside SplitStroke.
+        app.stylus.frame_predicted_doc.clear();
+        if !buttons.stopped && !app.stylus.frame_predicted.is_empty() {
+            let t_last = app.stylus.last_point_ms().unwrap_or(now_ms) - app.stylus.point_ms(0);
+            for (idx, &(pred_sample, pred_pos)) in app.stylus.frame_predicted.iter().enumerate() {
+                if !(pred_pos.x.is_finite() && pred_pos.y.is_finite()) {
+                    continue;
+                }
+                let d = xf.to_doc(pred_pos);
+                let mut sp = photocraft_engine::paint::StrokePoint::new(
+                    d[0],
+                    d[1],
+                    app.stylus.apply_pressure_curve(pred_sample.pressure),
+                );
+                sp.tilt_x = pred_sample.tilt_x;
+                sp.tilt_y = pred_sample.tilt_y;
+                sp.rotation = pred_sample.rotation;
+                sp.time = t_last + ((idx + 1) as f64) * 8.0;
+                app.stylus.frame_predicted_doc.push(sp);
+            }
         }
-        app.stylus.clear_selection();
-        app.stylus.clock_ms = now_ms;
-        app.defer_live_stroke = false;
         // One live-stroke update for the whole frame, not one per recovered sample.
         feed_live_stroke(app);
         // A held pen keeps the clock running for airbrush build-up and smoothing catch-up (asked

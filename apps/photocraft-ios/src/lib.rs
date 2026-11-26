@@ -554,6 +554,7 @@ struct Host {
     inbox: Inbox,
     feed: StylusFeed,
     pen_down: bool,
+    last_pen_pos: Option<(f32, f32)>,
     pressure_filter: photocraft_paint::PressureFilter,
     touch_recorder: photocraft_paint::TouchRecorder,
     wants_keyboard: bool,
@@ -745,6 +746,7 @@ impl Host {
             inbox,
             feed,
             pen_down: false,
+            last_pen_pos: None,
             pressure_filter: photocraft_paint::PressureFilter::new(),
             touch_recorder: photocraft_paint::TouchRecorder::new(),
             wants_keyboard: false,
@@ -1531,20 +1533,24 @@ pub unsafe extern "C" fn pc_pen_ex(
         h.set_modifiers(to_mods(mods));
         let pos = h.pt(x, y);
         let m = h.modifiers;
-        // Single calibration + lightweight EMA in the entire live stroke pipeline.
+        let ts_s = (timestamp.is_finite() && timestamp > 0.0).then_some(timestamp);
+        let dist_pt = match (phase, h.last_pen_pos) {
+            (1, Some((px, py))) => ((x - px).hypot(y - py)).max(0.0),
+            _ => 0.0,
+        };
+        // Single calibration + velocity/time-dilated EMA in the entire live stroke pipeline.
         let filtered_p = match phase {
             0 => {
                 if h.on_canvas(x, y) {
-                    h.pressure_filter.begin(pressure, h.pressure_divisor)
+                    h.pressure_filter.begin_at(pressure, h.pressure_divisor, ts_s)
                 } else {
                     let norm = (pressure / h.pressure_divisor.max(0.01)).clamp(photocraft_paint::PressureFilter::MIN_PRESSURE, 1.0);
                     photocraft_paint::calibrate_stylus_pressure(norm).clamp(photocraft_paint::PressureFilter::MIN_PRESSURE, 1.0)
                 }
             }
-            1 => h.pressure_filter.push_move(pressure, h.pressure_divisor),
+            1 => h.pressure_filter.push_move_timed(pressure, h.pressure_divisor, ts_s, dist_pt),
             _ => h.pressure_filter.end_liftoff(pressure, h.pressure_divisor),
         };
-        let ts_s = (timestamp.is_finite() && timestamp > 0.0).then_some(timestamp);
         let sample = PenSample {
             pressure: filtered_p,
             tilt_x,
@@ -1563,14 +1569,16 @@ pub unsafe extern "C" fn pc_pen_ex(
                 if h.on_canvas(x, y) {
                     h.gesture = None;
                     h.pen_down = true;
+                    h.last_pen_pos = Some((x, y));
                     h.fast_stroke_active = false;
                     h.cached_prims = None;
                     h.cached_screen = None;
-                    h.feed.set_with_timestamp_est(Some(sample), ts_s, estimation_index, expecting_mask);
+                    h.feed.set_with_timestamp_est_pos(Some(sample), Some(pos), ts_s, estimation_index, expecting_mask);
                     h.push(egui::Event::PointerMoved(pos));
                     h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
                     h.ctx.request_repaint();
                 } else {
+                    h.last_pen_pos = None;
                     h.fast_stroke_active = false;
                     h.cached_prims = None;
                     h.cached_screen = None;
@@ -1580,7 +1588,8 @@ pub unsafe extern "C" fn pc_pen_ex(
             }
             1 => {
                 if h.pen_down {
-                    h.feed.set_with_timestamp_est(Some(sample), ts_s, estimation_index, expecting_mask);
+                    h.last_pen_pos = Some((x, y));
+                    h.feed.set_with_timestamp_est_pos(Some(sample), Some(pos), ts_s, estimation_index, expecting_mask);
                     h.push(egui::Event::PointerMoved(pos));
                     h.ctx.request_repaint();
                 } else if h.gesture.is_some_and(|g| g.pen) {
@@ -1594,10 +1603,11 @@ pub unsafe extern "C" fn pc_pen_ex(
                 h.fast_stroke_active = false;
                 h.cached_prims = None;
                 h.cached_screen = None;
+                h.last_pen_pos = None;
                 if h.pen_down {
                     h.pen_down = false;
-                    // Final lift-off sample is immediately finalized (expecting_mask = 0).
-                    h.feed.set_with_timestamp_est(Some(sample), ts_s, estimation_index, 0);
+                    // Preserve `expecting_mask` even on lift-off so final updates still match cleanly.
+                    h.feed.set_with_timestamp_est_pos(Some(sample), Some(pos), ts_s, estimation_index, expecting_mask);
                     h.push(egui::Event::PointerMoved(pos));
                     h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
                     // The stroke's last samples keep their pressure; nothing is held after this.

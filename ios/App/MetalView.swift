@@ -1049,76 +1049,47 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             }
             let maxForce = c.maximumPossibleForce
             let rawNorm: Float = maxForce > 0 ? Float(min(1.0, max(0.0, c.force / maxForce))) : 0.5
-            let expectingUpdate = c.estimationUpdateIndex != nil && c.estimatedPropertiesExpectingUpdates.contains(.force)
-            let forceEstimated = c.estimatedProperties.contains(.force) || expectingUpdate
+            let expectingForce = c.estimationUpdateIndex != nil && c.estimatedPropertiesExpectingUpdates.contains(.force)
+            let forceEstimated = c.estimatedProperties.contains(.force) || expectingForce
             let estMask = estimationMask(for: c)
             let estIdx: UInt64 = (estMask != 0 && c.estimationUpdateIndex != nil) ? UInt64(c.estimationUpdateIndex!.int64Value) : 0
-            let bogusZero = rawNorm <= 1e-4
-            let isUnknown = forceEstimated || bogusZero
             recordDebugTouch(c, loc: loc, forceEstimated: forceEstimated, phase: UInt8(clamping: phase))
 
             var roll: CGFloat = 0
             if #available(iOS 17.5, *) { roll = c.rollAngle }
 
-            if !isUnknown {
-                let confirmed = max(0.0009765625, min(1.0, rawNorm))
-                lastConfirmedForce = confirmed
-                backfillPendingForce(confirmed)
-                penQueue.append(PenItem(
-                    phase: phase,
-                    location: loc,
-                    normForce: confirmed,
-                    isUnknownForce: false,
-                    altitude: c.altitudeAngle,
-                    azimuth: c.azimuthUnitVector(in: self),
-                    roll: roll,
-                    mods: mods,
-                    index: estMask != 0 ? c.estimationUpdateIndex : nil,
-                    estIndex: estIdx,
-                    expectingMask: phase >= 2 ? 0 : estMask,
-                    ready: true,
-                    time: CACurrentMediaTime(),
-                    stamp: c.timestamp))
-            } else if let confirmed = lastConfirmedForce {
-                // Mid-stroke or lift-off: forward last confirmed force immediately without queue delay.
-                penQueue.append(PenItem(
-                    phase: phase,
-                    location: loc,
-                    normForce: confirmed,
-                    isUnknownForce: false,
-                    altitude: c.altitudeAngle,
-                    azimuth: c.azimuthUnitVector(in: self),
-                    roll: roll,
-                    mods: mods,
-                    index: estMask != 0 ? c.estimationUpdateIndex : nil,
-                    estIndex: estIdx,
-                    expectingMask: phase >= 2 ? 0 : estMask,
-                    ready: true,
-                    time: CACurrentMediaTime(),
-                    stamp: c.timestamp))
+            // Pass real Apple Pencil estimated force directly with zero 16 ms touchdown stall so
+            // `SplitStroke` draws live immediately and refines in-place on update packets.
+            // Only replace bogus `<= 1e-4` touchdown/sensor zero placeholders.
+            let sampleForce: Float
+            if rawNorm > 1e-4 {
+                sampleForce = max(0.0009765625, min(1.0, rawNorm))
+                if !forceEstimated {
+                    lastConfirmedForce = sampleForce
+                }
             } else {
-                // Stroke start before first confirmed force: hold briefly (<= 16 ms) for force refinement.
-                penQueue.append(PenItem(
-                    phase: phase,
-                    location: loc,
-                    normForce: 0,
-                    isUnknownForce: true,
-                    altitude: c.altitudeAngle,
-                    azimuth: c.azimuthUnitVector(in: self),
-                    roll: roll,
-                    mods: mods,
-                    index: expectingUpdate ? c.estimationUpdateIndex : nil,
-                    estIndex: estIdx,
-                    expectingMask: phase >= 2 ? 0 : estMask,
-                    ready: false,
-                    time: CACurrentMediaTime(),
-                    stamp: c.timestamp))
+                sampleForce = lastConfirmedForce ?? 0.25
             }
+            penQueue.append(PenItem(
+                phase: phase,
+                location: loc,
+                normForce: sampleForce,
+                isUnknownForce: false,
+                altitude: c.altitudeAngle,
+                azimuth: c.azimuthUnitVector(in: self),
+                roll: roll,
+                mods: mods,
+                index: estMask != 0 ? c.estimationUpdateIndex : nil,
+                estIndex: estIdx,
+                expectingMask: estMask,
+                ready: true,
+                time: CACurrentMediaTime(),
+                stamp: c.timestamp))
         }
         if phase != 1 {
             lastQueuedLocation = nil
         }
-        flushPen(all: phase >= 2)
+        flushPen(all: true)
     }
 
     private func estimationMask(for touch: UITouch) -> UInt32 {
@@ -1138,9 +1109,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             let maxForce = t.maximumPossibleForce
             let rawNorm: Float = maxForce > 0 ? Float(min(1.0, max(0.0, t.force / maxForce))) : 0.5
             let expecting = t.estimatedPropertiesExpectingUpdates.contains(.force)
-            let stillEstimated = t.estimatedProperties.contains(.force) || expecting
-            let confirmedNow = !stillEstimated && rawNorm > 1e-4
-            recordDebugTouch(t, loc: t.preciseLocation(in: self), forceEstimated: stillEstimated, phase: 4)
+            let forceStillEstimated = t.estimatedProperties.contains(.force) || expecting
+            let confirmedNow = !t.estimatedProperties.contains(.force) && rawNorm > 1e-4
+            recordDebugTouch(t, loc: t.preciseLocation(in: self), forceEstimated: forceStillEstimated, phase: 4)
             let confirmedForce = max(0.0009765625, min(1.0, rawNorm))
             let remainingMask = estimationMask(for: t)
 
@@ -1271,20 +1242,11 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                     }
                 }
             }
-            fit.append(point)
-            if fit.count > 4 { fit.removeFirst() }
-            // With a new sample in hand, the curve between the two samples before it is final.
-            if fit.count >= 3 {
-                let n = fit.count
-                let p1 = fit[n - 3], p2 = fit[n - 2]
-                let p0 = n >= 4 ? fit[n - 4] : nil
-                emitSegment(p0, p1, p2, fit[n - 1], mods: item.mods)
-                emitPen(p2, phase: 1, mods: item.mods)
-            }
+            fit = [point]
+            emitPen(point, phase: 1, mods: item.mods)
         default:
-            // Lift-off: discard noisy micro-hooks (< 1.0 pt or sharp reversal over tiny span),
-            // clamp pressure monotonically, and gently taper off along the last valid exit tangent.
-            var hookDiscarded = false
+            // Lift-off: discard noisy micro-hooks (< 1.0 pt or sharp reversal over tiny span)
+            // and stream the final point directly 1:1 to Rust (`SplitStroke` + `PressureFilter`).
             if let prev = fit.last {
                 let dx = point.x - prev.x, dy = point.y - prev.y
                 let dist = (dx * dx + dy * dy).squareRoot()
@@ -1292,53 +1254,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 if dist < 1.0 || sharpReversal {
                     point.x = prev.x
                     point.y = prev.y
-                    hookDiscarded = true
-                } else {
-                    lastValidDir = (dx / dist, dy / dist)
                 }
             }
-            if hookDiscarded {
-                if fit.count >= 2 {
-                    let n = fit.count
-                    let p0 = n >= 3 ? fit[n - 3] : nil
-                    emitSegment(p0, fit[n - 2], fit[n - 1], nil, mods: item.mods)
-                    emitPen(fit[n - 1], phase: 1, mods: item.mods)
-                }
-            } else {
-                fit.append(point)
-                if fit.count > 4 { fit.removeFirst() }
-                let n = fit.count
-                if n >= 3 {
-                    let p0 = n >= 4 ? fit[n - 4] : nil
-                    emitSegment(p0, fit[n - 3], fit[n - 2], fit[n - 1], mods: item.mods)
-                    emitPen(fit[n - 2], phase: 1, mods: item.mods)
-                }
-                if n >= 2 {
-                    let p0 = n >= 3 ? fit[n - 3] : nil
-                    emitSegment(p0, fit[n - 2], fit[n - 1], nil, mods: item.mods)
-                }
-            }
-            // Smooth exit-tangent lift-off taper when the stroke moved enough to establish a tangent.
-            if let dir = lastValidDir, fit.count >= 2 {
-                let tailSpan = 4.0
-                for step in 1...2 {
-                    let frac = Double(step) / 2.0
-                    let decay: Float = step == 1 ? 0.55 : 0.15
-                    let tp = PenPoint(
-                        x: point.x + dir.0 * (tailSpan * frac),
-                        y: point.y + dir.1 * (tailSpan * frac),
-                        pressure: max(0.0009765625, point.pressure * decay),
-                        tiltX: point.tiltX,
-                        tiltY: point.tiltY,
-                        roll: point.roll,
-                        stamp: point.stamp + 0.002 * Double(step),
-                        estIndex: 0,
-                        expectingMask: 0)
-                    emitPen(tp, phase: step == 2 ? item.phase : 1, mods: item.mods)
-                }
-            } else {
-                emitPen(point, phase: item.phase, mods: item.mods)
-            }
+            emitPen(point, phase: item.phase, mods: item.mods)
             fit.removeAll()
             lastValidDir = nil
             lastConfirmedForce = nil
@@ -1348,81 +1266,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private func emitPen(_ p: PenPoint, phase: Int32, mods: UInt32) {
         guard let h = handle else { return }
         pc_pen_ex(h, Float(p.x), Float(p.y), phase, p.pressure, p.tiltX, p.tiltY, p.roll, mods, p.stamp, p.estIndex, p.expectingMask)
-    }
-
-    /// Extra points along a smooth (centripetal Catmull-Rom) curve from `p1` to `p2`, so a fast
-    /// stroke is drawn as a curve rather than as straight chords. `p0` and `p3` are the
-    /// neighbouring samples; a missing neighbour uses one-sided forward/backward tangents.
-    private func emitSegment(_ p0: PenPoint?, _ p1: PenPoint, _ p2: PenPoint, _ p3: PenPoint?, mods: UInt32) {
-        let dx = p2.x - p1.x, dy = p2.y - p1.y
-        let length = (dx * dx + dy * dy).squareRoot()
-        let zoom = handle != nil ? Double(pc_canvas_zoom(handle)) : 1.0
-        let canvasLength = length / max(zoom, 0.01)
-        if length < 1.0 || canvasLength < 0.5 { return }
-        let stepScreen = 2.0
-        let count = min(24, max(1, Int((length / stepScreen).rounded(.up)))) - 1
-        if count < 1 { return }
-
-        // Centripetal Catmull-Rom (alpha = 0.5: Euclidean distance to power 0.5)
-        func dist(_ u: PenPoint, _ v: PenPoint) -> Double {
-            max(((u.x - v.x) * (u.x - v.x) + (u.y - v.y) * (u.y - v.y)).squareRoot().squareRoot(), 0.7071)
-        }
-        let dt12 = dist(p1, p2)
-
-        // One-sided end tangents: when p0 is missing or too close to p1 (< 0.5 pt), tangent at p1 is strictly
-        // the forward difference (p2 - p1)/dt12; when p3 is missing or too close to p2 (< 0.5 pt), tangent at p2
-        // is strictly the backward difference (p2 - p1)/dt12. This eliminates division-by-zero tangent spikes
-        // and wild overshoots from duplicate or near-duplicate points.
-        let len01 = p0 != nil ? ((p0!.x - p1.x) * (p0!.x - p1.x) + (p0!.y - p1.y) * (p0!.y - p1.y)).squareRoot() : 0.0
-        let a = (p0 != nil && len01 >= 0.5) ? p0! : PenPoint(x: 2 * p1.x - p2.x, y: 2 * p1.y - p2.y, pressure: p1.pressure, tiltX: p1.tiltX, tiltY: p1.tiltY, roll: p1.roll, stamp: p1.stamp, estIndex: 0, expectingMask: 0)
-        let dt01 = (p0 != nil && len01 >= 0.5) ? dist(a, p1) : dt12
-
-        let len23 = p3 != nil ? ((p3!.x - p2.x) * (p3!.x - p2.x) + (p3!.y - p2.y) * (p3!.y - p2.y)).squareRoot() : 0.0
-        let d = (p3 != nil && len23 >= 0.5) ? p3! : PenPoint(x: 2 * p2.x - p1.x, y: 2 * p2.y - p1.y, pressure: p2.pressure, tiltX: p2.tiltX, tiltY: p2.tiltY, roll: p2.roll, stamp: p2.stamp, estIndex: 0, expectingMask: 0)
-        let dt23 = (p3 != nil && len23 >= 0.5) ? dist(p2, d) : dt12
-
-        let t0 = 0.0
-        let t1 = t0 + dt01
-        let t2 = t1 + dt12
-        let t3 = t2 + dt23
-
-        func mix(_ u: (Double, Double), _ v: (Double, Double), _ w: Double) -> (Double, Double) {
-            (u.0 * (1 - w) + v.0 * w, u.1 * (1 - w) + v.1 * w)
-        }
-        var rollDelta = p2.roll - p1.roll
-        if rollDelta > 180 { rollDelta -= 360 } else if rollDelta < -180 { rollDelta += 360 }
-
-        let chordMidX = (p1.x + p2.x) * 0.5
-        let chordMidY = (p1.y + p2.y) * 0.5
-        let maxDevSq = (length * 1.5 + 8.0) * (length * 1.5 + 8.0)
-
-        for i in 1...count {
-            let u = Double(i) / Double(count + 1)
-            let t = t1 + (t2 - t1) * u
-            let A1 = mix((a.x, a.y), (p1.x, p1.y), (t - t0) / (t1 - t0))
-            let A2 = mix((p1.x, p1.y), (p2.x, p2.y), (t - t1) / (t2 - t1))
-            let A3 = mix((p2.x, p2.y), (d.x, d.y), (t - t2) / (t3 - t2))
-            let B1 = mix(A1, A2, (t - t0) / (t2 - t0))
-            let B2 = mix(A2, A3, (t - t1) / (t3 - t1))
-            let C = mix(B1, B2, (t - t1) / (t2 - t1))
-            if !C.0.isFinite || !C.1.isFinite { continue }
-            let devX = C.0 - chordMidX
-            let devY = C.1 - chordMidY
-            if (devX * devX + devY * devY) > maxDevSq { continue }
-
-            let f = Float(u)
-            let midPressure = max(0.0009765625, min(1.0, p1.pressure + (p2.pressure - p1.pressure) * f))
-            let midStamp = p1.stamp + (p2.stamp - p1.stamp) * u
-            let mid = PenPoint(x: C.0, y: C.1,
-                               pressure: midPressure,
-                               tiltX: p1.tiltX + (p2.tiltX - p1.tiltX) * f,
-                               tiltY: p1.tiltY + (p2.tiltY - p1.tiltY) * f,
-                               roll: p1.roll + rollDelta * f,
-                               stamp: midStamp,
-                               estIndex: p2.estIndex,
-                               expectingMask: p2.expectingMask)
-            emitPen(mid, phase: 1, mods: mods)
-        }
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {

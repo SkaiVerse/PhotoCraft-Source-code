@@ -44,7 +44,8 @@ pub use brush::{
 pub use curve::ResponseCurve;
 pub use dynamics::{
     DynamicsLut, PressureFilter, SMOOTHING_FLOOR, apply_directional_damping, apply_magnetic_rotation, blend_wet_mix, calibrate_stylus_pressure,
-    effective_smoothing_amount, eval_height_map_grain, filter_circular_angle,
+    effective_smoothing_amount, eval_height_map_grain, eval_trig_spline, extrapolate_curvature_point, fast_sin, filter_circular_angle,
+    smooth_mirrored_window, trig_spline_weights,
 };
 pub use touch_stream::{RawTouchRecord, TouchForceResolver, TouchRecorder};
 pub use mip_cache::{mip_cache_bytes, purge_mip_cache};

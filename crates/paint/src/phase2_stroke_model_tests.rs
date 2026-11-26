@@ -371,17 +371,17 @@ fn test_global_concave_pressure_calibration_curve() {
     let p0 = calibrate_stylus_pressure(0.0);
     assert!((p0 - 0.0).abs() < 1e-5, "0.0 force should calibrate to 0.0, got {p0}");
 
-    // 0.10 -> concave lift (~0.3119)
-    let p1 = calibrate_stylus_pressure(0.10);
-    let expected = (0.10f32 / 0.70).powf(0.60);
-    assert!((p1 - expected).abs() < 1e-4, "0.10 force should produce concave lift ~0.3119, got {p1}");
-    assert!((p1 - 0.3119).abs() < 0.01, "0.10 force should be approximately 0.3119, got {p1}");
+    // 0.10 -> light concave lift (~0.24..0.30, never flat or muted)
+    let p10 = calibrate_stylus_pressure(0.10);
+    assert!(p10 > 0.20 && p10 < 0.35, "0.10 force should produce smooth concave light-stroke lift, got {p10}");
 
-    // 0.70 -> 1.0 (saturates at 0.70 hardware max)
+    // 0.70 -> leaves genuine upper headroom (< 0.99, > 0.85) instead of early clipping at 1.0
     let p70 = calibrate_stylus_pressure(0.70);
-    assert!((p70 - 1.0).abs() < 1e-5, "0.70 force should calibrate to exactly 1.0, got {p70}");
+    assert!(p70 > 0.85 && p70 < 0.99, "0.70 force should retain upper headroom instead of hard clipping, got {p70}");
 
-    // 1.00 -> 1.0 (saturation above 0.70)
+    // Monotonicity across the entire [0, 1] range and full output at 1.0
+    assert!(p10 < calibrate_stylus_pressure(0.40));
+    assert!(calibrate_stylus_pressure(0.40) < p70);
     let p100 = calibrate_stylus_pressure(1.0);
     assert!((p100 - 1.0).abs() < 1e-5, "1.00 force should calibrate to 1.0, got {p100}");
 }
@@ -883,6 +883,149 @@ fn split_stroke_updates_tail_in_place_without_duplicate_dabs() {
     for y in 0..80 {
         for x in 0..140 {
             assert_eq!(live_surf.rgba(x, y), expected_surf.rgba(x, y), "pixel mismatch at ({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn test_pressure_filter_timed_speed_softening() {
+    use crate::dynamics::PressureFilter;
+
+    // Slow shading stays near-instantaneous while fast flicks soften sudden stair-step spikes
+    // proportionally to speed and 60 Hz-normalized time dilation.
+    let mut slow = PressureFilter::new();
+    let p0_s = slow.begin_at(0.25, 1.0, Some(1.000));
+    let p1_s = slow.push_move_timed(0.85, 1.0, Some(1.016), 0.5);
+
+    let mut fast = PressureFilter::new();
+    let p0_f = fast.begin_at(0.25, 1.0, Some(1.000));
+    let p1_f = fast.push_move_timed(0.85, 1.0, Some(1.016), 24.0);
+
+    assert!((p0_s - p0_f).abs() < 1e-6);
+    assert!(p1_s > 0.85, "slow shading should respond immediately ({p1_s})");
+    assert!(p1_f > p0_f && p1_f < p1_s, "fast sweep softens stair-step spike smoothly ({p1_f} vs {p1_s})");
+}
+
+#[test]
+fn test_convex_trig_spline_zero_overshoot_and_extrapolation() {
+    use crate::dynamics::{eval_trig_spline, extrapolate_curvature_point, smooth_mirrored_window};
+
+    // Sharp 90-degree corner: [0,0] -> [100,0] -> [100,100] -> [200,100].
+    // Convex trig spline must never overshoot past y < 0 or x > 200 on the middle span.
+    let p0 = StrokePoint::new(0.0, 0.0, 0.4);
+    let p1 = StrokePoint::new(100.0, 0.0, 0.6);
+    let p2 = StrokePoint::new(100.0, 100.0, 0.8);
+    let p3 = StrokePoint::new(200.0, 100.0, 0.9);
+    let ctrl = [p0, p1, p2, p3];
+    for step in 0..=8 {
+        let u = step as f32 / 8.0;
+        let q = eval_trig_spline(&ctrl, u);
+        assert!(q.x >= 0.0 && q.x <= 200.0 && q.y >= 0.0 && q.y <= 100.0, "convex hull violated at u={u}: ({}, {})", q.x, q.y);
+    }
+
+    // Curvature extrapolation on a circular arc turns along the arc instead of shooting straight.
+    let a = StrokePoint::new(100.0, 0.0, 0.8);
+    let b = StrokePoint::new(70.710678, 70.710678, 0.6);
+    let c = StrokePoint::new(0.0, 100.0, 0.4);
+    let ext = extrapolate_curvature_point(Some(&a), &b, &c);
+    assert!(ext.x < c.x && ext.y < c.y + 40.0 && ext.pressure <= c.pressure, "expected inward curved taper, got {ext:?}");
+
+    // Mirrored-window smoothing keeps endpoints anchored and smooths interior zig-zag without phase lag.
+    let noisy = vec![
+        StrokePoint::new(0.0, 50.0, 0.5),
+        StrokePoint::new(25.0, 62.0, 0.5),
+        StrokePoint::new(50.0, 38.0, 0.5),
+        StrokePoint::new(75.0, 60.0, 0.5),
+        StrokePoint::new(100.0, 50.0, 0.5),
+    ];
+    let mut smoothed = Vec::new();
+    smooth_mirrored_window(&noisy, &[], 0.8, 0.4, &mut smoothed);
+    assert_eq!(smoothed.len(), noisy.len());
+    assert!((smoothed[0].y - 50.0).abs() < 1e-6);
+    assert!((smoothed[4].y - 50.0).abs() < 1e-6);
+    assert!((smoothed[2].y - 50.0).abs() < (noisy[2].y - 50.0).abs());
+}
+
+#[test]
+fn test_dynamic_secant_spacing_smooth_transition() {
+    use crate::dynamics::{DabBuilder, PathWalker};
+
+    // Pressure drops rapidly across one 60 px segment (diameter 30 -> 3): secant+bisection
+    // dynamic spacing keeps consecutive dab spacing proportional so no detached bead forms.
+    let brush = BrushSettings { size: 30.0, spacing: 0.25, pressure_size: true, ..Default::default() };
+    let db = DabBuilder::new(&brush);
+    let mut walker = PathWalker::new(None);
+    let mut centers = Vec::new();
+    let p0 = StrokePoint::new(0.0, 20.0, 1.0);
+    let p1 = StrokePoint::new(60.0, 20.0, 0.1);
+    walker.push(p0, &|q| db.step_len(q), &mut |s| centers.push((s.point.x, s.point.pressure)));
+    walker.push(p1, &|q| db.step_len(q), &mut |s| centers.push((s.point.x, s.point.pressure)));
+    assert!(centers.len() >= 8, "expected dense dynamically-spaced steps as size shrinks, got {}", centers.len());
+    for w in centers.windows(2) {
+        let gap = w[1].0 - w[0].0;
+        let max_expected_step = 30.0 * 0.25 + 1.0;
+        assert!(gap > 0.2 && gap <= max_expected_step, "gap {gap} out of continuous bounds between {w:?}");
+    }
+}
+
+#[test]
+fn split_stroke_predicted_real_stamps_never_leak_into_finish() {
+    use crate::render::{EST_FORCE, SplitStroke, TailPoint, render_stroke};
+    use photocraft_color::PixelFormat;
+    use photocraft_geom::Rect;
+    use photocraft_raster::Surface;
+
+    let fmt = PixelFormat::RGBA8;
+    let brush = BrushSettings {
+        size: 18.0,
+        spacing: 0.25,
+        hardness: 1.0,
+        pressure_size: true,
+        smoothing: Smoothing { enabled: true, amount: 0.1, catch_up_on_end: true, ..Default::default() },
+        color: [0.0, 0.0, 0.0, 1.0],
+        ..Default::default()
+    };
+    let mut split = SplitStroke::new(&brush, Some(fmt), 1.0);
+    let pts = vec![
+        TailPoint::finalized(StrokePoint { time: 0.0, ..StrokePoint::new(20.0, 40.0, 0.6) }),
+        TailPoint::new(StrokePoint { time: 8.0, ..StrokePoint::new(40.0, 40.0, 0.7) }, 1, 0),
+        TailPoint::new(StrokePoint { time: 16.0, ..StrokePoint::new(60.0, 40.0, 0.0) }, 2, EST_FORCE),
+        TailPoint::new(StrokePoint { time: 24.0, ..StrokePoint::new(80.0, 40.0, 0.5) }, 3, 0),
+    ];
+    split.push_tagged(&pts);
+
+    // Stage ephemeral predicted stamps far to the right (x = 130..160).
+    let pred = vec![
+        StrokePoint { time: 32.0, ..StrokePoint::new(130.0, 40.0, 0.8) },
+        StrokePoint { time: 40.0, ..StrokePoint::new(155.0, 40.0, 0.6) },
+    ];
+    split.set_predicted(&pred);
+
+    let pre = Surface::new(fmt);
+    let mut live_surf = pre.clone();
+    let (_, tail_rect) = split.composite_live(Rect::EMPTY, &pre, &mut live_surf, None, false);
+    assert!(!tail_rect.is_empty());
+    // Real brush coverage appears in the predicted span during live composite.
+    assert!(live_surf.rgba(145, 40)[3] > 0.01, "expected predicted brush stamp pixel at x=145");
+
+    // On finish(), predicted stamps clear completely, and unfinalized zero #2 backfills cleanly (~0.6).
+    split.finish();
+    live_surf.write_region(Rect::new(0, 0, 180, 80), &pre.read_region(Rect::new(0, 0, 180, 80)));
+    split.finalized_mut().mark_dirty(Rect::new(0, 0, 180, 80));
+    split.composite(&pre, &mut live_surf, None, false, true);
+    assert_eq!(live_surf.rgba(145, 40)[3], 0.0, "predicted brush stamps must never leak after finish()");
+
+    let expected_pts = vec![
+        StrokePoint { time: 0.0, ..StrokePoint::new(20.0, 40.0, 0.6) },
+        StrokePoint { time: 8.0, ..StrokePoint::new(40.0, 40.0, 0.7) },
+        StrokePoint { time: 16.0, ..StrokePoint::new(60.0, 40.0, 0.6) },
+        StrokePoint { time: 24.0, ..StrokePoint::new(80.0, 40.0, 0.5) },
+    ];
+    let mut expected_surf = pre.clone();
+    render_stroke(&mut expected_surf, &brush, &expected_pts, None, false, 1.0);
+    for y in 0..80 {
+        for x in 0..180 {
+            assert_eq!(live_surf.rgba(x, y), expected_surf.rgba(x, y), "backfill pixel mismatch at ({x}, {y})");
         }
     }
 }

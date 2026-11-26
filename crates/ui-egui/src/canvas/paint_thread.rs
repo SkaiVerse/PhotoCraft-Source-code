@@ -27,6 +27,8 @@ pub(super) struct Shown {
     pub(super) wants_time: bool,
     /// The Brush's smoothing string (`photocraft_engine::brush_cmds::LiveStroke::smoothing_string`).
     pub(super) smoothing_string: Option<([f64; 2], [f64; 2])>,
+    /// True when the stroke is an `EngineStroke::Brush` that renders real brush stamps for predicted points.
+    pub(super) has_brush_predicted: bool,
 }
 
 impl Shown {
@@ -35,7 +37,12 @@ impl Shown {
             EngineStroke::Brush(l) => l.smoothing_string(),
             _ => None,
         };
-        Self { doc: stroke.doc().clone(), wants_time: stroke.wants_time(), smoothing_string }
+        Self {
+            doc: stroke.doc().clone(),
+            wants_time: stroke.wants_time(),
+            smoothing_string,
+            has_brush_predicted: stroke.is_brush(),
+        }
     }
 }
 
@@ -46,6 +53,8 @@ struct State {
     pending_tagged: Vec<(StrokePoint, u64, u32)>,
     /// Asynchronous estimation updates for in-flight tail points.
     pending_updates: Vec<crate::stylus::EstimateUpdate>,
+    /// Transient predicted points for zero-latency brush-stamp preview (`Some(vec)` replaces/clears).
+    pending_predicted: Option<Vec<StrokePoint>>,
     /// The stroke, while nothing is painting with it.
     stroke: Option<EngineStroke>,
     /// Steps painted since the canvas last took them, and what the last one shows.
@@ -66,7 +75,11 @@ struct State {
 
 impl State {
     fn idle(&self) -> bool {
-        self.stroke.is_some() && self.pending.is_empty() && self.pending_tagged.is_empty() && self.pending_updates.is_empty()
+        self.stroke.is_some()
+            && self.pending.is_empty()
+            && self.pending_tagged.is_empty()
+            && self.pending_updates.is_empty()
+            && self.pending_predicted.is_none()
     }
 }
 
@@ -82,9 +95,9 @@ impl Shared {
 
     /// Paint the pending points and estimation updates, if the stroke is free.
     fn paint_pending(&self) {
-        let (updates, tagged, pts, stroke) = {
+        let (updates, tagged, pts, predicted, stroke) = {
             let mut st = self.lock();
-            if st.pending.is_empty() && st.pending_tagged.is_empty() && st.pending_updates.is_empty() {
+            if st.pending.is_empty() && st.pending_tagged.is_empty() && st.pending_updates.is_empty() && st.pending_predicted.is_none() {
                 return;
             }
             let Some(stroke) = st.stroke.take() else { return };
@@ -92,6 +105,7 @@ impl Shared {
                 std::mem::take(&mut st.pending_updates),
                 std::mem::take(&mut st.pending_tagged),
                 std::mem::take(&mut st.pending),
+                st.pending_predicted.take(),
                 stroke,
             )
         };
@@ -132,6 +146,18 @@ impl Shared {
                 Err(e) => step = Err(e),
             }
         }
+        if step.is_ok()
+            && let Some(pred) = predicted
+        {
+            match stroke.set_predicted(&pred) {
+                Ok(r) => {
+                    if let Ok(acc) = step.as_mut() {
+                        *acc = acc.union(&r);
+                    }
+                }
+                Err(e) => step = Err(e),
+            }
+        }
         let mut st = self.lock();
         if step.is_ok() {
             st.shown = Shown::of(&stroke);
@@ -163,7 +189,12 @@ impl Shared {
         loop {
             {
                 let mut st = self.lock();
-                while st.pending.is_empty() && st.pending_tagged.is_empty() && st.pending_updates.is_empty() && !st.closed {
+                while st.pending.is_empty()
+                    && st.pending_tagged.is_empty()
+                    && st.pending_updates.is_empty()
+                    && st.pending_predicted.is_none()
+                    && !st.closed
+                {
                     st = self.changed.wait(st).unwrap_or_else(PoisonError::into_inner);
                 }
                 if st.closed {
@@ -190,6 +221,7 @@ impl PaintThread {
             pending: Vec::new(),
             pending_tagged: Vec::new(),
             pending_updates: Vec::new(),
+            pending_predicted: None,
             stroke: Some(stroke),
             steps: Vec::new(),
             shown: shown.clone(),
@@ -261,6 +293,22 @@ impl PaintThread {
                 return;
             }
             st.pending_updates.extend_from_slice(updates);
+        }
+        if self.thread.is_some() {
+            self.shared.changed.notify_all();
+        } else {
+            self.shared.paint_pending();
+        }
+    }
+
+    /// Update ephemeral predicted-touch points for zero-latency brush-stamp preview.
+    pub(super) fn set_predicted(&mut self, pts: Vec<StrokePoint>) {
+        {
+            let mut st = self.shared.lock();
+            if st.failed {
+                return;
+            }
+            st.pending_predicted = Some(pts);
         }
         if self.thread.is_some() {
             self.shared.changed.notify_all();

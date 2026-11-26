@@ -1766,12 +1766,17 @@ impl TailPoint {
 pub struct SplitStroke {
     finalized: StrokeRenderer,
     tail: VecDeque<TailPoint>,
+    last_finalized_pressure: Option<f32>,
+    predicted: Vec<StrokePoint>,
     tail_dabs: Vec<Dab>,
     tail_duals: Vec<Dab>,
     tail_keys: HashSet<u64>,
     tail_renderer: StrokeRenderer,
     tile_pool: Vec<CovTile>,
     baked_batch: Vec<StrokePoint>,
+    tail_pts_scratch: Vec<StrokePoint>,
+    smoothed_scratch: Vec<StrokePoint>,
+    subdiv_scratch: Vec<StrokePoint>,
     region_scratch: Vec<f32>,
 }
 
@@ -1780,12 +1785,17 @@ impl SplitStroke {
         Self {
             finalized: StrokeRenderer::new(brush, fmt, zoom),
             tail: VecDeque::with_capacity(32),
+            last_finalized_pressure: None,
+            predicted: Vec::with_capacity(16),
             tail_dabs: Vec::with_capacity(64),
             tail_duals: Vec::with_capacity(64),
             tail_keys: HashSet::with_capacity(64),
             tail_renderer: StrokeRenderer::new(brush, fmt, zoom),
             tile_pool: Vec::with_capacity(32),
             baked_batch: Vec::with_capacity(16),
+            tail_pts_scratch: Vec::with_capacity(48),
+            smoothed_scratch: Vec::with_capacity(48),
+            subdiv_scratch: Vec::with_capacity(192),
             region_scratch: Vec::new(),
         }
     }
@@ -1881,6 +1891,9 @@ impl SplitStroke {
         while let Some(front) = self.tail.front() {
             if front.expecting_updates == 0 || self.tail.len() > MAX_UNFINALIZED_TAIL {
                 if let Some(popped) = self.tail.pop_front() {
+                    if (popped.expecting_updates & EST_FORCE) == 0 || popped.point.pressure > 1e-4 {
+                        self.last_finalized_pressure = Some(popped.point.pressure);
+                    }
                     self.baked_batch.push(popped.point);
                 }
             } else {
@@ -1942,9 +1955,63 @@ impl SplitStroke {
         out
     }
 
+    /// Set ephemeral predicted-touch points for zero-latency brush-stamp preview.
+    /// These are rendered only in the editable tail buffer and never committed or leaked into `finalized`.
+    pub fn set_predicted(&mut self, pts: &[StrokePoint]) {
+        self.predicted.clear();
+        for p in pts.iter().take(16) {
+            if p.x.is_finite() && p.y.is_finite() {
+                self.predicted.push(StrokePoint {
+                    pressure: if p.pressure.is_finite() { p.pressure.clamp(0.0, 1.0) } else { 0.5 },
+                    ..*p
+                });
+            }
+        }
+    }
+
+    /// Clear transient predicted-touch points without mutating `finalized` or committed `tail`.
+    pub fn clear_predicted(&mut self) {
+        self.predicted.clear();
+    }
+
+    /// Number of currently staged transient predicted points.
+    pub fn predicted_len(&self) -> usize {
+        self.predicted.len()
+    }
+
     /// Flush every remaining unfinalized tail sample into the wet buffer and finish the stroke.
     pub fn finish(&mut self) {
+        self.predicted.clear();
         if !self.tail.is_empty() {
+            // Smoothly linear-backfill any still-unfinalized zero placeholder pressures on lift-off
+            // so dropped updates never stamp a zero bead inside the committed stroke tail.
+            let n = self.tail.len();
+            let mut last_valid_pressure = self.last_finalized_pressure;
+            let mut i = 0;
+            while i < n {
+                let is_missing_force = (self.tail[i].expecting_updates & EST_FORCE) != 0 && self.tail[i].point.pressure <= 1e-4;
+                if !is_missing_force {
+                    last_valid_pressure = Some(self.tail[i].point.pressure);
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < n && (self.tail[i].expecting_updates & EST_FORCE) != 0 && self.tail[i].point.pressure <= 1e-4 {
+                    i += 1;
+                }
+                let next_valid_pressure = (i < n).then(|| self.tail[i].point.pressure);
+                let span = (i - start + 1) as f32;
+                for j in start..i {
+                    let t = (j - start + 1) as f32 / span;
+                    let fill = match (last_valid_pressure, next_valid_pressure) {
+                        (Some(a), Some(b)) => a + (b - a) * t,
+                        (Some(a), None) => a,
+                        (None, Some(b)) => b,
+                        (None, None) => 0.0,
+                    };
+                    self.tail[j].point.pressure = fill.clamp(0.0, 1.0);
+                }
+            }
             self.baked_batch.clear();
             while let Some(t) = self.tail.pop_front() {
                 self.baked_batch.push(t.point);
@@ -1971,13 +2038,72 @@ impl SplitStroke {
         self.tail_renderer.cov.bounds = Rect::EMPTY;
     }
 
+    fn prepare_live_tail_points(&mut self) {
+        self.tail_pts_scratch.clear();
+        for t in &self.tail {
+            self.tail_pts_scratch.push(t.point);
+        }
+        let brush = &self.finalized.ctx.brush;
+        if !brush.aliased && brush.smoothing.enabled && (self.tail_pts_scratch.len() + self.predicted.len()) >= 3 {
+            let amount = crate::dynamics::effective_smoothing_amount(&brush.smoothing).clamp(0.0, 1.0);
+            crate::dynamics::smooth_mirrored_window(&self.tail_pts_scratch, &self.predicted, amount, amount * 0.5, &mut self.smoothed_scratch);
+        } else {
+            self.smoothed_scratch.clear();
+            self.smoothed_scratch.extend_from_slice(&self.tail_pts_scratch);
+            self.smoothed_scratch.extend_from_slice(&self.predicted);
+        }
+        self.subdiv_scratch.clear();
+        let m = self.smoothed_scratch.len();
+        if !brush.aliased && m >= 3 {
+            let reflect = |a: StrokePoint, b: StrokePoint| StrokePoint {
+                x: 2.0 * a.x - b.x,
+                y: 2.0 * a.y - b.y,
+                pressure: (2.0 * a.pressure - b.pressure).clamp(0.0, 1.0),
+                tilt_x: (2.0 * a.tilt_x - b.tilt_x).clamp(-90.0, 90.0),
+                tilt_y: (2.0 * a.tilt_y - b.tilt_y).clamp(-90.0, 90.0),
+                rotation: a.rotation,
+                wheel: a.wheel,
+                time: a.time,
+            };
+            let lead = reflect(self.smoothed_scratch[0], self.smoothed_scratch[1]);
+            let trail = reflect(self.smoothed_scratch[m - 1], self.smoothed_scratch[m - 2]);
+            self.subdiv_scratch.push(self.smoothed_scratch[0]);
+            for i in 0..(m - 1) {
+                let p0 = if i == 0 { lead } else { self.smoothed_scratch[i - 1] };
+                let p1 = self.smoothed_scratch[i];
+                let p2 = self.smoothed_scratch[i + 1];
+                let p3 = if i + 2 < m { self.smoothed_scratch[i + 2] } else { trail };
+                let dx1 = p2.x - p1.x;
+                let dy1 = p2.y - p1.y;
+                let dx0 = p1.x - p0.x;
+                let dy0 = p1.y - p0.y;
+                let dx2 = p3.x - p2.x;
+                let dy2 = p3.y - p2.y;
+                let curved = (dx0 * dy1 - dy0 * dx1).abs() + (dx1 * dy2 - dy1 * dx2).abs() > 0.05;
+                if curved {
+                    let ctrl = [p0, p1, p2, p3];
+                    for s in 1..4 {
+                        let u = s as f32 * 0.25;
+                        self.subdiv_scratch.push(crate::dynamics::eval_trig_spline(&ctrl, u));
+                    }
+                }
+                self.subdiv_scratch.push(p2);
+            }
+        } else {
+            self.subdiv_scratch.extend_from_slice(&self.smoothed_scratch);
+        }
+    }
+
     fn populate_tail_renderer(&mut self) -> bool {
         self.recycle_tail_tiles();
         let mut generator = self.finalized.generator.clone();
         self.tail_dabs.clear();
         self.tail_duals.clear();
-        for t in &self.tail {
-            generator.push(&[t.point], &mut self.tail_dabs, &mut self.tail_duals);
+        if !self.tail.is_empty() || !self.predicted.is_empty() {
+            self.prepare_live_tail_points();
+            for p in &self.subdiv_scratch {
+                generator.push(&[*p], &mut self.tail_dabs, &mut self.tail_duals);
+            }
         }
         generator.finish(&mut self.tail_dabs, &mut self.tail_duals);
         if self.tail_dabs.is_empty() && self.tail_duals.is_empty() {

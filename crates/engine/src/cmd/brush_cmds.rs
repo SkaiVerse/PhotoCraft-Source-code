@@ -819,6 +819,25 @@ impl LiveStroke {
         Ok(dmg)
     }
 
+    /// Update ephemeral predicted-touch points for zero-latency brush-stamp preview without
+    /// modifying committed `points`, `finalized` tiles, or undo history.
+    pub fn set_predicted(&mut self, pts: &[StrokePoint]) -> Result<Rect> {
+        check_coords(pts, &self.cmd)?;
+        if pts.is_empty() && self.renderer.predicted_len() == 0 {
+            return Ok(Rect::EMPTY);
+        }
+        let cmyk = self.cmyk.clone();
+        let dmg = photocraft_color::convert::with_cmyk_space(cmyk.as_ref(), || -> Result<Rect> {
+            self.renderer.set_predicted(pts);
+            self.composite_current()
+        })?;
+        if let Some(table) = crate::mode_cmds::paint_color_table(&self.doc, &self.params) {
+            let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
+            crate::mode_cmds::keep_in_color_table(&table, &self.pre, surf, dmg);
+        }
+        Ok(dmg)
+    }
+
     fn composite_current(&mut self) -> Result<Rect> {
         let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
         if self.mirror_distinct.iter().any(|d| *d) {

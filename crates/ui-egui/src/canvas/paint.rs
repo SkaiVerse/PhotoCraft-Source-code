@@ -608,9 +608,10 @@ pub(super) fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter
             if let Some(s) = app.live_stroke.as_ref().and_then(|l| l.smoothing_string()) {
                 draw_smoothing_string(painter, xf, s);
             }
-            // Transient iPadOS predicted-touch preview: drawn cleanly above the unfinalized tail
-            // for this frame only, never entering committed stroke points or undo history.
-            if !app.stylus.frame_predicted.is_empty() {
+            // Brush/Pencil/Eraser strokes render predicted touches directly via SplitStroke's real
+            // brush rasterizer in `tail_renderer`. Keep circle fallback only for tools without SplitStroke.
+            let brush_predicted = app.live_stroke.as_ref().is_some_and(|l| l.paint.shown().has_brush_predicted);
+            if !brush_predicted && !app.stylus.frame_predicted.is_empty() {
                 let brush = &app.session.tools.brush;
                 let base_color = if brush.erase || d.erase {
                     Color32::from_rgba_unmultiplied(245, 245, 245, 110)

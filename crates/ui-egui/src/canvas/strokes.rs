@@ -260,6 +260,19 @@ impl EngineStroke {
             }
         }
     }
+    /// True when the engine stroke is a brush/pencil/eraser live stroke that supports
+    /// ephemeral predicted brush-stamp rendering inside `SplitStroke::tail_renderer`.
+    pub(super) fn is_brush(&self) -> bool {
+        matches!(self, Self::Brush(_))
+    }
+
+    pub(super) fn set_predicted(&mut self, pts: &[photocraft_engine::paint::StrokePoint]) -> photocraft_engine::Result<DRect> {
+        match self {
+            Self::Brush(s) => s.set_predicted(pts),
+            Self::Retouch(_) | Self::Dab(_) | Self::Mixer(_) => Ok(DRect::EMPTY),
+        }
+    }
+
     pub(super) fn update_estimate(&mut self, u: &crate::stylus::EstimateUpdate) -> photocraft_engine::Result<DRect> {
         match self {
             Self::Brush(s) => s.update_estimate(u.estimation_index, u.pressure, u.tilt_x, u.tilt_y, u.rotation, u.remaining_expected),
@@ -299,6 +312,8 @@ pub(crate) struct LiveStroke {
     pub(super) damage: Vec<DRect>,
     /// Drag points rendered so far.
     fed: usize,
+    /// True when transient predicted points were last forwarded to `SplitStroke`.
+    had_predicted: bool,
 }
 
 impl LiveStroke {
@@ -504,6 +519,7 @@ pub(super) fn begin_live_stroke(app: &PhotocraftApp) -> Option<LiveStroke> {
         key: (1 << 44) | (n << 20),
         damage,
         fed: if d.tool == Tool::MixerBrush { 1 } else { d.points.len() },
+        had_predicted: false,
         preview_failed: false,
     })
 }
@@ -597,6 +613,17 @@ pub(super) fn feed_live_stroke_waiting(app: &mut PhotocraftApp, wait: std::time:
         app.stylus.pending_updates.clear();
     }
     l.paint.push_tagged(pts);
+    if l.paint.shown().has_brush_predicted {
+        if !app.stylus.frame_predicted_doc.is_empty() {
+            l.paint.set_predicted(std::mem::take(&mut app.stylus.frame_predicted_doc));
+            l.had_predicted = true;
+        } else if l.had_predicted {
+            l.paint.set_predicted(Vec::new());
+            l.had_predicted = false;
+        }
+    } else {
+        app.stylus.frame_predicted_doc.clear();
+    }
     let steps = l.paint.catch_up(wait);
     let tool = d.tool;
     take_steps(app, tool, steps);

@@ -564,3 +564,46 @@ fn live_tail_estimate_update_patches_point_and_predicted_never_leaks_on_commit()
     assert!((commit.points()[0].pressure - 0.88).abs() < 1e-6);
     assert_eq!(commit.points().len(), 2);
 }
+
+#[test]
+fn unified_stylus_packets_preserve_1to1_positions_and_brush_predicted_isolation() {
+    use photocraft_engine::paint::StrokePoint;
+    use photocraft_paint::EST_FORCE;
+
+    let mut s = Stylus::default();
+    s.clock_ms = 50.0;
+    s.feed.set_with_timestamp_est_pos(Some(pen(0.20)), Some(egui::pos2(10.0, 20.0)), Some(10.000), 1, EST_FORCE);
+    s.feed.set_with_timestamp_est_pos(Some(pen(0.55)), Some(egui::pos2(24.0, 22.0)), Some(10.004), 2, EST_FORCE);
+    s.feed.set_with_timestamp_est_pos(Some(pen(0.80)), Some(egui::pos2(42.0, 28.0)), Some(10.008), 3, 0);
+    s.update(&[]);
+
+    // Press origin consumed sample 0 -> exact_frame_moves yields samples 1 and 2 1:1.
+    let exact = s.exact_frame_moves(Some(egui::pos2(10.0, 20.0))).expect("all packets carried positions");
+    assert_eq!(exact, vec![(1, egui::pos2(24.0, 22.0)), (2, egui::pos2(42.0, 28.0))]);
+
+    s.select_exact(0);
+    s.begin_stroke();
+    assert!((s.sample().unwrap().pressure - 0.20).abs() < 1e-6);
+    s.select_exact(1);
+    assert!((s.sample().unwrap().pressure - 0.55).abs() < 1e-6);
+    s.select_exact(2);
+    assert!((s.sample().unwrap().pressure - 0.80).abs() < 1e-6);
+
+    // LiveStroke::set_predicted renders real brush stamps without mutating LiveCommit::points().
+    let mut session = photocraft_engine::Session::new();
+    session.execute("file.new", serde_json::json!({"width": 160, "height": 160, "background": "white"})).unwrap();
+    let p = serde_json::json!({"points": [[20.0, 40.0, 0.5]], "brush": {"size": 16, "pressureSize": true, "smoothing": {"enabled": false}}});
+    let mut live = photocraft_engine::brush_cmds::LiveStroke::begin_with_tagged(&session, "paint.stroke", &p, &[(0, 0)]).unwrap();
+    live.push_tagged(&[(StrokePoint::new(40.0, 40.0, 0.7), 2, EST_FORCE)]).unwrap();
+    let before_pred = live.bounds();
+    assert!(before_pred.x1 <= 52, "tail before predicted should stay near x=40, got {:?}", before_pred);
+    live.set_predicted(&[StrokePoint::new(120.0, 40.0, 0.9)]).unwrap();
+    let after_pred = live.bounds();
+    assert!(after_pred.x1 >= 120, "predicted brush stamp should extend bounds >= 120, got {:?}", after_pred);
+    let layer_id = live.doc.layers[0].id;
+    let live_px = live.doc.layer(layer_id).unwrap().surface().unwrap().rgba(120, 40);
+    assert!(live_px[0] < 0.99 || live_px[3] > 0.0, "expected real painted pixel at predicted coordinate, got {live_px:?}");
+    let commit = live.into_commit().unwrap();
+    assert_eq!(commit.points().len(), 2);
+    assert!(commit.points().iter().all(|pt| pt.x <= 40.0));
+}

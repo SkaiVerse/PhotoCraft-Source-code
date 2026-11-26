@@ -96,29 +96,41 @@ fn pose_differs(brush: &StrokePoint, p: &StrokePoint, eps: f32) -> bool {
         || (p.wheel - brush.wheel).abs() > eps
 }
 
-/// Global Apple Pencil concave pressure calibration curve:
-/// Saturates full output (1.0) at 0.70 of hardware max force (clamp(p / 0.70, 0.0, 1.0))
-/// and applies a concave gamma lift (pow(p_scaled, 0.60)) so light sketching registers
-/// effortlessly while retaining full dynamic range.
+/// Global Apple Pencil concave pressure calibration curve (Natural Cubic Fritsch–Carlson spline)
+/// passing through `{0,0}`, `{0.123, 0.280}`, `{0.575, 0.880}`, `{1.0, 1.0}`:
+/// lifts light sketching effortlessly without clipping away the `0.70..1.00` heavy-pressure range.
 #[inline]
 pub fn calibrate_stylus_pressure(raw_force: f32) -> f32 {
-    let p_scaled = (raw_force.max(0.0) / 0.70).min(1.0);
-    p_scaled.powf(0.60)
+    static DEFAULT_PENCIL_CURVE: std::sync::OnceLock<crate::ResponseCurve> = std::sync::OnceLock::new();
+    let curve = DEFAULT_PENCIL_CURVE.get_or_init(|| {
+        crate::ResponseCurve::new(&[
+            [0.0, 0.0],
+            [0.1229896, 0.280303],
+            [0.57521287, 0.8797349],
+            [1.0, 1.0],
+        ])
+    });
+    if !raw_force.is_finite() {
+        return 0.0;
+    }
+    curve.eval(raw_force.clamp(0.0, 1.0))
 }
 
-/// The single lightweight stylus pressure calibration + EMA filter in the live path.
+/// The single velocity- & time-normalized stylus pressure calibration filter in the live path.
 ///
-/// Runs once per Pencil sample after unrefined/placeholder forces are resolved so light-touch
-/// force ripple is smoothed without stacking multiple EMAs across Swift and Rust.
+/// Runs once per hardware Pencil sample so light-touch force ripple is smoothed without stacking
+/// EMAs across Swift/Rust or over-filtering across subdivided spline steps.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PressureFilter {
     prev: Option<f32>,
+    prev_time_s: Option<f64>,
+    smoothed_speed: f32,
 }
 
 impl PressureFilter {
     /// Minimum non-zero stylus pressure floor.
     pub const MIN_PRESSURE: f32 = 0.0009765625;
-    /// Single lightweight EMA weight applied to each newly calibrated sample.
+    /// Default responsiveness when elapsed timestamps aren't supplied.
     pub const EMA_ALPHA: f32 = 0.45;
 
     pub fn new() -> Self {
@@ -127,6 +139,8 @@ impl PressureFilter {
 
     pub fn reset(&mut self) {
         self.prev = None;
+        self.prev_time_s = None;
+        self.smoothed_speed = 0.0;
     }
 
     #[inline]
@@ -138,16 +152,45 @@ impl PressureFilter {
 
     /// Initialize on touch down without averaging against an earlier stroke.
     pub fn begin(&mut self, raw_force: f32, divisor: f32) -> f32 {
+        self.begin_at(raw_force, divisor, None)
+    }
+
+    /// Initialize on touch down with optional hardware monotonic timestamp (seconds).
+    pub fn begin_at(&mut self, raw_force: f32, divisor: f32, timestamp_s: Option<f64>) -> f32 {
         let calibrated = Self::calibrate(raw_force, divisor);
         self.prev = Some(calibrated);
+        self.prev_time_s = timestamp_s.filter(|t| t.is_finite() && *t > 0.0);
+        self.smoothed_speed = 0.0;
         calibrated
     }
 
-    /// Filter a confirmed mid-stroke move sample.
+    /// Filter a confirmed mid-stroke move sample (uses 120 Hz default delta when timestamps omitted).
     pub fn push_move(&mut self, raw_force: f32, divisor: f32) -> f32 {
+        self.push_move_timed(raw_force, divisor, None, 4.0)
+    }
+
+    /// Velocity- and time-dilation-normalized pressure softening matching physical stylus dynamics:
+    /// expresses elapsed time in 60 Hz frame units (`time_dilation = dt * 60.0`) so fast flicks resist
+    /// stair-step spikes while slow shading stays instantaneous.
+    pub fn push_move_timed(&mut self, raw_force: f32, divisor: f32, timestamp_s: Option<f64>, dist_pt: f32) -> f32 {
         let calibrated = Self::calibrate(raw_force, divisor);
+        let dt_s = match (self.prev_time_s, timestamp_s.filter(|t| t.is_finite() && *t > 0.0)) {
+            (Some(t0), Some(t1)) if t1 > t0 => (t1 - t0).clamp(0.0005, 0.25),
+            _ => 1.0 / 120.0,
+        };
+        if let Some(ts) = timestamp_s.filter(|t| t.is_finite() && *t > 0.0) {
+            self.prev_time_s = Some(ts);
+        }
+        let time_dilation = (dt_s as f32 * 60.0).clamp(0.08, 4.0);
+        let seg_len = if dist_pt.is_finite() { dist_pt.max(0.5) } else { 4.0 };
+        let inst_speed = ((seg_len / time_dilation) / 25.0).sqrt().clamp(0.0, 1.5);
+        let k = (3.0 / time_dilation).clamp(0.5, 16.0);
+        self.smoothed_speed = (inst_speed + k * self.smoothed_speed) / (k + 1.0);
+        let t = (time_dilation / seg_len).clamp(0.20, 1.0);
+        let alpha = t.powf((2.0 * self.smoothed_speed).clamp(0.15, 2.0)).clamp(0.25, 0.90);
+
         let filtered = match self.prev {
-            Some(prev) => (prev * (1.0 - Self::EMA_ALPHA) + calibrated * Self::EMA_ALPHA).clamp(Self::MIN_PRESSURE, 1.0),
+            Some(prev) => (prev + (calibrated - prev) * alpha).clamp(Self::MIN_PRESSURE, 1.0),
             None => calibrated,
         };
         self.prev = Some(filtered);
@@ -162,10 +205,195 @@ impl PressureFilter {
     /// Monotonic lift-off filter: lift pressure cannot spike above the prior filtered sample.
     pub fn end_liftoff(&mut self, raw_force: f32, divisor: f32) -> f32 {
         let calibrated = Self::calibrate(raw_force, divisor);
+        self.prev_time_s = None;
+        self.smoothed_speed = 0.0;
         match self.prev.take() {
             Some(prev) => (prev * (1.0 - Self::EMA_ALPHA) + calibrated * Self::EMA_ALPHA).min(prev).clamp(Self::MIN_PRESSURE, 1.0),
             None => calibrated,
         }
+    }
+}
+
+/// Fast parabolic sine refinement used inside hot spline / arc root-finding loops (`|err| < 0.001`).
+#[inline]
+pub fn fast_sin(x: f32) -> f32 {
+    let pi = std::f32::consts::PI;
+    let two_pi = 2.0 * pi;
+    let wrapped = (x + pi).rem_euclid(two_pi) - pi;
+    let y = 1.27323949f32 * wrapped - 0.405284733f32 * wrapped * wrapped.abs();
+    y + 0.225f32 * (y * y.abs() - y)
+}
+
+/// 4-point strictly convex trigonometric blending weights (`w[i] in [0, 0.5], sum == 1.0`).
+/// Guarantees curve evaluation stays inside the control-point convex hull with zero overshoot/hooks.
+#[inline]
+pub fn trig_spline_weights(t: f32) -> [f32; 4] {
+    let t = t.clamp(0.0, 1.0);
+    let u = t * std::f32::consts::FRAC_PI_2;
+    let s = fast_sin(u);
+    let c = fast_sin(u + std::f32::consts::FRAC_PI_2);
+    [
+        0.25 - 0.25 * c,
+        0.25 + 0.25 * s,
+        0.25 + 0.25 * c,
+        0.25 - 0.25 * s,
+    ]
+}
+
+/// Evaluate a 4-point convex trigonometric curve segment (`ctrl = [oldest..newest]`,
+/// normalized to `w` where `t = 0` centers on `ctrl[1]` and `t = 1` centers on `ctrl[2]`)
+/// using shortest-arc `(sin, cos)` vector angle blending for barrel rotation.
+#[inline]
+pub fn eval_trig_spline(ctrl: &[StrokePoint; 4], t: f32) -> StrokePoint {
+    // Reorder [c3, c2, c1, c0] into [p0, p1, p2, p3] so t=0 centers on p1 (w=[0.25,0.5,0.25,0])
+    // and t=1 centers on p2 (w=[0,0.25,0.5,0.25]).
+    let w = trig_spline_weights(t);
+    let weights = [w[3], w[2], w[1], w[0]];
+    let mut x = 0.0f64;
+    let mut y = 0.0f64;
+    let mut pressure = 0.0f32;
+    let mut tilt_x = 0.0f32;
+    let mut tilt_y = 0.0f32;
+    let mut wheel = 0.0f32;
+    let mut time = 0.0f64;
+    let mut sin_sum = 0.0f32;
+    let mut cos_sum = 0.0f32;
+    for (pt, &wi) in ctrl.iter().zip(&weights) {
+        let wf = f64::from(wi);
+        x += pt.x * wf;
+        y += pt.y * wf;
+        pressure += pt.pressure * wi;
+        tilt_x += pt.tilt_x * wi;
+        tilt_y += pt.tilt_y * wi;
+        wheel += pt.wheel * wi;
+        time += pt.time * wf;
+        let rad = pt.rotation.to_radians();
+        sin_sum += rad.sin() * wi;
+        cos_sum += rad.cos() * wi;
+    }
+    let rotation = if sin_sum.abs() + cos_sum.abs() > 1e-6 {
+        sin_sum.atan2(cos_sum).to_degrees().rem_euclid(360.0)
+    } else {
+        ctrl[1].rotation
+    };
+    StrokePoint {
+        x,
+        y,
+        pressure: pressure.clamp(0.0, 1.0),
+        tilt_x,
+        tilt_y,
+        rotation,
+        wheel,
+        time,
+    }
+}
+
+/// Curvature-preserving synthetic extrapolation beyond `p1` using `p2` (and optional `p3`),
+/// continuing natural arc curvature (`stepDist = 0.25 * len`, `nextAngle = theta1 + 1.125 * dtheta`)
+/// and monotonically decayed pressure for flicker-free lift-off and predicted trails.
+#[inline]
+pub fn extrapolate_curvature_point(p3: Option<&StrokePoint>, p2: &StrokePoint, p1: &StrokePoint) -> StrokePoint {
+    let dx = p1.x - p2.x;
+    let dy = p1.y - p2.y;
+    let len = dx.hypot(dy);
+    if !(len.is_finite() && len > 1e-6) {
+        return *p1;
+    }
+    let theta1 = dy.atan2(dx);
+    let theta2 = p3.map_or(theta1, |q| (p2.y - q.y).atan2(p2.x - q.x));
+    let pi = std::f64::consts::PI;
+    let dtheta = (theta1 - theta2 + pi).rem_euclid(2.0 * pi) - pi;
+    let step_dist = (0.25 * len).clamp(0.25, 24.0);
+    let next_angle = theta1 + 1.125 * dtheta;
+    let dt = (p1.time - p2.time).clamp(1.0, 16.0);
+    let dp = p1.pressure - p2.pressure;
+    let next_pressure = (p1.pressure + dp).clamp(0.0, p1.pressure);
+    StrokePoint {
+        x: p1.x + step_dist * next_angle.cos(),
+        y: p1.y + step_dist * next_angle.sin(),
+        pressure: next_pressure,
+        tilt_x: p1.tilt_x,
+        tilt_y: p1.tilt_y,
+        rotation: p1.rotation,
+        wheel: p1.wheel,
+        time: p1.time + 0.25 * dt,
+    }
+}
+
+/// Zero-phase mirrored-boundary window smoother with decoupled position & pressure stabilization.
+/// Using future predicted points + reflected boundary points removes tremor with near-zero directional
+/// lag while keeping touchdown and lift-off endpoints anchored cleanly.
+pub fn smooth_mirrored_window(
+    committed: &[StrokePoint],
+    predicted: &[StrokePoint],
+    pos_strength: f32,
+    pressure_strength: f32,
+    out: &mut Vec<StrokePoint>,
+) {
+    out.clear();
+    let n_comm = committed.len();
+    let n_tot = n_comm + predicted.len();
+    if n_tot == 0 {
+        return;
+    }
+    if n_tot < 2 || (pos_strength <= 1e-4 && pressure_strength <= 1e-4) {
+        out.extend_from_slice(committed);
+        out.extend_from_slice(predicted);
+        return;
+    }
+    let pos_r = (pos_strength.clamp(0.0, 1.0).powf(2.2) * 16.0).floor() as isize;
+    let pre_r = (pressure_strength.clamp(0.0, 1.0).powf(1.6) * 8.0).floor() as isize;
+
+    let sample_at = |idx: isize| -> StrokePoint {
+        // Reflect indices across [0, n_tot - 1] around endpoints so start/end anchor cleanly.
+        let reflected = if idx < 0 {
+            (-idx).min((n_tot as isize) - 1) as usize
+        } else if idx >= n_tot as isize {
+            let mirror = 2 * (n_tot as isize - 1) - idx;
+            mirror.max(0) as usize
+        } else {
+            idx as usize
+        };
+        if reflected < n_comm {
+            committed[reflected]
+        } else {
+            predicted[reflected - n_comm]
+        }
+    };
+
+    for i in 0..n_tot {
+        let base = if i < n_comm { committed[i] } else { predicted[i - n_comm] };
+        let (x, y) = if pos_r > 0 && i > 0 && i + 1 < n_tot {
+            let mut sx = 0.0f64;
+            let mut sy = 0.0f64;
+            let mut wsum = 0.0f64;
+            let ii = i as isize;
+            for k in -pos_r..=pos_r {
+                let p = sample_at(ii + k);
+                let dist = (k.abs() as f64) / (pos_r as f64 + 1.0);
+                let w = 1.0 - dist * 0.5;
+                sx += p.x * w;
+                sy += p.y * w;
+                wsum += w;
+            }
+            (sx / wsum, sy / wsum)
+        } else {
+            (base.x, base.y)
+        };
+        let pressure = if pre_r > 0 {
+            let mut sp = 0.0f32;
+            let mut wsum = 0.0f32;
+            let ii = i as isize;
+            for k in -pre_r..=pre_r {
+                let p = sample_at(ii + k);
+                sp += p.pressure;
+                wsum += 1.0;
+            }
+            (sp / wsum).clamp(0.0, 1.0)
+        } else {
+            base.pressure
+        };
+        out.push(StrokePoint { x, y, pressure, ..base });
     }
 }
 
@@ -691,19 +919,87 @@ impl PathWalker {
             match self.speed.filter(|_| dt > 0.0 && dt.is_finite()) {
                 None => {
                     if !self.grid.is_some_and(|g| self.grid_steps(&a, &p, g, out)) {
-                        let mut emitted = 0usize;
-                        while self.next_at <= len + 1e-9 && emitted < MAX_DISTANCE_STEPS_PER_SEGMENT && self.step < MAX_STEPS_PER_STROKE {
-                            let q = lerp_pt(&a, &p, (self.next_at / len).min(1.0));
-                            self.emit(q, out);
-                            self.next_at += step_len(&q).max(0.25);
-                            emitted += 1;
-                        }
-                        // Cut short: the rest of the segment is skipped, spacing restarts at its end.
-                        // Only when the cap held back a step that was still due; a segment that ends right at the cap keeps its carry-over.
-                        // When pressure drops across a segment (shrinking diameter), clamp carry-over so it never skips dabs and leaves detached beads.
-                        let cut_short = emitted == MAX_DISTANCE_STEPS_PER_SEGMENT && self.next_at <= len + 1e-9;
+                        let start_step = step_len(&a).max(0.25);
                         let end_step = step_len(&p).max(0.25);
-                        self.next_at = if cut_short { end_step } else { (self.next_at - len).min(end_step) };
+                        if end_step >= start_step - 0.1 {
+                            let mut emitted = 0usize;
+                            while self.next_at <= len + 1e-9 && emitted < MAX_DISTANCE_STEPS_PER_SEGMENT && self.step < MAX_STEPS_PER_STROKE {
+                                let q = lerp_pt(&a, &p, (self.next_at / len).min(1.0));
+                                self.emit(q, out);
+                                self.next_at += step_len(&q).max(0.25);
+                                emitted += 1;
+                            }
+                            // Cut short: the rest of the segment is skipped, spacing restarts at its end.
+                            // Only when the cap held back a step that was still due; a segment that ends right at the cap keeps its carry-over.
+                            let cut_short = emitted == MAX_DISTANCE_STEPS_PER_SEGMENT && self.next_at <= len + 1e-9;
+                            self.next_at = if cut_short { end_step } else { (self.next_at - len).min(end_step) };
+                        } else {
+                            // Shrinking diameter across pressure drop: solve
+                            // `(s - prev_s) - 0.5 * (prev_step + step(s)) = 0` via safeguarded
+                            // secant + bisection so shrinking dabs never skip ahead and leave detached beads.
+                            let mut prev_s = self.next_at - start_step;
+                            let mut prev_step = start_step;
+                            let mut emitted = 0usize;
+                            while emitted < MAX_DISTANCE_STEPS_PER_SEGMENT && self.step < MAX_STEPS_PER_STROKE {
+                                let lo_start = prev_s.max(0.0);
+                                if lo_start > len + 1e-9 {
+                                    break;
+                                }
+                                let eval_f = |s: f64| -> f64 {
+                                    let q = lerp_pt(&a, &p, (s / len).clamp(0.0, 1.0));
+                                    let st = step_len(&q).max(0.25);
+                                    (s - prev_s) - 0.5 * (prev_step + st)
+                                };
+                                let f_lo = eval_f(lo_start);
+                                let s_root = if f_lo >= 0.0 {
+                                    lo_start
+                                } else {
+                                    let f_hi = eval_f(len);
+                                    if f_hi < 0.0 {
+                                        break;
+                                    }
+                                    let (mut lo, mut fl) = (lo_start, f_lo);
+                                    let (mut hi, mut fh) = (len, f_hi);
+                                    let (mut x0, mut fx0) = (lo, fl);
+                                    let (mut x1, mut fx1) = (hi, fh);
+                                    let mut best = 0.5 * (lo + hi);
+                                    for _ in 0..30 {
+                                        let denom = fx1 - fx0;
+                                        let sec = if denom.abs() > 1e-9 { x1 - fx1 * (x1 - x0) / denom } else { best };
+                                        let cand = if sec > lo && sec < hi { sec } else { 0.5 * (lo + hi) };
+                                        let fc = eval_f(cand);
+                                        best = cand;
+                                        if fc.abs() <= 0.01 || (hi - lo) <= 0.01 {
+                                            break;
+                                        }
+                                        if fc < 0.0 {
+                                            lo = cand;
+                                            fl = fc;
+                                        } else {
+                                            hi = cand;
+                                            fh = fc;
+                                        }
+                                        x0 = x1;
+                                        fx0 = fx1;
+                                        x1 = cand;
+                                        fx1 = fc;
+                                        let _ = (fl, fh);
+                                    }
+                                    best
+                                };
+                                let q = lerp_pt(&a, &p, (s_root / len).clamp(0.0, 1.0));
+                                self.emit(q, out);
+                                prev_s = s_root;
+                                prev_step = step_len(&q).max(0.25);
+                                emitted += 1;
+                                if prev_s + 0.125 >= len {
+                                    break;
+                                }
+                            }
+                            let cut_short = emitted == MAX_DISTANCE_STEPS_PER_SEGMENT && prev_s + 0.25 <= len + 1e-9;
+                            let rem = (0.5 * (prev_step + end_step) - (len - prev_s)).clamp(0.0, end_step);
+                            self.next_at = if cut_short { end_step } else { rem };
+                        }
                     }
                 }
                 Some(iv) => {
@@ -1183,8 +1479,8 @@ impl DabBuilder {
             }
             // Tilt Scale and Brush Projection (Shape Dynamics).
             let (mut proj_angle, mut proj_scale) = (0.0, 1.0);
+            let tilt = s.point.tilt_x.hypot(s.point.tilt_y).clamp(0.0, 90.0);
             if sd.enabled {
-                let tilt = s.point.tilt_x.hypot(s.point.tilt_y).clamp(0.0, 90.0);
                 if sd.size.control == Control::PenTilt && sd.tilt_scale > 0.0 {
                     let k = 1.0 - sd.tilt_scale.clamp(0.0, 2.0) * 0.5 * tilt / 90.0;
                     roundness = (roundness * k).clamp(0.01, 1.0);
@@ -1196,6 +1492,13 @@ impl DabBuilder {
                         proj_scale = tilt.to_radians().cos().max(0.05);
                     }
                 }
+            }
+            if b.dynamics_tilt_size > 0.0 && tilt > 1.0 && !(sd.enabled && sd.brush_projection) {
+                let az = (-s.point.tilt_y).atan2(s.point.tilt_x);
+                let alt_compress = tilt.to_radians().cos().max(0.25);
+                let k = 1.0 - b.dynamics_tilt_size.clamp(0.0, 1.0) * (1.0 - alt_compress);
+                proj_angle = az;
+                proj_scale = k.clamp(0.20, 1.0);
             }
             let radius = (diameter / 2.0).max(0.5);
             // Scatter.
