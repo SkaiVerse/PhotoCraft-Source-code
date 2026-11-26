@@ -104,6 +104,7 @@ impl PhotocraftApp {
             last_window_title: String::new(),
             fonts_ready: false,
             last_canvas_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
+            strict_background_lock: false,
             arrange_start: 0,
             drawing_window: None,
             ppp: 1.0,

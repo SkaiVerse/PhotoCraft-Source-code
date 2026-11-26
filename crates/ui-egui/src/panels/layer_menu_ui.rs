@@ -260,6 +260,258 @@ fn items(app: &crate::PhotocraftApp, ui: &mut egui::Ui, l: &Layer, on_set: bool,
     }
 }
 
+/// Render the Affinity-style touch layer popover menu matching the clean dark card layout
+/// (`Add to Selection`, `Duplicate`, `Delete`, `Hide`, `Solo`, `Lock`, `Rename Layer...`,
+/// `Create Clipping Mask`, `Release`, `Merge ▸`, `Rasterise ▸`, `Expand Selection`,
+/// `Collapse Selection`, `Collapse All Parents`, and the `Tag` 8-circle colour row).
+/// Returns `(rename_requested, action_dispatched)`.
+pub(crate) fn show_affinity_popover(
+    app: &crate::PhotocraftApp,
+    ui: &mut egui::Ui,
+    l: &Layer,
+    multi: bool,
+    actions: &mut Vec<(String, Value)>,
+) -> bool {
+    use egui::{Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
+
+    let Some(st) = app.session.active() else { return false };
+    let doc = &st.doc;
+    let ctx = ui.ctx().clone();
+    let is_bg = doc.is_background(l.id);
+    let is_locked = is_bg || l.locks.all;
+    let solo_active = st.show_only.as_ref().is_some_and(|(id, _)| *id == l.id);
+    let can_clip_create = !l.clipped && doc.path_of(l.id).and_then(|p| p.last().copied()).is_some_and(|idx| idx > 0);
+    let can_clip_release = l.clipped;
+
+    let selected = st.selected_layers();
+    let check_ids: Vec<photocraft_doc::LayerId> = if multi && selected.contains(&l.id) { selected.clone() } else { vec![l.id] };
+    let can_expand_sel = check_ids
+        .iter()
+        .any(|id| doc.layer(*id).is_some_and(|x| matches!(&x.content, LayerContent::Group(g) if !g.expanded)));
+    let can_collapse_sel = check_ids
+        .iter()
+        .any(|id| doc.layer(*id).is_some_and(|x| matches!(&x.content, LayerContent::Group(g) if g.expanded)));
+    let any_group_expanded = doc.walk().iter().any(|(_, _, g)| matches!(&g.content, LayerContent::Group(gr) if gr.expanded));
+    let can_merge_down = if multi {
+        selected.len() > 1
+    } else if l.is_group() {
+        true
+    } else {
+        doc.path_of(l.id).and_then(|p| p.last().copied()).is_some_and(|idx| idx > 0)
+    };
+    let can_delete = !(doc.layers.len() == 1 && is_bg);
+
+    let sub_key = egui::Id::unique(("affinity-layer-menu-sub", l.id.0));
+    // 0 = none, 1 = Merge expanded, 2 = Rasterise expanded
+    let mut open_sub = ctx.data(|d| d.get_temp::<u8>(sub_key)).unwrap_or(0);
+
+    let text_enabled = Color32::from_rgb(232, 232, 235);
+    let text_disabled = Color32::from_rgb(104, 104, 110);
+    let divider_color = Color32::from_rgba_unmultiplied(255, 255, 255, 26);
+    let hover_bg = Color32::from_rgba_unmultiplied(255, 255, 255, 24);
+    let row_h = 28.0_f32;
+    let w = ui.available_width().max(220.0);
+
+    let menu_row = |ui: &mut egui::Ui, label: &str, enabled: bool, submenu_arrow: bool, active: bool| -> bool {
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, row_h), if enabled { Sense::click() } else { Sense::hover() });
+        if enabled && (resp.hovered() || active) {
+            ui.painter().rect_filled(rect, 5.0, hover_bg);
+        }
+        let col = if enabled { text_enabled } else { text_disabled };
+        let font = egui::FontId::proportional(14.0);
+        let galley = ui.painter().layout_no_wrap(label.to_string(), font, col);
+        let pos = pos2(rect.left() + 12.0, rect.center().y - galley.size().y * 0.5);
+        ui.painter().galley(pos, galley, col);
+        if submenu_arrow {
+            let cx = rect.right() - 14.0;
+            let cy = rect.center().y;
+            let arrow_col = Color32::from_rgb(138, 138, 144);
+            let pts = if active {
+                vec![pos2(cx - 4.0, cy - 2.5), pos2(cx + 3.0, cy - 2.5), pos2(cx - 0.5, cy + 3.0)]
+            } else {
+                vec![pos2(cx - 2.5, cy - 4.0), pos2(cx + 3.0, cy), pos2(cx - 2.5, cy + 4.0)]
+            };
+            ui.painter().add(egui::Shape::convex_polygon(pts, arrow_col, Stroke::NONE));
+        }
+        enabled && resp.clicked()
+    };
+
+    let sep = |ui: &mut egui::Ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(w, 7.0), Sense::hover());
+        let y = r.center().y;
+        ui.painter().line_segment([pos2(r.left() + 2.0, y), pos2(r.right() - 2.0, y)], Stroke::new(1.0, divider_color));
+    };
+
+    let mut rename_clicked = false;
+
+    crate::widgets::menu_scroll(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+
+        if menu_row(ui, tl!("Add to Selection"), true, false, false) {
+            actions.push(("layer.select".into(), json!({"layer": l.id.0, "mode": "add"})));
+            ctx.data_mut(|d| {
+                let list = d.get_temp_mut_or_default::<Vec<u64>>(crate::layer_row_ui::swipe_select_key());
+                if !list.contains(&l.id.0) {
+                    list.push(l.id.0);
+                }
+            });
+        }
+        if menu_row(ui, tl!("Duplicate"), true, false, false) {
+            actions.push(("layer.duplicate".into(), json!({"layer": l.id.0})));
+        }
+        if menu_row(ui, tl!("Delete"), can_delete, false, false) {
+            actions.push(("layer.delete".into(), json!({"layer": l.id.0})));
+        }
+
+        sep(ui);
+
+        if menu_row(ui, if l.visible { tl!("Hide") } else { tl!("Show") }, true, false, false) {
+            actions.push(("layer.setProps".into(), json!({"layer": l.id.0, "visible": !l.visible})));
+        }
+        if menu_row(ui, tl!("Solo"), true, false, solo_active) {
+            actions.push(("layer.showOnly".into(), json!({"layer": l.id.0})));
+        }
+        if menu_row(ui, if is_locked { tl!("Unlock") } else { tl!("Lock") }, true, false, false) {
+            if is_bg {
+                actions.push(("layer.new.layerFromBackground".into(), json!({})));
+            } else {
+                actions.push(("layer.lockLayers".into(), json!({"layer": l.id.0, "all": !l.locks.all})));
+            }
+        }
+
+        sep(ui);
+
+        if menu_row(ui, tl!("Rename Layer..."), true, false, false) {
+            rename_clicked = true;
+        }
+
+        sep(ui);
+
+        if menu_row(ui, tl!("Create Clipping Mask"), can_clip_create, false, false) {
+            actions.push(("layer.createClippingMask".into(), json!({"layer": l.id.0})));
+        }
+        if menu_row(ui, tl!("Release"), can_clip_release, false, false) {
+            actions.push(("layer.releaseClippingMask".into(), json!({"layer": l.id.0})));
+        }
+
+        sep(ui);
+
+        if menu_row(ui, tl!("Merge"), true, true, open_sub == 1) {
+            open_sub = if open_sub == 1 { 0 } else { 1 };
+            ctx.data_mut(|d| d.insert_temp(sub_key, open_sub));
+        }
+        if open_sub == 1 {
+            ui.indent("affinity-merge-sub", |ui| {
+                if multi {
+                    if menu_row(ui, tl!("Merge Selected"), can_merge_down, false, false) {
+                        actions.push(("layer.mergeLayers".into(), json!({})));
+                    }
+                } else if l.is_group() {
+                    if menu_row(ui, tl!("Merge Group"), true, false, false) {
+                        actions.push(("layer.mergeGroup".into(), json!({"layer": l.id.0})));
+                    }
+                } else if menu_row(ui, tl!("Merge Down"), can_merge_down, false, false) {
+                    actions.push(("layer.mergeDown".into(), json!({"layer": l.id.0})));
+                }
+                if menu_row(ui, tl!("Merge Visible"), true, false, false) {
+                    actions.push(("layer.mergeVisible".into(), json!({})));
+                }
+                if menu_row(ui, tl!("Flatten Image"), true, false, false) {
+                    actions.push(("layer.flattenImage".into(), json!({})));
+                }
+            });
+        }
+
+        if menu_row(ui, tl!("Rasterise"), true, true, open_sub == 2) {
+            open_sub = if open_sub == 2 { 0 } else { 2 };
+            ctx.data_mut(|d| d.insert_temp(sub_key, open_sub));
+        }
+        if open_sub == 2 {
+            ui.indent("affinity-rasterise-sub", |ui| {
+                if menu_row(ui, tl!("Rasterise Layer"), true, false, false) {
+                    actions.push(("layer.rasterize.layer".into(), json!({"layer": l.id.0})));
+                }
+                if menu_row(ui, tl!("Rasterise Layer Style"), !l.effects.items.is_empty(), false, false) {
+                    actions.push(("layer.rasterize.layerStyle".into(), json!({"layer": l.id.0})));
+                }
+                if menu_row(ui, tl!("Rasterise All"), true, false, false) {
+                    actions.push(("layer.rasterize.allLayers".into(), json!({})));
+                }
+            });
+        }
+
+        sep(ui);
+
+        if menu_row(ui, tl!("Expand Selection"), can_expand_sel, false, false) {
+            for &id in &check_ids {
+                actions.push(("layer.setExpanded".into(), json!({"layer": id.0, "expanded": true})));
+            }
+        }
+        if menu_row(ui, tl!("Collapse Selection"), can_collapse_sel, false, false) {
+            for &id in &check_ids {
+                actions.push(("layer.setExpanded".into(), json!({"layer": id.0, "expanded": false})));
+            }
+        }
+        if menu_row(ui, tl!("Collapse All Parents"), any_group_expanded, false, false) {
+            actions.push(("layer.setExpanded".into(), json!({"all": true, "expanded": false})));
+        }
+
+        sep(ui);
+
+        // Affinity Tag header + 8 circular colour swatches
+        let (tag_hdr, _) = ui.allocate_exact_size(vec2(w, 20.0), Sense::hover());
+        let tag_galley = ui.painter().layout_no_wrap(tl!("Tag").into(), egui::FontId::proportional(12.0), Color32::from_rgb(200, 200, 206));
+        ui.painter().galley(pos2(tag_hdr.left() + 12.0, tag_hdr.center().y - tag_galley.size().y * 0.5), tag_galley, Color32::from_rgb(200, 200, 206));
+
+        let (tag_row, _) = ui.allocate_exact_size(vec2(w, 34.0), Sense::hover());
+        let tags: [(LabelColor, Color32); 8] = [
+            (LabelColor::None, Color32::WHITE),
+            (LabelColor::Red, Color32::from_rgb(255, 69, 58)),
+            (LabelColor::Orange, Color32::from_rgb(255, 159, 10)),
+            (LabelColor::Yellow, Color32::from_rgb(255, 214, 10)),
+            (LabelColor::Green, Color32::from_rgb(48, 209, 88)),
+            (LabelColor::Blue, Color32::from_rgb(10, 132, 255)),
+            (LabelColor::Violet, Color32::from_rgb(191, 90, 242)),
+            (LabelColor::Gray, Color32::from_rgb(142, 142, 147)),
+        ];
+        let pad_x = 12.0_f32;
+        let span_w = (tag_row.width() - pad_x * 2.0).max(160.0);
+        let step_x = span_w / 8.0;
+        let current_tag = common_color(app, l, multi);
+        for (idx, (color, fill)) in tags.into_iter().enumerate() {
+            let cx = tag_row.left() + pad_x + step_x * (idx as f32 + 0.5);
+            let cy = tag_row.center().y;
+            let hit_rect = Rect::from_center_size(Pos2::new(cx, cy), vec2(26.0, 26.0));
+            let resp = ui.interact(hit_rect, egui::Id::unique(("affinity-tag-dot", l.id.0, idx)), Sense::click());
+            let selected = current_tag == Some(color);
+            let radius = if color == LabelColor::None { 10.5 } else { 9.5 };
+            if selected {
+                ui.painter().circle_stroke(pos2(cx, cy), radius + 2.5, Stroke::new(1.5, Color32::WHITE));
+            }
+            if color == LabelColor::None {
+                ui.painter().circle_filled(pos2(cx, cy), radius, Color32::WHITE);
+                ui.painter().circle_stroke(pos2(cx, cy), radius, Stroke::new(1.0, Color32::from_rgb(180, 180, 185)));
+                let s = radius * 0.65;
+                ui.painter().line_segment([pos2(cx - s, cy + s), pos2(cx + s, cy - s)], Stroke::new(1.8, Color32::from_rgb(10, 132, 255)));
+            } else {
+                ui.painter().circle_filled(pos2(cx, cy), radius, fill);
+                if resp.hovered() {
+                    ui.painter().circle_stroke(pos2(cx, cy), radius + 1.0, Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 160)));
+                }
+            }
+            if resp.clicked() {
+                let params = if multi { json!({"color": color.id()}) } else { json!({"layer": l.id.0, "color": color.id()}) };
+                actions.push(("layer.setLabelColor".into(), params));
+            }
+        }
+    });
+
+    if !actions.is_empty() || rename_clicked {
+        ctx.data_mut(|d| d.remove::<u8>(sub_key));
+    }
+    rename_clicked
+}
+
 pub(crate) fn color_name(color: LabelColor) -> &'static str {
     crate::i18n::tr_ctx(crate::i18n::current(), "layerLabel", color.label())
 }

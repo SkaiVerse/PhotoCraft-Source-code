@@ -52,6 +52,90 @@ pub fn tool_name(app: &PhotocraftApp, tool: Tool) -> Option<&'static str> {
     }
 }
 
+/// Human-readable lowercase tool name for locked/background layer alerts across all editing tools.
+fn any_tool_name(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Brush => tl!("brush tool"),
+        Tool::Pencil => tl!("pencil tool"),
+        Tool::MixerBrush => tl!("mixer brush tool"),
+        Tool::ColorReplacement => tl!("color replacement tool"),
+        Tool::Eraser => tl!("eraser tool"),
+        Tool::BackgroundEraser => tl!("background eraser tool"),
+        Tool::MagicEraser => tl!("magic eraser tool"),
+        Tool::Blur => tl!("blur tool"),
+        Tool::Sharpen => tl!("sharpen tool"),
+        Tool::Smudge => tl!("smudge tool"),
+        Tool::Dodge => tl!("dodge tool"),
+        Tool::Burn => tl!("burn tool"),
+        Tool::Sponge => tl!("sponge tool"),
+        Tool::CloneStamp => tl!("clone stamp tool"),
+        Tool::PatternStamp => tl!("pattern stamp tool"),
+        Tool::HistoryBrush => tl!("history brush tool"),
+        Tool::ArtHistoryBrush => tl!("art history brush tool"),
+        Tool::SpotHealing => tl!("spot healing brush tool"),
+        Tool::Healing => tl!("healing brush tool"),
+        Tool::Remove => tl!("remove tool"),
+        Tool::Patch => tl!("patch tool"),
+        Tool::ContentAwareMove => tl!("content-aware move tool"),
+        Tool::RedEye => tl!("red eye tool"),
+        Tool::PaintBucket => tl!("paint bucket tool"),
+        Tool::Gradient => tl!("gradient tool"),
+        Tool::Pen | Tool::CurvaturePen => tl!("pen tool"),
+        Tool::FreeformPen => tl!("freeform pen tool"),
+        Tool::AddAnchorPoint | Tool::DeleteAnchorPoint | Tool::ConvertPoint | Tool::PathSelection | Tool::DirectSelection => tl!("path tool"),
+        Tool::Rectangle | Tool::EllipseShape | Tool::Triangle | Tool::Polygon | Tool::Star | Tool::Line | Tool::CustomShape => tl!("shape tool"),
+        Tool::Type | Tool::VerticalType | Tool::HorizontalTypeMask | Tool::VerticalTypeMask => tl!("type tool"),
+        Tool::Move => tl!("move tool"),
+        Tool::Artboard => tl!("artboard tool"),
+        Tool::Frame => tl!("frame tool"),
+        Tool::Crop | Tool::PerspectiveCrop => tl!("crop tool"),
+        Tool::Slice | Tool::SliceSelect => tl!("slice tool"),
+        _ => tl!("tool"),
+    }
+}
+
+/// Returns a warning dialog message when `tool` cannot operate on a Background or locked layer
+/// under strict Background/lock enforcement (`app.strict_background_lock`). Navigation,
+/// color/measurement, and pure selection marquee/lasso/wand tools remain usable.
+pub(crate) fn locked_or_background_alert(app: &PhotocraftApp, tool: Tool) -> Option<String> {
+    if !app.strict_background_lock {
+        return None;
+    }
+    if matches!(
+        tool,
+        Tool::Hand
+            | Tool::RotateView
+            | Tool::Zoom
+            | Tool::Eyedropper
+            | Tool::ColorSampler
+            | Tool::Ruler
+            | Tool::Count
+            | Tool::Note
+            | Tool::RectMarquee
+            | Tool::EllipseMarquee
+            | Tool::SingleRowMarquee
+            | Tool::SingleColumnMarquee
+            | Tool::Lasso
+            | Tool::PolygonLasso
+            | Tool::MagneticLasso
+            | Tool::MagicWand
+            | Tool::QuickSelection
+            | Tool::ObjectSelection
+    ) {
+        return None;
+    }
+    let st = app.session.active()?;
+    let id = st.active_layer?;
+    let _layer = st.doc.layer(id)?;
+    let locks = st.doc.effective_locks(id);
+    let is_bg = st.doc.is_background(id);
+
+    if is_bg || locks.all || locks.pixels || locks.position || locks.transparency || locks.artboard {
+        return Some(crate::i18n::fmt(tl!(LOCKED), &[("tool", any_tool_name(tool))]));
+    }
+    None
+}
+
 /// The alert a press with `tool` gets, if any. `hidden` is the press-time hidden-target refusal
 /// (`canvas::tool_input`), which this only words; the lock and the group are checked here. Lock
 /// transparent pixels is no refusal, and a group's targeted mask paints. A tool with a

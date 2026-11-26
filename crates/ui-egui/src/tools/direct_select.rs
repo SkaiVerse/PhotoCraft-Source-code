@@ -23,7 +23,6 @@
 //! step per drag, and the same commands drive it over MCP and the control channel. The Pen path
 //! being drawn is not in the document yet: its edits apply to it directly, without a command.
 
-use std::cell::RefCell;
 use std::time::Instant;
 
 use egui::{Color32, Modifiers, Pos2};
@@ -37,8 +36,15 @@ use crate::PhotocraftApp;
 use crate::canvas::ToolEvent;
 use crate::state::Tool;
 
-thread_local! {
-    static LAST_ANCHOR_TAP: RefCell<Option<(PathRef, [usize; 2], Instant)>> = const { RefCell::new(None) };
+/// Per-instance double-tap anchor cache (`last_anchor_tap`), ignored in `PartialEq` so tap timing
+/// never perturbs selection equality checks or leaks across documents/apps.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AnchorTapCache(Option<(PathRef, [usize; 2], Instant)>);
+
+impl PartialEq for AnchorTapCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 /// A path Direct Selection edits.
@@ -111,6 +117,9 @@ pub struct DirectSelection {
     /// the anchor's subpath (`anchor_tools`).
     #[serde(skip)]
     pub(crate) subpath_press: Option<[f64; 2]>,
+    /// Last anchor press for double-tap corner/smooth toggling on this `DirectSelection` instance.
+    #[serde(skip)]
+    pub(crate) last_anchor_tap: AnchorTapCache,
 }
 
 /// The cached structural check for one document revision. Type Paths are generated only when
@@ -627,6 +636,9 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: Modifiers) -> bool 
                 Some(Drag::Edit { base, edit, start, end, preview, .. }) => {
                     *end = edit.constrain(*start, [x, y], mods.shift);
                     *preview = edit.preview(base, *start, *end);
+                    if (end[0] - start[0]).hypot(end[1] - start[1]) > 2.0 {
+                        ds.last_anchor_tap.0 = None;
+                    }
                 }
                 Some(Drag::Marquee { end, .. }) => *end = [x, y],
                 None => return owns(tool),
@@ -636,6 +648,9 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: Modifiers) -> bool 
         ToolEvent::Up { x, y } => match app.ui.direct_selection.drag.take() {
             Some(Drag::Edit { target, base, edit, start, .. }) => {
                 let end = edit.constrain(start, [x, y], mods.shift);
+                if (end[0] - start[0]).hypot(end[1] - start[1]) > 2.0 {
+                    app.ui.direct_selection.last_anchor_tap.0 = None;
+                }
                 release(app, target, &base, &edit, start, end, mods);
                 app.ui.direct_selection.coalesce = None;
                 true
@@ -666,6 +681,7 @@ fn press(app: &mut PhotocraftApp, p: [f64; 2], mods: Modifiers, convert: bool) -
         }
         let owner = Owner::current(app);
         let ds = &mut app.ui.direct_selection;
+        ds.last_anchor_tap.0 = None;
         ds.drag = Some(Drag::Marquee { start: p, end: p, add: mods.shift });
         ds.owner = owner;
         return true;
@@ -720,17 +736,16 @@ fn press(app: &mut PhotocraftApp, p: [f64; 2], mods: Modifiers, convert: bool) -
             ds.segment = None;
             // Direct Selection double-tap anchor toggle (Refinement 4)
             if app.ui.tool == Tool::DirectSelection && !convert && !mods.alt && !mods.shift && !mods.command && !mods.ctrl {
-                let is_double_tap = LAST_ANCHOR_TAP.with(|cell| {
-                    let mut b = cell.borrow_mut();
-                    if let Some((prev_target, prev_k, time)) = *b {
-                        if prev_target == target && prev_k == k && time.elapsed().as_millis() <= 400 {
-                            *b = None;
-                            return true;
-                        }
+                let is_double_tap = match ds.last_anchor_tap.0 {
+                    Some((prev_target, prev_k, time)) if prev_target == target && prev_k == k && time.elapsed().as_millis() <= 400 => {
+                        ds.last_anchor_tap.0 = None;
+                        true
                     }
-                    *b = Some((target, k, Instant::now()));
-                    false
-                });
+                    _ => {
+                        ds.last_anchor_tap.0 = Some((target, k, Instant::now()));
+                        false
+                    }
+                };
 
                 if is_double_tap {
                     if let Some(sub) = base.subpaths.get(k[0]) {
@@ -818,7 +833,9 @@ fn press(app: &mut PhotocraftApp, p: [f64; 2], mods: Modifiers, convert: bool) -
                                     let _ = app.run("path.convertPoint", params);
                                 }
                             }
+                            let owner = Owner::current(app);
                             let ds = &mut app.ui.direct_selection;
+                            ds.owner = owner;
                             ds.anchors = vec![k];
                             ds.drag = None;
                             return true;

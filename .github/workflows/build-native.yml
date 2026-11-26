@@ -165,7 +165,10 @@ jobs:
           CGImageDestinationAddImage(dest, result, nil)
           if !CGImageDestinationFinalize(dest) { exit(1) }
           SWIFTEOF
-          OFFICIAL=$(find assets -iname '*macos*512*.png' 2>/dev/null | head -1)
+          OFFICIAL=$(find assets/app-icon -maxdepth 2 -name 'photocraft-1024.png' 2>/dev/null | head -1)
+          if [ -z "$OFFICIAL" ]; then
+            OFFICIAL=$(find assets -iname '*photocraft*1024*.png' -o -iname '*macos*512*.png' 2>/dev/null | head -1)
+          fi
           if [ -f ios/AppIcon.png ]; then
             echo "Using your own icon: ios/AppIcon.png"
             swift /tmp/make-icon.swift ios/AppIcon.png "$ICONSET/AppIcon-1024.png" plain
@@ -186,7 +189,7 @@ jobs:
           p = pathlib.Path("ios/project.yml")
           s = p.read_text().replace("__BUILD__", build)
           p.write_text(s)
-          line = f"PhotoCraft version 0.P.14, build {build}"
+          line = f"PhotoCraft version 0.P.15, build {build}"
           pathlib.Path("logs/version.txt").write_text(line + "\n")
           print(line)
           PYEOF

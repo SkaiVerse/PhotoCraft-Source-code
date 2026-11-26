@@ -42,7 +42,7 @@ pub fn begin(app: &mut PhotocraftApp, ctx: &egui::Context) -> Result<(), String>
     let layer = doc.layer(id).ok_or("no layer")?;
     let frame_only =
         app.ui.tool == crate::state::Tool::Frame && layer.frame.is_some() && crate::frame_tool::target(app, layer) == crate::frame_tool::Target::Frame;
-    if photocraft_engine::transform_cmds::locked_for_transform(&doc, id) {
+    if photocraft_engine::transform_cmds::locked_for_transform(&doc, id) || (app.strict_background_lock && doc.is_background(id)) {
         // Photoshop refuses before the box opens rather than when it is committed (#2585).
         app.ui.open_dialog(crate::state::DialogKind::Error, json!({"message": tl!(LOCKED)}).as_object().cloned().unwrap_or_default());
         return Err(LOCKED.into());

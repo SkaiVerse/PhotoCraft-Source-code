@@ -389,16 +389,18 @@ pub fn layer_popover_state(ctx: &egui::Context) -> Option<LayerPopoverState> {
     ctx.data(|d| d.get_temp::<LayerPopoverState>(egui::Id::unique("layer-popover-state")))
 }
 
-/// Horizontal swipe offset and spring-snap animation for a layer row.
+/// Horizontal swipe offset and spring-snap animation for a layer row (both left and right swipes).
 pub fn row_swipe_offset(ctx: &egui::Context, layer_id: u64) -> f32 {
     let key = egui::Id::unique(("layer-swipe-snap", layer_id));
     if let Some((start_time, initial_offset)) = ctx.data(|d| d.get_temp::<(f64, f32)>(key)) {
         let now = ctx.input(|i| i.time);
-        let elapsed = (now - start_time) as f32;
-        let duration = 0.20_f32; // ~0.2s spring animation
+        let elapsed = (now - start_time).max(0.0) as f32;
+        let duration = 0.22_f32;
         if elapsed < duration {
-            let progress = elapsed / duration;
-            let factor = (1.0 - progress) * (progress * std::f32::consts::FRAC_PI_2).cos();
+            let progress = (elapsed / duration).clamp(0.0, 1.0);
+            // Smooth cubic ease-out back to x = 0 so both left- and right-swipes settle like Affinity.
+            let inv = 1.0 - progress;
+            let factor = inv * inv * inv;
             ctx.request_repaint();
             initial_offset * factor
         } else {

@@ -498,6 +498,9 @@ pub struct PhotocraftApp {
     fonts_ready: bool,
     /// Screen rect of the main canvas last frame (for overlays and the navigator).
     pub last_canvas_rect: egui::Rect,
+    /// When enabled (iPad/touch shell), refuse canvas editing/creation tools on the Background
+    /// layer just like locked layers and show the locked-layer warning dialog.
+    pub strict_background_lock: bool,
     /// Window › Arrange: the first document of the shown run of tiles, when there are more
     /// documents than tiles (`canvas::arranged_cells`).
     pub(crate) arrange_start: usize,

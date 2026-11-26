@@ -706,6 +706,7 @@ impl Host {
         let place_inbox: PlaceInbox = Arc::default();
         let services = build_services(cb, &inbox, &place_inbox);
         let mut app = PhotocraftApp::new(Session::new(), services);
+        app.strict_background_lock = true;
         app.set_theme(&ctx, ThemeKind::Pro);
         app.set_wgpu(rs.clone());
         app.start_compositor(&ctx);
@@ -902,7 +903,7 @@ impl Host {
                         }
                         return;
                     }
-                    // Horizontal swipe on layer row (Affinity style)
+                    // Horizontal swipe on layer row (Affinity style: slide left for options menu, right for multi-select)
                     if dx.abs() > dy.abs() * 0.8 {
                         if dx > 0.0 {
                             // Swiping right: live rubber-band nudge
@@ -933,14 +934,22 @@ impl Host {
                                 self.ctx.request_repaint();
                                 return;
                             }
-                        } else if dx <= -28.0 && !g.consumed {
-                            // Swiping left: open floating layer context menu popover anchored to left edge of panel
-                            g.consumed = true;
-                            g.mode = GMode::Scroll;
-                            self.gesture = Some(g);
-                            photocraft_ui_egui::layer_row_ui::open_layer_popover(&self.ctx, lt.layer, lt.row);
+                        } else {
+                            // Swiping left: live slide-left animation before opening Affinity layer popover
+                            let nudge = (dx * 0.45).clamp(-48.0, 0.0);
+                            self.ctx.data_mut(|d| d.insert_temp(egui::Id::unique(("layer-live-nudge", lt.layer)), nudge));
                             self.ctx.request_repaint();
-                            return;
+
+                            if dx <= -28.0 && !g.consumed {
+                                g.consumed = true;
+                                g.mode = GMode::Scroll;
+                                self.gesture = Some(g);
+                                self.ctx.data_mut(|d| d.remove::<f32>(egui::Id::unique(("layer-live-nudge", lt.layer))));
+                                photocraft_ui_egui::layer_row_ui::trigger_row_snap_back(&self.ctx, lt.layer, nudge);
+                                photocraft_ui_egui::layer_row_ui::open_layer_popover(&self.ctx, lt.layer, lt.row);
+                                self.ctx.request_repaint();
+                                return;
+                            }
                         }
                         // Horizontal swipe in progress: stay in Pending
                         return;
@@ -1007,7 +1016,7 @@ impl Host {
             let nudge = self.ctx.data(|d| d.get_temp::<f32>(key));
             self.ctx.data_mut(|d| d.remove::<f32>(key));
             if let Some(n) = nudge {
-                if n > 0.0 {
+                if n.abs() > 0.5 {
                     photocraft_ui_egui::layer_row_ui::trigger_row_snap_back(&self.ctx, lt.layer, n);
                     self.ctx.request_repaint();
                 }
@@ -1148,7 +1157,9 @@ impl Host {
                     self.push(egui::Event::PointerButton { pos: sp, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
                     self.ctx.request_repaint();
                 }
-            } else if g.t0.elapsed() >= Duration::from_millis(450) {
+            } else if !g.on_canvas && g.t0.elapsed() >= Duration::from_millis(450) {
+                // Canvas long press is handled once by UILongPressGestureRecognizer (`pc_long_press`)
+                // so a single finger hold never double-clicks Secondary and immediately dismisses its own menu.
                 g.consumed = true;
                 self.gesture = Some(g);
                 note("press and hold: right click");
@@ -1242,28 +1253,11 @@ impl Host {
             pixels_per_point: ppp_out,
         };
 
-        // Decouple live drawing from full egui tessellation:
-        // When an Apple Pencil stroke is actively moving on the canvas (without UI interaction),
-        // reuse the cached UI mesh so live paint dabs render immediately with minimum latency.
-        let can_fast_path = self.fast_stroke_active
-            && self.pen_down
-            && self.gesture.is_none()
-            && self.cached_prims.is_some()
-            && self.cached_screen.as_ref().map(|&(sz, ppp)| sz == screen.size_in_pixels && (ppp - screen.pixels_per_point).abs() < 1e-3).unwrap_or(false);
-
-        let prims = if can_fast_path {
-            self.cached_prims.as_ref().unwrap().clone()
-        } else {
-            let p = Arc::new(ctx.tessellate(shapes, ppp_out));
-            if self.fast_stroke_active && self.pen_down && self.gesture.is_none() {
-                self.cached_prims = Some(p.clone());
-                self.cached_screen = Some((screen.size_in_pixels, screen.pixels_per_point));
-            } else {
-                self.cached_prims = None;
-                self.cached_screen = None;
-            }
-            p
-        };
+        // Always tessellate fresh overlays so interactive tool previews (gradient guide line, shapes,
+        // freehand path, transform box) and the brush cursor follow the Pencil smoothly on every frame.
+        self.cached_prims = None;
+        self.cached_screen = None;
+        let prims = Arc::new(ctx.tessellate(shapes, ppp_out));
 
         let rs = self.rs.clone();
         {
@@ -1532,12 +1526,13 @@ pub unsafe extern "C" fn pc_pen(
                 if h.on_canvas(x, y) {
                     h.gesture = None;
                     h.pen_down = true;
-                    h.fast_stroke_active = true;
+                    h.fast_stroke_active = false;
                     h.cached_prims = None;
                     h.cached_screen = None;
                     h.feed.set(Some(sample));
                     h.push(egui::Event::PointerMoved(pos));
                     h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
+                    h.ctx.request_repaint();
                 } else {
                     h.fast_stroke_active = false;
                     h.cached_prims = None;
@@ -1550,6 +1545,7 @@ pub unsafe extern "C" fn pc_pen(
                 if h.pen_down {
                     h.feed.set(Some(sample));
                     h.push(egui::Event::PointerMoved(pos));
+                    h.ctx.request_repaint();
                 } else if h.gesture.is_some_and(|g| g.pen) {
                     h.gesture_move(x, y);
                 }
@@ -1563,11 +1559,15 @@ pub unsafe extern "C" fn pc_pen(
                 h.cached_screen = None;
                 if h.pen_down {
                     h.pen_down = false;
+                    // Push the final clamped lift-off sample before PointerMoved so Stylus::frame
+                    // retains it for the final move instead of falling back to 1.0 mouse pressure.
+                    h.feed.set(Some(sample));
                     h.push(egui::Event::PointerMoved(pos));
                     h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
                     // The stroke's last samples keep their pressure; nothing is held after this.
                     h.feed.set(None);
                     h.feed.set_predicted(None);
+                    h.ctx.request_repaint();
                 } else if h.gesture.is_some_and(|g| g.pen) {
                     h.gesture_end(x, y, phase == 3);
                 }
@@ -1737,15 +1737,32 @@ pub unsafe extern "C" fn pc_long_press(h: *mut c_void, x: f32, y: f32) {
                 return;
             }
         }
-        if h.pen_down {
+        let was_pen_down = h.pen_down;
+        if was_pen_down {
+            // Cancel any tiny accidental stroke/drag started during the press-and-hold before
+            // releasing Primary, and stage the Secondary click on the next frame so `track_right_press`
+            // never sees Primary and Secondary down together.
             h.pen_down = false;
+            h.quickshape_active = false;
+            h.quickshape_kind = None;
+            h.quickshape_raw.clear();
+            h.app.cancel_active_stroke();
             let pos = h.pt(x, y);
             let m = h.modifiers;
             h.push(egui::Event::PointerMoved(pos));
             h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
             h.feed.set(None);
+            h.feed.set_predicted(None);
+            h.post(1, egui::Event::PointerMoved(pos));
+            h.post(1, egui::Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed: true, modifiers: m });
+            h.post(2, egui::Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed: false, modifiers: m });
+            h.wake();
+            return;
         }
         if let Some(g) = h.gesture.as_mut() {
+            if g.consumed {
+                return;
+            }
             g.consumed = true;
         }
         h.click(x, y, egui::PointerButton::Secondary, true);

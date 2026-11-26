@@ -112,3 +112,39 @@ fn eraser_on_locked_layer_is_refused() {
     app.run("layer.lockLayers", json!({"all": true})).unwrap();
     refused(&mut app, "Could not use the eraser tool because the layer is locked.");
 }
+
+#[test]
+fn locked_layer_refuses_all_editing_tools_with_alert() {
+    for tool in [Tool::Brush, Tool::Pencil, Tool::Gradient, Tool::Rectangle, Tool::Pen, Tool::PaintBucket, Tool::Crop, Tool::Move] {
+        let mut app = app(tool);
+        app.strict_background_lock = true;
+        app.ui.tool_options.gradient_classic = false;
+        app.run("layer.lockLayers", json!({"all": true})).unwrap();
+        let before = steps(&app);
+        stroke(&mut app);
+        let msg = alerts(&app);
+        assert_eq!(msg.len(), 1, "{tool:?}: expected locked alert dialog, got {msg:?}");
+        assert!(msg[0].contains("because the layer is locked."), "{tool:?}: {msg:?}");
+        assert_eq!(steps(&app), before, "{tool:?}: locked layer must not modify history");
+        let id = app.ui.dialogs[0].id;
+        crate::dialogs::confirm(&mut app, id).unwrap();
+    }
+}
+
+#[test]
+fn strict_background_lock_refuses_all_editing_tools_on_background_with_alert() {
+    for tool in [Tool::Brush, Tool::Pencil, Tool::Eraser, Tool::Gradient, Tool::Rectangle, Tool::Pen, Tool::Type, Tool::Move] {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 64, "height": 64})).unwrap();
+        app.strict_background_lock = true;
+        app.ui.tool = tool;
+        app.ui.tool_options.gradient_classic = false;
+        app.sync_views();
+        let before = steps(&app);
+        stroke(&mut app);
+        let msg = alerts(&app);
+        assert_eq!(msg.len(), 1, "{tool:?}: expected background lock alert dialog, got {msg:?}");
+        assert!(msg[0].contains("because the layer is locked."), "{tool:?}: {msg:?}");
+        assert_eq!(steps(&app), before, "{tool:?}: background layer must not modify history");
+    }
+}

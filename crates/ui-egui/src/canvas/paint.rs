@@ -600,63 +600,6 @@ pub(super) fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter
     if let Some(r) = marquee {
         draw_marquee_readout(app, painter.ctx(), xf.to_screen(last[0] as f32, last[1] as f32), size_readout(app, r));
     }
-    if let Some((sample, pred_screen_pos)) = app.stylus.feed.predicted() {
-        if (d.tool.is_brushlike() || strokes_live(d.tool)) && !d.erase && d.tool != Tool::Eraser {
-            let last_screen = xf.to_screen(last[0] as f32, last[1] as f32);
-            let brush = &app.session.tools.brush;
-            let strength = brush.smoothing.stabilization.max(brush.smoothing.streamline);
-            let pred_pos = if strength > 0.0 {
-                let dx = (pred_screen_pos.x - last_screen.x) as f64;
-                let dy = (pred_screen_pos.y - last_screen.y) as f64;
-                let len = (dx * dx + dy * dy).sqrt();
-                if len > 1e-4 {
-                    let mut dir = if d.points.len() >= 2 {
-                        let p2 = d.points[d.points.len() - 1];
-                        let p1 = d.points[d.points.len() - 2];
-                        let s2 = xf.to_screen(p2[0] as f32, p2[1] as f32);
-                        let s1 = xf.to_screen(p1[0] as f32, p1[1] as f32);
-                        let ddx = (s2.x - s1.x) as f64;
-                        let ddy = (s2.y - s1.y) as f64;
-                        let slen = (ddx * ddx + ddy * ddy).sqrt();
-                        if slen > 1e-4 { Some([ddx / slen, ddy / slen]) } else { None }
-                    } else {
-                        None
-                    };
-                    let pt = photocraft_paint::StrokePoint::new(pred_screen_pos.x as f64, pred_screen_pos.y as f64, sample.pressure);
-                    let last_pt = photocraft_paint::StrokePoint::new(last_screen.x as f64, last_screen.y as f64, sample.pressure);
-                    let damped = photocraft_paint::apply_directional_damping(pt, last_pt, &mut dir, strength);
-                    egui::pos2(damped.x as f32, damped.y as f32)
-                } else {
-                    pred_screen_pos
-                }
-            } else {
-                pred_screen_pos
-            };
-            let dist = (pred_pos - last_screen).length();
-            if dist > 0.5 && dist < 400.0 {
-                let size_factor = if brush.shape_dynamics.size.is_active() || brush.pressure_size {
-                    photocraft_paint::DynamicsLut::eval_pressure_size(brush, sample.pressure)
-                } else {
-                    1.0
-                };
-                let opacity_factor = if brush.transfer.opacity.is_active() || brush.pressure_opacity {
-                    photocraft_paint::DynamicsLut::eval_pressure_opacity(brush, sample.pressure)
-                } else {
-                    1.0
-                };
-                let fg = app.session.tools.foreground;
-                let stroke_col = egui::Color32::from_rgba_unmultiplied(
-                    (fg[0] * 255.0).clamp(0.0, 255.0) as u8,
-                    (fg[1] * 255.0).clamp(0.0, 255.0) as u8,
-                    (fg[2] * 255.0).clamp(0.0, 255.0) as u8,
-                    ((fg[3] * 255.0) * (brush.opacity * opacity_factor).clamp(0.05, 1.0)).clamp(0.0, 255.0) as u8,
-                );
-                let brush_radius = (app.session.tools.brush.size * xf.zoom / 2.0).max(1.0);
-                let line_width = (brush_radius * 2.0 * size_factor).clamp(1.0, (brush_radius * 2.0).max(1.0));
-                painter.line_segment([last_screen, pred_pos], egui::Stroke::new(line_width, stroke_col));
-            }
-        }
-    }
     match d.tool {
         // The canvas shows the live stroke itself (`LiveStroke`); a stroke that couldn't start one
         // (Sample All Layers, say) keeps the trail.

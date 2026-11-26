@@ -508,7 +508,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         tapKey(eraserOn ? 0x08 : 0x05)
     }
 
-    /// Squeeze on the Pencil Pro: opens the floating arc tool menu (or toggles brush options if active tool is brush-like).
+    /// Squeeze on the Pencil Pro: always opens the floating arc tool menu across all tools (including brush and eraser).
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
         guard squeeze.phase == .ended, let h = handle else { return }
         pcLog("pencil: squeeze")
@@ -518,13 +518,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             pc_close_brush_picker(h)
             return
         }
+        pc_close_brush_picker(h)
         let loc = (lastHover != .zero) ? lastHover : CGPoint(x: bounds.midX, y: bounds.midY)
-        let optionsLoc = CGPoint(x: loc.x, y: max(80, loc.y - 120))
-        let brushMenuResult = pc_show_brush_options(h, Float(optionsLoc.x), Float(optionsLoc.y))
-        if brushMenuResult != 0 {
-            // Active tool is a brush/pencil/eraser/etc. - toggled brush options menu, do NOT open arc menu.
-            return
-        }
         let palette = SqueezePaletteView(centerAt: loc, in: self) { [weak self] toolId in
             guard let self = self, let h = self.handle else { return }
             toolId.withCString { pc_select_tool(h, $0) }
@@ -606,9 +601,10 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         // Hovering is how the Pencil is noticed before it touches: never filter it out.
         if g is UIHoverGestureRecognizer { return true }
         if g is UILongPressGestureRecognizer {
+            guard let h = handle else { return false }
             let p = touch.location(in: self)
-            // Long press context menu is strictly for canvas; never intercept panel/dock/toolbar touches
-            let onCanvas = p.x > 80 && p.x < (bounds.width - 320) && p.y > 50
+            // Long press context menu is strictly for canvas; query real canvas rect instead of hardcoded panels.
+            let onCanvas = pc_on_canvas(h, Float(p.x), Float(p.y)) != 0
             return onCanvas && !(touch.type == .direct && pencilNear)
         }
         if touch.type == .pencil { return false }
@@ -947,16 +943,15 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         fingerTouch = nil
     }
 
-    /// Adds a Pencil sample. It is sent immediately without artificial delay.
+    /// Adds a Pencil sample. Always keeps sub-0.5 pt duplicate rejection and calibrated pressure wait.
     private func queuePen(_ touch: UITouch, phase: Int32, event: UIEvent?, mods: UInt32) {
         if phase == 0 {
             lastQueuedLocation = touch.preciseLocation(in: self)
         }
         var samples: [UITouch] = [touch]
         if phase == 1, let more = event?.coalescedTouches(for: touch), !more.isEmpty { samples = more }
-        let zoom = handle != nil ? Double(pc_canvas_zoom(handle)) : 1.0
-        // Canvas-space aware sample rejection: 0.5 pt at 1.0x, scaling down with zoom to preserve sub-pixel detail
-        let minScreenDist = min(0.5, 0.5 * max(zoom, 0.01))
+        // Always enforce sub-0.5 pt duplicate rejection in screen points even when smoothing == 0.
+        let minScreenDist = 0.5
         for c in samples {
             let loc = c.preciseLocation(in: self)
             if phase == 1, let prev = lastQueuedLocation {
@@ -990,7 +985,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if phase != 1 {
             lastQueuedLocation = nil
         }
-        flushPen(all: phase != 0)
+        flushPen(all: phase >= 2)
     }
 
     /// iPadOS refines the Pencil's pressure a few milliseconds after the touch. Matching the
@@ -1035,7 +1030,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 }
                 break
             }
-            if item.ready || all || now - item.time > 0.004 {
+            if item.ready || all || now - item.time > 0.008 {
                 penQueueHead += 1
                 sendPen(item)
             } else {
@@ -1061,6 +1056,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     /// The last few real samples. Each new sample lets the curve between the two before it be drawn smoothly.
     private var fit: [PenPoint] = []
+    private var lastValidDir: (Double, Double)? = nil
     private var statSum = 0.0
     private var statMax = 0.0
     private var statCount = 0
@@ -1069,11 +1065,18 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         guard handle != nil else { return }
         // The Pencil's normalized force (0.0009765625 to 1.0)
         var pressure = Float(max(0.0009765625, min(1.0, item.force)))
-        // Responsive exponential moving average (alpha = 0.4)
-        if item.phase == 0 { smoothedPressure = pressure } else { smoothedPressure = smoothedPressure * 0.6 + pressure * 0.4 }
+        let prevSmoothed = smoothedPressure
+        // Baseline EMA pressure filter (alpha = 0.4), always active even when smoothing == 0.
+        if item.phase == 0 {
+            smoothedPressure = pressure
+        } else {
+            let candidate = smoothedPressure * 0.6 + pressure * 0.4
+            // Monotonic lift-off decay: touchesEnded force spikes can never exceed prior smoothed pressure.
+            smoothedPressure = item.phase >= 2 ? min(candidate, prevSmoothed) : candidate
+        }
         pressure = max(0.0009765625, min(1.0, smoothedPressure))
         let (tx, ty) = self.tilt(altitude: Double(item.altitude), azimuth: item.azimuth)
-        let point = PenPoint(x: Double(item.location.x), y: Double(item.location.y), pressure: pressure, tiltX: tx, tiltY: ty,
+        var point = PenPoint(x: Double(item.location.x), y: Double(item.location.y), pressure: pressure, tiltX: tx, tiltY: ty,
                              roll: Float(item.roll * 180 / CGFloat.pi))
 
         // How late the sample reaches the app, measured from the moment of the touch.
@@ -1089,8 +1092,25 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         switch item.phase {
         case 0:
             fit = [point]
+            lastValidDir = nil
             emitPen(point, phase: 0, mods: item.mods)
         case 1:
+            if let last = fit.last {
+                let dx = point.x - last.x, dy = point.y - last.y
+                let dist = (dx * dx + dy * dy).squareRoot()
+                if dist < 0.5 { return }
+                if dist >= 1.0 {
+                    let u = (dx / dist, dy / dist)
+                    if let prevU = lastValidDir {
+                        let bx = prevU.0 * 0.5 + u.0 * 0.5
+                        let by = prevU.1 * 0.5 + u.1 * 0.5
+                        let blen = (bx * bx + by * by).squareRoot()
+                        lastValidDir = blen > 1e-6 ? (bx / blen, by / blen) : u
+                    } else {
+                        lastValidDir = u
+                    }
+                }
+            }
             fit.append(point)
             if fit.count > 4 { fit.removeFirst() }
             // With a new sample in hand, the curve between the two samples before it is final.
@@ -1102,21 +1122,62 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 emitPen(p2, phase: 1, mods: item.mods)
             }
         default:
-            // The stroke ends: finish the curve up to the last sample, then lift.
-            fit.append(point)
-            if fit.count > 4 { fit.removeFirst() }
-            let n = fit.count
-            if n >= 3 {
-                let p0 = n >= 4 ? fit[n - 4] : nil
-                emitSegment(p0, fit[n - 3], fit[n - 2], fit[n - 1], mods: item.mods)
-                emitPen(fit[n - 2], phase: 1, mods: item.mods)
+            // Lift-off: discard noisy micro-hooks (< 1.0 pt or sharp reversal over tiny span),
+            // clamp pressure monotonically, and gently taper off along the last valid exit tangent.
+            var hookDiscarded = false
+            if let prev = fit.last {
+                let dx = point.x - prev.x, dy = point.y - prev.y
+                let dist = (dx * dx + dy * dy).squareRoot()
+                let sharpReversal = dist > 1e-6 && dist < 8.0 && (lastValidDir.map { ($0.0 * (dx / dist) + $0.1 * (dy / dist)) < 0.2 } ?? false)
+                if dist < 1.0 || sharpReversal {
+                    point.x = prev.x
+                    point.y = prev.y
+                    hookDiscarded = true
+                } else {
+                    lastValidDir = (dx / dist, dy / dist)
+                }
             }
-            if n >= 2 {
-                let p0 = n >= 3 ? fit[n - 3] : nil
-                emitSegment(p0, fit[n - 2], fit[n - 1], nil, mods: item.mods)
+            if hookDiscarded {
+                if fit.count >= 2 {
+                    let n = fit.count
+                    let p0 = n >= 3 ? fit[n - 3] : nil
+                    emitSegment(p0, fit[n - 2], fit[n - 1], nil, mods: item.mods)
+                    emitPen(fit[n - 1], phase: 1, mods: item.mods)
+                }
+            } else {
+                fit.append(point)
+                if fit.count > 4 { fit.removeFirst() }
+                let n = fit.count
+                if n >= 3 {
+                    let p0 = n >= 4 ? fit[n - 4] : nil
+                    emitSegment(p0, fit[n - 3], fit[n - 2], fit[n - 1], mods: item.mods)
+                    emitPen(fit[n - 2], phase: 1, mods: item.mods)
+                }
+                if n >= 2 {
+                    let p0 = n >= 3 ? fit[n - 3] : nil
+                    emitSegment(p0, fit[n - 2], fit[n - 1], nil, mods: item.mods)
+                }
             }
-            emitPen(point, phase: item.phase, mods: item.mods)
+            // Smooth exit-tangent lift-off taper when the stroke moved enough to establish a tangent.
+            if let dir = lastValidDir, fit.count >= 2 {
+                let tailSpan = 4.0
+                for step in 1...2 {
+                    let frac = Double(step) / 2.0
+                    let decay: Float = step == 1 ? 0.55 : 0.15
+                    let tp = PenPoint(
+                        x: point.x + dir.0 * (tailSpan * frac),
+                        y: point.y + dir.1 * (tailSpan * frac),
+                        pressure: max(0.0009765625, point.pressure * decay),
+                        tiltX: point.tiltX,
+                        tiltY: point.tiltY,
+                        roll: point.roll)
+                    emitPen(tp, phase: step == 2 ? item.phase : 1, mods: item.mods)
+                }
+            } else {
+                emitPen(point, phase: item.phase, mods: item.mods)
+            }
             fit.removeAll()
+            lastValidDir = nil
         }
     }
 

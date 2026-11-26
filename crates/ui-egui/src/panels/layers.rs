@@ -654,12 +654,12 @@ pub(crate) fn render_layer_popover(
     let ease_out = 1.0 - (1.0 - t) * (1.0 - t);
     let alpha = ease_out;
 
-    let popover_w = 210.0_f32;
+    let popover_w = 248.0_f32;
     let target_x = (panel_left - popover_w - 8.0).max(8.0);
     let row_cy = popover.row_rect.center().y;
     let screen_h = ctx.input(|i| i.viewport_rect()).height();
-    let est_h = 320.0_f32;
-    let target_y = (row_cy - est_h / 2.0).clamp(32.0, (screen_h - est_h - 16.0).max(32.0));
+    let est_h = 460.0_f32;
+    let target_y = (row_cy - est_h / 2.0).clamp(24.0, (screen_h - est_h - 16.0).max(24.0));
     let popover_pos = pos2(target_x, target_y);
 
     let popover_area = egui::Area::new(egui::Id::unique("layer-context-popover"))
@@ -671,37 +671,39 @@ pub(crate) fn render_layer_popover(
 
     popover_area.show(ctx, |ui| {
         let frame = egui::Frame::NONE
-            .fill(egui::Color32::from_rgba_unmultiplied(22, 25, 32, (246.0 * alpha) as u8))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (32.0 * alpha) as u8)))
-            .corner_radius(13.0)
-            .inner_margin(egui::Margin::symmetric(8, 8));
+            .fill(egui::Color32::from_rgba_unmultiplied(32, 33, 36, (248.0 * alpha) as u8))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (26.0 * alpha) as u8)))
+            .corner_radius(12.0)
+            .inner_margin(egui::Margin::symmetric(0, 6));
 
         let resp = frame.show(ui, |ui| {
             ui.set_width(popover_w);
             let mut multi = s.selected_layers().len() > 1 && s.selected_layers().contains(&l.id);
-            if let Some(swipe_list) = ctx.data(|d| d.get_temp::<Vec<u64>>(crate::layer_row_ui::swipe_select_key())) {
-                if swipe_list.len() > 1 && swipe_list.contains(&l.id.0) {
-                    multi = true;
-                }
+            if let Some(swipe_list) = ctx.data(|d| d.get_temp::<Vec<u64>>(crate::layer_row_ui::swipe_select_key()))
+                && swipe_list.len() > 1
+                && swipe_list.contains(&l.id.0)
+            {
+                multi = true;
             }
-            if crate::layer_menu_ui::show(app, ui, l, multi, actions) {
+            if crate::layer_menu_ui::show_affinity_popover(app, ui, l, multi, actions) {
                 if let Some(action) = crate::layer_row_ui::start_rename(ctx, l.id.0, &l.name) {
                     actions.push(action);
                 }
+                closed = true;
             }
         });
 
         // Layered subtle drop shadow
         let painter = ui.painter();
-        painter.rect_filled(resp.response.rect.translate(vec2(0.0, 5.0)).expand(4.0), 15.0, egui::Color32::from_black_alpha((50.0 * alpha) as u8));
+        painter.rect_filled(resp.response.rect.translate(vec2(0.0, 6.0)).expand(5.0), 14.0, egui::Color32::from_black_alpha((55.0 * alpha) as u8));
 
         // Tap outside to dismiss
-        if elapsed > 0.08 && ctx.input(|i| i.pointer.any_pressed()) {
-            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos())) {
-                if !resp.response.rect.contains(pos) {
-                    closed = true;
-                }
-            }
+        if elapsed > 0.08
+            && ctx.input(|i| i.pointer.any_pressed())
+            && let Some(pos) = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()))
+            && !resp.response.rect.contains(pos)
+        {
+            closed = true;
         }
     });
 

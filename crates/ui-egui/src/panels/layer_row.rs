@@ -249,7 +249,19 @@ pub(super) fn layer_row(
     let snap_offset = crate::layer_row_ui::row_swipe_offset(ctx, l.id.0);
     let shift_x = live_nudge + snap_offset;
     let draw_rect = rect.translate(vec2(shift_x, 0.0));
-    let painter = ui.painter_at(draw_rect.expand(1.0));
+    if shift_x.abs() > 0.5 {
+        let track = ui.painter_at(rect);
+        track.rect_filled(rect, 0.0, Color32::from_rgb(18, 19, 23));
+        if shift_x < -1.5 {
+            let slot = Rect::from_min_max(pos2((rect.right() + shift_x).max(rect.left()), rect.top()), rect.right_bottom());
+            track.rect_filled(slot, 0.0, Color32::from_rgb(42, 46, 56));
+        } else if shift_x > 1.5 {
+            let slot = Rect::from_min_max(rect.left_top(), pos2((rect.left() + shift_x).min(rect.right()), rect.bottom()));
+            track.rect_filled(slot, 0.0, Color32::from_rgba_unmultiplied(28, 120, 242, 72));
+        }
+    }
+    let clip_rect = if shift_x.abs() > 0.5 { rect.intersect(draw_rect).expand(1.0) } else { draw_rect.expand(1.0) };
+    let painter = ui.painter_at(clip_rect);
     let is_hovered = resp.hovered() || app.canvas_hover_layer == Some(l.id);
     if resp.hovered() {
         app.hover_layer = Some(l.id);
@@ -257,7 +269,7 @@ pub(super) fn layer_row(
     let is_swipe_sel = ctx.data(|d| d.get_temp::<Vec<u64>>(crate::layer_row_ui::swipe_select_key())).is_some_and(|s| s.contains(&l.id.0));
     let is_blue = selected || is_swipe_sel;
     let blue_fade = ctx.animate_bool_with_time(egui::Id::unique(("layer-blue-fade", l.id.0)), is_blue, 0.20);
-    paint_row_background(&painter, &t, l, draw_rect, is_blue, row.multi || is_swipe_sel, is_hovered, blue_fade);
+    paint_row_background(&painter, &t, l, draw_rect, is_blue, is_hovered, blue_fade);
     if ctx.data(|d| d.get_temp::<u64>(egui::Id::unique("layer-drag"))).is_some_and(|id| id == l.id.0) {
         painter.rect_filled(draw_rect, if t.pro { 0.0 } else { t.radius }, Color32::from_rgba_unmultiplied(0, 0, 0, 110));
     }
@@ -377,7 +389,7 @@ fn eye_cell(rect: Rect) -> Rect {
 }
 
 /// The row's fill (selection / hover), the label colour behind the eye column and the pro dividers.
-fn paint_row_background(painter: &egui::Painter, t: &Tokens, l: &Layer, rect: Rect, selected: bool, _multi: bool, is_hovered: bool, blue_fade: f32) {
+fn paint_row_background(painter: &egui::Painter, t: &Tokens, l: &Layer, rect: Rect, selected: bool, is_hovered: bool, blue_fade: f32) {
     let radius = if t.pro { 0.0 } else { t.radius };
     let blue = Color32::from_rgb(28, 120, 242);
     if blue_fade > 0.001 {
@@ -648,6 +660,10 @@ fn row_context_menu(app: &mut PhotocraftApp, ui: &mut egui::Ui, rc: &RowCtx<'_>,
         // Long-touched on row body is reserved strictly for layer pickup/reorder, not context menu
         if resp.long_touched() && !on_mask && !on_thumb && !resp.secondary_clicked() && !force_open {
             ctx.data_mut(|d| d.insert_temp(egui::Id::unique("layer-drag"), l.id.0));
+            return;
+        }
+        if app.strict_background_lock && !on_mask && !on_thumb && resp.secondary_clicked() {
+            crate::layer_row_ui::open_layer_popover(ctx, l.id.0, rc.rect);
             return;
         }
         resp.context_menu(|ui| {

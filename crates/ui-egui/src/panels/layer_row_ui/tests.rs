@@ -829,3 +829,32 @@ fn a_masked_artboards_thumbnail_retargets_it_and_ends_the_mask_view() {
     assert!(!h.state().ui.mask_target, "the board is targeted again");
     assert!(!viewing(&h), "and the mask view ends");
 }
+
+#[test]
+fn row_swipe_offset_animates_both_left_and_right_spring_ease_out() {
+    let ctx = egui::Context::default();
+    let step = |t: f64| {
+        let raw = egui::RawInput { time: Some(t), ..Default::default() };
+        ctx.begin_pass(raw);
+    };
+
+    // Start both a left swipe (-40 pt) and a right swipe (+44 pt) at t = 1.0s.
+    step(1.0);
+    super::trigger_row_snap_back(&ctx, 10, -40.0);
+    super::trigger_row_snap_back(&ctx, 20, 44.0);
+    ctx.end_pass().textures_delta.clear();
+
+    // Midway (elapsed = 0.11s -> progress = 0.5, factor = 0.125): preserves sign and eases smoothly.
+    step(1.11);
+    let left_mid = super::row_swipe_offset(&ctx, 10);
+    let right_mid = super::row_swipe_offset(&ctx, 20);
+    ctx.end_pass().textures_delta.clear();
+    assert!((left_mid + 5.0).abs() < 0.05, "left swipe should ease smoothly at midpoint: {left_mid}");
+    assert!((right_mid - 5.5).abs() < 0.05, "right swipe should ease smoothly at midpoint: {right_mid}");
+
+    // Past duration (>= 0.22s): settles cleanly to 0.0.
+    step(1.30);
+    assert_eq!(super::row_swipe_offset(&ctx, 10), 0.0);
+    assert_eq!(super::row_swipe_offset(&ctx, 20), 0.0);
+    ctx.end_pass().textures_delta.clear();
+}

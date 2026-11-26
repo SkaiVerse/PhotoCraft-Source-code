@@ -193,6 +193,19 @@ fn filter_event_before_tool(
     if alt_eyedropper(app, ev, mods) {
         return None;
     }
+    // Block canvas editing/creation tools (including live Gradient, Crop, Frame, Shapes, Pen, Type)
+    // when pressed on a locked or Background layer before pre-tool overlays capture the press.
+    let pre_tool = event_tool(app, mods);
+    let sets_source = matches!(pre_tool, Tool::CloneStamp | Tool::Healing) && mods.alt;
+    if app.strict_background_lock && matches!(raw, ToolEvent::Down { .. }) && pre_tool != Tool::Move && !sets_source {
+        let hidden = hidden_target(app, pre_tool);
+        if hidden.is_none()
+            && let Some(message) = crate::brush_refusal::locked_or_background_alert(app, pre_tool)
+        {
+            crate::brush_refusal::prompt(app, &message);
+            return None;
+        }
+    }
     // Move tool: ⇧ locks the axis, ⌥ duplicates (move_mods.rs).
     let ev = crate::move_mods::filter_event(app, ev, mods);
     // A live shape's corner radius widgets (Path Selection, the shape tools, Move with its
@@ -301,6 +314,18 @@ fn handle_move_pointer(app: &mut PhotocraftApp, raw: ToolEvent, ev: ToolEvent, t
                 app.ui.status = "Move and transforms on several color channels are not implemented yet".into();
                 return true;
             }
+            if app.strict_background_lock {
+                if let Some(message) = crate::brush_refusal::locked_or_background_alert(app, tool) {
+                    app.move_blocked = false;
+                    crate::brush_refusal::prompt(app, &message);
+                    return true;
+                }
+                if crate::move_lock::blocked(app, tool, [x, y], mods) {
+                    app.move_blocked = false;
+                    crate::move_lock::prompt(app);
+                    return true;
+                }
+            }
             // Auto-Select (or ⌘-click while it is off) picks the layer under the pointer first
             // (not when the selected pixels move: those are the active layer's).
             if !crate::move_ui::moves_selected_pixels_with(app, tool) && app.ui.tool_options.move_auto_select != mods.command {
@@ -321,8 +346,15 @@ fn handle_move_pointer(app: &mut PhotocraftApp, raw: ToolEvent, ev: ToolEvent, t
                         if !empty {
                             // Pressing locked selected pixels still uses the existing move-lock
                             // handler. Otherwise a locked-only hit can start a marquee (#4058).
-                            if inside_selection(app, [x, y]) && crate::move_lock::blocked(app, tool, [x, y], mods) {
-                                app.move_blocked = true;
+                            if app.strict_background_lock
+                                || (inside_selection(app, [x, y]) && crate::move_lock::blocked(app, tool, [x, y], mods))
+                            {
+                                if app.strict_background_lock {
+                                    app.move_blocked = false;
+                                    crate::move_lock::prompt(app);
+                                } else {
+                                    app.move_blocked = true;
+                                }
                                 return true;
                             }
                             // Shift preserves the base selection for its additive marquee.
@@ -357,8 +389,14 @@ fn handle_move_pointer(app: &mut PhotocraftApp, raw: ToolEvent, ev: ToolEvent, t
                 }
             }
             // A locked layer: no drag, and Photoshop's message once the pointer moves (`move_lock`).
+            // Under strict Background/lock enforcement (iPad), show the warning immediately on press.
             if crate::move_lock::blocked(app, tool, [x, y], mods) {
-                app.move_blocked = true;
+                if app.strict_background_lock {
+                    app.move_blocked = false;
+                    crate::move_lock::prompt(app);
+                } else {
+                    app.move_blocked = true;
+                }
                 return true;
             }
             // With a selection: cut the selected pixels (⌥ copies them) and drag them as a floating
@@ -522,7 +560,12 @@ pub(super) fn tool_event_with_view(app: &mut PhotocraftApp, ev: ToolEvent, mods:
     // tool below, once Auto-Select has picked the layer.
     match ev {
         ToolEvent::Down { x, y, .. } if tool != Tool::Move && app.ui.transform.is_none() && crate::move_lock::blocked(app, tool, [x, y], mods) => {
-            app.move_blocked = true;
+            if app.strict_background_lock {
+                app.move_blocked = false;
+                crate::move_lock::prompt(app);
+            } else {
+                app.move_blocked = true;
+            }
             return;
         }
         ToolEvent::Move { .. } if app.move_blocked => {
@@ -847,6 +890,10 @@ fn press_refused(app: &mut PhotocraftApp, tool: Tool) -> bool {
             app.ui.status = why.into();
             app.ui.status_error = true;
         }
+        return true;
+    }
+    if let Some(message) = crate::brush_refusal::locked_or_background_alert(app, tool) {
+        crate::brush_refusal::prompt(app, &message);
         return true;
     }
     false
