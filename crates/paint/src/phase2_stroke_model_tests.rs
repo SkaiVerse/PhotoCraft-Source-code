@@ -7,10 +7,8 @@
 use crate::brush::{BrushSettings, Control, Dynamic, Scattering, ShapeDynamics, Smoothing, Transfer};
 use crate::curve::ResponseCurve;
 use crate::dynamics::{
-    DynamicsLut, apply_directional_damping, apply_retroactive_liftoff_taper,
-    calibrate_stylus_pressure, filter_circular_angle, filter_perpendicular_motion,
+    DynamicsLut, apply_directional_damping, calibrate_stylus_pressure, filter_circular_angle,
 };
-use crate::Dab;
 use crate::StrokePoint;
 
 #[test]
@@ -403,58 +401,6 @@ fn test_damped_circular_angle_filter_wrap_around() {
 
     // Non-circular naive lerp would have produced: 3.10 + 0.5 * (-3.10 - 3.10) = 0.0 (wrong 180-deg reversal!)
     assert!(filtered.abs() > 3.0, "Angle should not glitch or reverse to 0.0");
-}
-
-#[test]
-fn test_perpendicular_motion_filtering_without_corner_collapse() {
-    let p_prev = StrokePoint::new(10.0, 0.0, 1.0);
-    let mut dir = Some([1.0, 0.0]); // stroke traveling along +x
-
-    // 1. Hand wobble perpendicular to travel vector (+y jitter)
-    let p_wobble = StrokePoint::new(20.0, 4.0, 1.0);
-    let filtered_wobble = filter_perpendicular_motion(p_wobble, p_prev, &mut dir, 1.0);
-    assert!(filtered_wobble.y < 4.0, "Perpendicular jitter should be damped, got {}", filtered_wobble.y);
-
-    // 2. Sharp 90-degree corner: from (10, 0) straight up along +y to (10, 10)
-    let mut corner_dir = Some([1.0, 0.0]);
-    let p_corner = StrokePoint::new(10.0, 10.0, 1.0);
-    let filtered_corner = filter_perpendicular_motion(p_corner, p_prev, &mut corner_dir, 1.0);
-    // Because dot product is 0.0 (< 0.3), corner-collapse protection triggers: full responsiveness
-    assert!((filtered_corner.x - 10.0).abs() < 1e-4, "Corner apex x must be preserved without collapse, got {}", filtered_corner.x);
-    assert!((filtered_corner.y - 10.0).abs() < 1e-4, "Corner apex y must be preserved without collapse, got {}", filtered_corner.y);
-}
-
-#[test]
-fn test_retroactive_liftoff_taper_generation() {
-    // Simulate a fast flick stroke ending: 4 dabs with constant radius 10.0 and opacity 1.0
-    let mut dabs = vec![
-        Dab::round(photocraft_geom::Point::new(10.0, 0.0), 10.0, 1.0),
-        Dab::round(photocraft_geom::Point::new(20.0, 0.0), 10.0, 1.0),
-        Dab::round(photocraft_geom::Point::new(30.0, 0.0), 10.0, 1.0),
-        Dab::round(photocraft_geom::Point::new(40.0, 0.0), 10.0, 1.0),
-    ];
-
-    // High exit velocity (> 40.0) points
-    let recent = [
-        StrokePoint::new(0.0, 0.0, 0.8),
-        StrokePoint::new(10.0, 0.0, 0.7),
-        StrokePoint::new(20.0, 0.0, 0.6),
-        StrokePoint::new(30.0, 0.0, 0.4),
-        StrokePoint::new(50.0, 0.0, 0.2), // distance 20 in 1 step = high velocity
-    ];
-
-    apply_retroactive_liftoff_taper(&mut dabs, &recent);
-
-    // Tip dab should be tapered down to sharp tip (scale ~ 0.15)
-    let tip = dabs.last().unwrap();
-    assert!(tip.radius < 2.0, "Tip dab radius should taper down to a sharp point, got {}", tip.radius);
-    assert!(tip.opacity < 0.20, "Tip dab opacity should taper down smoothly, got {}", tip.opacity);
-
-    // Radius and opacity should taper monotonically towards the tip
-    for i in 1..dabs.len() {
-        assert!(dabs[i].radius <= dabs[i - 1].radius, "Radius should decrease towards tip: dab {} ({}) vs dab {} ({})", i - 1, dabs[i-1].radius, i, dabs[i].radius);
-        assert!(dabs[i].opacity <= dabs[i - 1].opacity, "Opacity should decrease towards tip: dab {} ({}) vs dab {} ({})", i - 1, dabs[i-1].opacity, i, dabs[i].opacity);
-    }
 }
 
 #[test]

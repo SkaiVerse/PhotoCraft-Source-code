@@ -554,7 +554,8 @@ struct Host {
     inbox: Inbox,
     feed: StylusFeed,
     pen_down: bool,
-    pen_ema_pressure: Option<f32>,
+    pressure_filter: photocraft_paint::PressureFilter,
+    touch_recorder: photocraft_paint::TouchRecorder,
     wants_keyboard: bool,
     /// The Pencil force that counts as full pressure (1.0 is an average touch). Lower is softer.
     pressure_divisor: f32,
@@ -744,7 +745,8 @@ impl Host {
             inbox,
             feed,
             pen_down: false,
-            pen_ema_pressure: None,
+            pressure_filter: photocraft_paint::PressureFilter::new(),
+            touch_recorder: photocraft_paint::TouchRecorder::new(),
             wants_keyboard: false,
             touch: TouchUi::default(),
             hw: egui::Modifiers::NONE,
@@ -1489,8 +1491,9 @@ pub unsafe extern "C" fn pc_pointer_button(h: *mut c_void, x: f32, y: f32, butto
 
 /// Apple Pencil touching the screen. phase: 0 touches down, 1 moves, 2 lifts, 3 is cancelled.
 /// Pressure is 0 to 1; tilt is in degrees (W3C style, like a browser's pen events); rotation is
-/// the barrel roll in degrees. On the picture the Pencil draws at once; on a panel or menu it
-/// taps, drags sliders and scrolls lists.
+/// the barrel roll in degrees; `timestamp` is real hardware `UITouch.timestamp` in monotonic seconds.
+/// On the picture the Pencil draws at once; on a panel or menu it taps, drags sliders and scrolls lists.
+#[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_pen(
     h: *mut c_void,
@@ -1502,38 +1505,26 @@ pub unsafe extern "C" fn pc_pen(
     tilt_y: f32,
     rotation: f32,
     mods: u32,
+    timestamp: f64,
 ) {
     if let Some(h) = unsafe { host(h) } {
         h.set_modifiers(to_mods(mods));
         let pos = h.pt(x, y);
         let m = h.modifiers;
-        // The shell sends the Pencil's normalized force (0.0009765625 to 1.0); full pressure is reached
-        // at `pressure_divisor`. Calibrate first, then filter with a baseline EMA (even at smoothing == 0)
-        // so concave curve amplification never turns light-touch force ripple into dark stroke dots.
-        let raw_p = (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0);
-        let calibrated = photocraft_paint::calibrate_stylus_pressure(raw_p).clamp(0.0009765625, 1.0);
+        // Single calibration + lightweight EMA in the entire live stroke pipeline.
         let filtered_p = match phase {
             0 => {
                 if h.on_canvas(x, y) {
-                    h.pen_ema_pressure = Some(calibrated);
+                    h.pressure_filter.begin(pressure, h.pressure_divisor)
+                } else {
+                    let norm = (pressure / h.pressure_divisor.max(0.01)).clamp(photocraft_paint::PressureFilter::MIN_PRESSURE, 1.0);
+                    photocraft_paint::calibrate_stylus_pressure(norm).clamp(photocraft_paint::PressureFilter::MIN_PRESSURE, 1.0)
                 }
-                calibrated
             }
-            1 => {
-                let p = match h.pen_ema_pressure {
-                    Some(prev) => (prev * 0.55 + calibrated * 0.45).clamp(0.0009765625, 1.0),
-                    None => calibrated,
-                };
-                if h.pen_down {
-                    h.pen_ema_pressure = Some(p);
-                }
-                p
-            }
-            _ => match h.pen_ema_pressure.take() {
-                Some(prev) => (prev * 0.55 + calibrated * 0.45).min(prev).clamp(0.0009765625, 1.0),
-                None => calibrated,
-            },
+            1 => h.pressure_filter.push_move(pressure, h.pressure_divisor),
+            _ => h.pressure_filter.end_liftoff(pressure, h.pressure_divisor),
         };
+        let ts_s = (timestamp.is_finite() && timestamp > 0.0).then_some(timestamp);
         let sample = PenSample {
             pressure: filtered_p,
             tilt_x,
@@ -1555,7 +1546,7 @@ pub unsafe extern "C" fn pc_pen(
                     h.fast_stroke_active = false;
                     h.cached_prims = None;
                     h.cached_screen = None;
-                    h.feed.set(Some(sample));
+                    h.feed.set_with_timestamp(Some(sample), ts_s);
                     h.push(egui::Event::PointerMoved(pos));
                     h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
                     h.ctx.request_repaint();
@@ -1569,7 +1560,7 @@ pub unsafe extern "C" fn pc_pen(
             }
             1 => {
                 if h.pen_down {
-                    h.feed.set(Some(sample));
+                    h.feed.set_with_timestamp(Some(sample), ts_s);
                     h.push(egui::Event::PointerMoved(pos));
                     h.ctx.request_repaint();
                 } else if h.gesture.is_some_and(|g| g.pen) {
@@ -1587,7 +1578,7 @@ pub unsafe extern "C" fn pc_pen(
                     h.pen_down = false;
                     // Push the final clamped lift-off sample before PointerMoved so Stylus::frame
                     // retains it for the final move instead of falling back to 1.0 mouse pressure.
-                    h.feed.set(Some(sample));
+                    h.feed.set_with_timestamp(Some(sample), ts_s);
                     h.push(egui::Event::PointerMoved(pos));
                     h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
                     // The stroke's last samples keep their pressure; nothing is held after this.
@@ -1603,6 +1594,7 @@ pub unsafe extern "C" fn pc_pen(
 }
 
 /// Forward iPadOS predicted touch points for low-latency live preview without baking them into stroke history.
+#[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_pen_predicted(
     h: *mut c_void,
@@ -1612,13 +1604,14 @@ pub unsafe extern "C" fn pc_pen_predicted(
     tilt_x: f32,
     tilt_y: f32,
     rotation: f32,
+    _timestamp: f64,
 ) {
     if let Some(h) = unsafe { host(h) } {
         if h.pen_down || h.on_canvas(x, y) {
             let pos = h.pt(x, y);
-            let raw_p = (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0);
+            let raw_p = (pressure / h.pressure_divisor.max(0.01)).clamp(photocraft_paint::PressureFilter::MIN_PRESSURE, 1.0);
             let sample = PenSample {
-                pressure: photocraft_paint::calibrate_stylus_pressure(raw_p).clamp(0.0009765625, 1.0),
+                pressure: photocraft_paint::calibrate_stylus_pressure(raw_p).clamp(photocraft_paint::PressureFilter::MIN_PRESSURE, 1.0),
                 tilt_x,
                 tilt_y,
                 rotation: rotation.rem_euclid(360.0),
@@ -1648,13 +1641,7 @@ pub unsafe extern "C" fn pc_pen_update_estimate(
 ) {
     if let Some(h) = unsafe { host(h) } {
         if h.pen_down {
-            let raw_p = (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0);
-            let calibrated = photocraft_paint::calibrate_stylus_pressure(raw_p).clamp(0.0009765625, 1.0);
-            let filtered = match h.pen_ema_pressure {
-                Some(prev) => (prev * 0.60 + calibrated * 0.40).clamp(0.0009765625, 1.0),
-                None => calibrated,
-            };
-            h.pen_ema_pressure = Some(filtered);
+            let filtered = h.pressure_filter.update_estimate(pressure, h.pressure_divisor);
             let sample = PenSample {
                 pressure: filtered,
                 tilt_x,
@@ -1775,7 +1762,7 @@ pub unsafe extern "C" fn pc_long_press(h: *mut c_void, x: f32, y: f32) {
             // releasing Primary, and stage the Secondary click on the next frame so `track_right_press`
             // never sees Primary and Secondary down together.
             h.pen_down = false;
-            h.pen_ema_pressure = None;
+            h.pressure_filter.reset();
             h.quickshape_active = false;
             h.quickshape_kind = None;
             h.quickshape_raw.clear();
@@ -2248,4 +2235,58 @@ pub unsafe extern "C" fn pc_apply_magnetic_rotation(angle_deg: f32, detent_deg: 
         unsafe { *snapped = is_snap as c_int };
     }
     res
+}
+
+/// Enable or disable offline raw Apple Pencil touch-stream recording (off by default).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_touch_recorder_set_enabled(h: *mut c_void, enabled: c_int) {
+    if let Some(h) = unsafe { host(h) } {
+        h.touch_recorder.set_enabled(enabled != 0);
+        if enabled == 0 {
+            h.touch_recorder.clear();
+        }
+    }
+}
+
+/// Returns 1 when offline touch-stream recording is active, else 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_touch_recorder_is_enabled(h: *mut c_void) -> c_int {
+    match unsafe { host(h) } {
+        Some(h) => c_int::from(h.touch_recorder.is_enabled()),
+        None => 0,
+    }
+}
+
+/// Record one raw touch sample when the offline debug recorder is enabled (zero overhead when off).
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_touch_recorder_record(
+    h: *mut c_void,
+    x: f64,
+    y: f64,
+    force: f32,
+    max_force: f32,
+    is_force_estimated: c_int,
+    estimation_update_index: i64,
+    altitude: f32,
+    azimuth: f32,
+    timestamp: f64,
+    phase: u8,
+) {
+    if let Some(h) = unsafe { host(h) }
+        && h.touch_recorder.is_enabled()
+    {
+        h.touch_recorder.record(photocraft_paint::RawTouchRecord {
+            x,
+            y,
+            force,
+            max_force,
+            is_force_estimated: is_force_estimated != 0,
+            estimation_update_index: (estimation_update_index >= 0).then_some(estimation_update_index as u64),
+            altitude,
+            azimuth,
+            timestamp,
+            phase,
+        });
+    }
 }

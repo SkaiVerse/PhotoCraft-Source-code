@@ -35,6 +35,7 @@ pub mod retouch;
 pub mod rng;
 pub mod symmetry;
 pub mod tile;
+pub mod touch_stream;
 
 pub use brush::{
     BrushPreset, BrushSettings, ColorDynamics, Control, DualBrush, Dynamic, MAX_BRUSH_SIZE, MAX_SCATTER, MaskMode, Pattern, PatternStyle, Pose, PresetCaptures,
@@ -42,10 +43,10 @@ pub use brush::{
 };
 pub use curve::ResponseCurve;
 pub use dynamics::{
-    DynamicsLut, apply_directional_damping, apply_magnetic_rotation, apply_retroactive_liftoff_taper,
-    blend_wet_mix, calibrate_stylus_pressure, eval_height_map_grain,
-    filter_circular_angle, filter_perpendicular_motion,
+    DynamicsLut, PressureFilter, apply_directional_damping, apply_magnetic_rotation, blend_wet_mix, calibrate_stylus_pressure, eval_height_map_grain,
+    filter_circular_angle,
 };
+pub use touch_stream::{RawTouchRecord, TouchForceResolver, TouchRecorder};
 pub use mip_cache::{mip_cache_bytes, purge_mip_cache};
 pub use mixer::MixerSettings;
 pub use quickshape::{

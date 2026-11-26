@@ -106,6 +106,69 @@ pub fn calibrate_stylus_pressure(raw_force: f32) -> f32 {
     p_scaled.powf(0.60)
 }
 
+/// The single lightweight stylus pressure calibration + EMA filter in the live path.
+///
+/// Runs once per Pencil sample after unrefined/placeholder forces are resolved so light-touch
+/// force ripple is smoothed without stacking multiple EMAs across Swift and Rust.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PressureFilter {
+    prev: Option<f32>,
+}
+
+impl PressureFilter {
+    /// Minimum non-zero stylus pressure floor.
+    pub const MIN_PRESSURE: f32 = 0.0009765625;
+    /// Single lightweight EMA weight applied to each newly calibrated sample.
+    pub const EMA_ALPHA: f32 = 0.45;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        self.prev = None;
+    }
+
+    #[inline]
+    fn calibrate(raw_force: f32, divisor: f32) -> f32 {
+        let div = if divisor.is_finite() && divisor > 0.01 { divisor } else { 1.0 };
+        let norm = if raw_force.is_finite() { (raw_force / div).clamp(Self::MIN_PRESSURE, 1.0) } else { 0.5 };
+        calibrate_stylus_pressure(norm).clamp(Self::MIN_PRESSURE, 1.0)
+    }
+
+    /// Initialize on touch down without averaging against an earlier stroke.
+    pub fn begin(&mut self, raw_force: f32, divisor: f32) -> f32 {
+        let calibrated = Self::calibrate(raw_force, divisor);
+        self.prev = Some(calibrated);
+        calibrated
+    }
+
+    /// Filter a confirmed mid-stroke move sample.
+    pub fn push_move(&mut self, raw_force: f32, divisor: f32) -> f32 {
+        let calibrated = Self::calibrate(raw_force, divisor);
+        let filtered = match self.prev {
+            Some(prev) => (prev * (1.0 - Self::EMA_ALPHA) + calibrated * Self::EMA_ALPHA).clamp(Self::MIN_PRESSURE, 1.0),
+            None => calibrated,
+        };
+        self.prev = Some(filtered);
+        filtered
+    }
+
+    /// Incorporate an asynchronous force estimate update.
+    pub fn update_estimate(&mut self, raw_force: f32, divisor: f32) -> f32 {
+        self.push_move(raw_force, divisor)
+    }
+
+    /// Monotonic lift-off filter: lift pressure cannot spike above the prior filtered sample.
+    pub fn end_liftoff(&mut self, raw_force: f32, divisor: f32) -> f32 {
+        let calibrated = Self::calibrate(raw_force, divisor);
+        match self.prev.take() {
+            Some(prev) => (prev * (1.0 - Self::EMA_ALPHA) + calibrated * Self::EMA_ALPHA).min(prev).clamp(Self::MIN_PRESSURE, 1.0),
+            None => calibrated,
+        }
+    }
+}
+
 /// Damped circular angle filter with shortest-arc angular interpolation across [-pi, pi].
 /// `current`: current filtered angle in radians [-pi, pi].
 /// `target`: new target angle in radians [-pi, pi].
@@ -201,77 +264,6 @@ pub fn blend_wet_mix(
         (1.0 - effective_pickup) * brush_color[2] + effective_pickup * canvas_color[2],
         (1.0 - effective_pickup) * brush_color[3] + effective_pickup * canvas_color[3],
     ]
-}
-
-/// Perpendicular motion filtering: dampens hand wobble perpendicular to the travel vector
-/// without dragging the stroke behind the nib or shrinking tight loops / collapsing corners.
-pub fn filter_perpendicular_motion(
-    raw: StrokePoint,
-    prev: StrokePoint,
-    dir: &mut Option<[f64; 2]>,
-    strength: f32,
-) -> StrokePoint {
-    let s = (strength as f64).clamp(0.0, 1.0);
-    if s <= 0.0 {
-        return raw;
-    }
-    let dx = raw.x - prev.x;
-    let dy = raw.y - prev.y;
-    let dist = (dx * dx + dy * dy).sqrt();
-    if dist < 1e-6 {
-        return StrokePoint { x: prev.x, y: prev.y, ..raw };
-    }
-    let raw_u = [dx / dist, dy / dist];
-    let (damped_dx, damped_dy) = if let Some(u) = *dir {
-        let dot = raw_u[0] * u[0] + raw_u[1] * u[1]; // cosine of heading change
-        // Corner-collapse protection: when heading changes sharply (dot < 0.3),
-        // ease off damping so corner apexes and tight loops do not shrink or collapse.
-        let corner_factor = if dot < 0.3 {
-            (dot.max(0.0) / 0.3).powi(2)
-        } else {
-            1.0
-        };
-        let eff_s = s * corner_factor;
-        let alpha_par = 1.0 - 0.5 * eff_s;
-        let alpha_perp = 1.0 - 0.875 * eff_s;
-
-        let par_len = dx * u[0] + dy * u[1];
-        let par_x = par_len * u[0];
-        let par_y = par_len * u[1];
-        let perp_x = dx - par_x;
-        let perp_y = dy - par_y;
-        (par_x * alpha_par + perp_x * alpha_perp, par_y * alpha_par + perp_y * alpha_perp)
-    } else {
-        *dir = Some(raw_u);
-        (dx, dy)
-    };
-
-    let new_len = (damped_dx * damped_dx + damped_dy * damped_dy).sqrt();
-    if new_len > 1e-6 {
-        let new_u = [damped_dx / new_len, damped_dy / new_len];
-        *dir = Some(if let Some(u) = *dir {
-            let blend_x = u[0] * 0.75 + new_u[0] * 0.25;
-            let blend_y = u[1] * 0.75 + new_u[1] * 0.25;
-            let blen = (blend_x * blend_x + blend_y * blend_y).sqrt().max(1e-6);
-            [blend_x / blen, blend_y / blen]
-        } else {
-            new_u
-        });
-    }
-    let ff = (1.0 - 0.5 * s) as f32;
-    let dr = (raw.rotation - prev.rotation + 540.0).rem_euclid(360.0) - 180.0;
-    let raw_p = if raw.pressure.is_finite() { raw.pressure.clamp(0.0009765625, 1.0) } else { prev.pressure };
-    let new_p = (prev.pressure + (raw_p - prev.pressure) * ff).clamp(0.0009765625, 1.0);
-    StrokePoint {
-        x: prev.x + damped_dx,
-        y: prev.y + damped_dy,
-        pressure: new_p,
-        tilt_x: prev.tilt_x + (raw.tilt_x - prev.tilt_x) * ff,
-        tilt_y: prev.tilt_y + (raw.tilt_y - prev.tilt_y) * ff,
-        rotation: (prev.rotation + dr * ff).rem_euclid(360.0),
-        wheel: prev.wheel + (raw.wheel - prev.wheel) * ff,
-        time: raw.time,
-    }
 }
 
 /// Directional damping with 0.125 base gain + EMA for stabilization and streamline.
@@ -655,9 +647,19 @@ impl PathWalker {
                 let alpha = (len as f32 / 6.0).clamp(0.20, 0.75);
                 self.dir = filter_circular_angle(self.dir, target_dir, alpha);
             }
-            let dt = (p.time - a.time).max(0.0);
-            let instant_speed = if dt > 0.0 { (len / dt) as f32 } else { (len / 16.0) as f32 };
-            self.velocity = self.velocity * 0.7 + instant_speed * 0.3;
+            let raw_dt = p.time - a.time;
+            let instant_speed = if raw_dt.is_finite() && raw_dt > 0.0 {
+                (len / raw_dt.clamp(0.5, 500.0)) as f32
+            } else if self.velocity > 0.0 {
+                self.velocity
+            } else {
+                (len / 8.333333) as f32
+            };
+            self.velocity = if self.step == 0 {
+                instant_speed
+            } else {
+                self.velocity * 0.7 + instant_speed * 0.3
+            };
         }
         if let Some(f) = self.pending_first.take() {
             self.emit_first(f, out);
@@ -1352,331 +1354,6 @@ pub fn apply_pose(b: &BrushSettings, mut p: StrokePoint) -> StrokePoint {
     p
 }
 
-/// Retroactively taper the final segment of dabs based on exit velocity and tangent across final samples.
-/// Scales dab diameter (radius) and opacity smoothly down to a point along the exit tangent,
-/// eliminating blunt pill-caps on fast flicks.
-pub fn apply_retroactive_liftoff_taper(
-    dabs: &mut [Dab],
-    recent_points: &[StrokePoint],
-) {
-    if dabs.is_empty() || recent_points.len() < 2 {
-        return;
-    }
-    let n_pts = recent_points.len();
-    let sample_window = n_pts.min(5);
-    let pts = &recent_points[n_pts - sample_window..];
-
-    let dx = pts[pts.len() - 1].x - pts[0].x;
-    let dy = pts[pts.len() - 1].y - pts[0].y;
-    let chord_len = (dx * dx + dy * dy).sqrt();
-    if chord_len < 1e-4 {
-        return;
-    }
-
-    let taper_count = (dabs.len().min(8) as f32).round().max(2.0) as usize;
-    let taper_count = taper_count.min(dabs.len());
-    if taper_count == 0 {
-        return;
-    }
-
-    let start_idx = dabs.len() - taper_count;
-    for (i, dab) in dabs[start_idx..].iter_mut().enumerate() {
-        let progress = (i + 1) as f32 / taper_count as f32;
-        let taper_scale = (1.0 - progress * 0.90).clamp(0.05, 1.0);
-        let smooth_taper = (taper_scale * std::f32::consts::PI * 0.5).sin();
-
-        dab.radius = (dab.radius * smooth_taper).max(0.2);
-        dab.opacity = (dab.opacity * smooth_taper).clamp(0.0, 1.0);
-    }
-}
-
-/// Baseline Apple Pencil / stylus stroke conditioner.
-///
-/// Runs unconditionally even when user stabilization and smoothing are set to `0.0`:
-/// - rejects sub-`0.5 pt` duplicate/jitter samples before spline/tangent calculation,
-/// - applies baseline EMA pressure filtering (`alpha = 0.40`) without adding position lag,
-/// - interpolates spans with centripetal Catmull-Rom splines (`alpha = 0.5`),
-/// - absorbs out-of-order force estimate updates without emitting duplicate points or dabs,
-/// - discards lift-off micro-hooks, enforces monotonic end pressure decay, and smoothly tapers
-///   the lifted tail in diameter and opacity along the last valid smoothed exit tangent.
-#[derive(Clone, Debug, Default)]
-pub struct StylusConditioner {
-    last_raw: Option<StrokePoint>,
-    fit: Vec<StrokePoint>,
-    smoothed_pressure: Option<f32>,
-    last_valid_dir: Option<[f64; 2]>,
-}
-
-impl StylusConditioner {
-    const MIN_POINT_DIST: f64 = 0.5;
-    const PRESSURE_EMA_ALPHA: f32 = 0.40;
-    const MIN_PRESSURE: f32 = 0.0009765625;
-    const MICRO_HOOK_MIN_DIST: f64 = 1.0;
-    const MICRO_HOOK_REVERSAL_MAX_DIST: f64 = 8.0;
-    const MICRO_HOOK_MIN_DOT: f64 = 0.2;
-
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn sanitize_pressure(pressure: f32, fallback: f32) -> f32 {
-        if pressure.is_finite() {
-            pressure.clamp(Self::MIN_PRESSURE, 1.0)
-        } else {
-            fallback.clamp(Self::MIN_PRESSURE, 1.0)
-        }
-    }
-
-    fn lerp_point(a: &StrokePoint, b: &StrokePoint, t: f32, x: f64, y: f64) -> StrokePoint {
-        let mut dr = (b.rotation - a.rotation + 540.0).rem_euclid(360.0) - 180.0;
-        if !dr.is_finite() {
-            dr = 0.0;
-        }
-        StrokePoint {
-            x,
-            y,
-            pressure: (a.pressure + (b.pressure - a.pressure) * t).clamp(Self::MIN_PRESSURE, 1.0),
-            tilt_x: a.tilt_x + (b.tilt_x - a.tilt_x) * t,
-            tilt_y: a.tilt_y + (b.tilt_y - a.tilt_y) * t,
-            rotation: (a.rotation + dr * t).rem_euclid(360.0),
-            wheel: a.wheel + (b.wheel - a.wheel) * t,
-            time: a.time + (b.time - a.time) * f64::from(t),
-        }
-    }
-
-    fn emit_segment(p0: Option<&StrokePoint>, p1: &StrokePoint, p2: &StrokePoint, p3: Option<&StrokePoint>, out: &mut Vec<StrokePoint>) {
-        let (dx, dy) = (p2.x - p1.x, p2.y - p1.y);
-        let length = dx.hypot(dy);
-        if !length.is_finite() || length < Self::MIN_POINT_DIST {
-            return;
-        }
-        let step = 2.0;
-        let count = ((length / step).ceil() as usize).clamp(1, 24).saturating_sub(1);
-        if count == 0 {
-            return;
-        }
-        // Centripetal Catmull-Rom (alpha = 0.5) parameter spacing.
-        let knot_dt = |u: &StrokePoint, v: &StrokePoint| -> f64 { (u.x - v.x).hypot(u.y - v.y).sqrt().max(std::f64::consts::FRAC_1_SQRT_2) };
-        let dt12 = knot_dt(p1, p2);
-
-        let a = match p0.filter(|p| (p.x - p1.x).hypot(p.y - p1.y) >= Self::MIN_POINT_DIST) {
-            Some(p) => *p,
-            None => StrokePoint { x: 2.0 * p1.x - p2.x, y: 2.0 * p1.y - p2.y, ..*p1 },
-        };
-        let dt01 = if p0.is_some_and(|p| (p.x - p1.x).hypot(p.y - p1.y) >= Self::MIN_POINT_DIST) {
-            knot_dt(&a, p1)
-        } else {
-            dt12
-        };
-
-        let d = match p3.filter(|p| (p.x - p2.x).hypot(p.y - p2.y) >= Self::MIN_POINT_DIST) {
-            Some(p) => *p,
-            None => StrokePoint { x: 2.0 * p2.x - p1.x, y: 2.0 * p2.y - p1.y, ..*p2 },
-        };
-        let dt23 = if p3.is_some_and(|p| (p.x - p2.x).hypot(p.y - p2.y) >= Self::MIN_POINT_DIST) {
-            knot_dt(p2, &d)
-        } else {
-            dt12
-        };
-
-        let t0 = 0.0;
-        let t1 = t0 + dt01;
-        let t2 = t1 + dt12;
-        let t3 = t2 + dt23;
-        let mix = |u: (f64, f64), v: (f64, f64), w: f64| -> (f64, f64) { (u.0 * (1.0 - w) + v.0 * w, u.1 * (1.0 - w) + v.1 * w) };
-        let mid_x = (p1.x + p2.x) * 0.5;
-        let mid_y = (p1.y + p2.y) * 0.5;
-        let max_dev_sq = (length * 1.5 + 8.0).powi(2);
-
-        for i in 1..=count {
-            let u = i as f64 / (count + 1) as f64;
-            let t = t1 + (t2 - t1) * u;
-            let a1 = mix((a.x, a.y), (p1.x, p1.y), (t - t0) / (t1 - t0));
-            let a2 = mix((p1.x, p1.y), (p2.x, p2.y), (t - t1) / (t2 - t1));
-            let a3 = mix((p2.x, p2.y), (d.x, d.y), (t - t2) / (t3 - t2));
-            let b1 = mix(a1, a2, (t - t0) / (t2 - t0));
-            let b2 = mix(a2, a3, (t - t1) / (t3 - t1));
-            let c = mix(b1, b2, (t - t1) / (t2 - t1));
-            if !c.0.is_finite() || !c.1.is_finite() {
-                continue;
-            }
-            if (c.0 - mid_x).powi(2) + (c.1 - mid_y).powi(2) > max_dev_sq {
-                continue;
-            }
-            out.push(Self::lerp_point(p1, p2, u as f32, c.0, c.1));
-        }
-    }
-
-    /// Push one raw stylus sample into `generator`.
-    pub fn push(&mut self, mut raw: StrokePoint, generator: &mut DabGenerator, dabs: &mut Vec<Dab>, dual: &mut Vec<Dab>) {
-        if !(raw.x.is_finite() && raw.y.is_finite()) {
-            return;
-        }
-        let fallback_p = self.smoothed_pressure.unwrap_or(0.5);
-        let p_in = Self::sanitize_pressure(raw.pressure, fallback_p);
-        if let Some(prev) = self.last_raw
-            && (raw.x - prev.x).hypot(raw.y - prev.y) < Self::MIN_POINT_DIST
-        {
-            return;
-        }
-        let ema = match self.smoothed_pressure {
-            None => p_in,
-            Some(prev_p) => (prev_p * (1.0 - Self::PRESSURE_EMA_ALPHA) + p_in * Self::PRESSURE_EMA_ALPHA).clamp(Self::MIN_PRESSURE, 1.0),
-        };
-        self.smoothed_pressure = Some(ema);
-        raw.pressure = ema;
-
-        if let Some(prev) = self.last_raw {
-            let (dx, dy) = (raw.x - prev.x, raw.y - prev.y);
-            let dist = dx.hypot(dy);
-            if dist >= 1.0 {
-                let unit = [dx / dist, dy / dist];
-                self.last_valid_dir = Some(match self.last_valid_dir {
-                    Some(prev_u) => {
-                        let bx = prev_u[0] * 0.5 + unit[0] * 0.5;
-                        let by = prev_u[1] * 0.5 + unit[1] * 0.5;
-                        let blen = bx.hypot(by);
-                        if blen > 1e-6 { [bx / blen, by / blen] } else { unit }
-                    }
-                    None => unit,
-                });
-            }
-        }
-        self.last_raw = Some(raw);
-
-        self.fit.push(raw);
-        if self.fit.len() > 4 {
-            self.fit.remove(0);
-        }
-        let n = self.fit.len();
-        let mut pts = Vec::new();
-        if n == 1 {
-            pts.push(self.fit[0]);
-        } else if n >= 3 {
-            let p0 = (n >= 4).then(|| &self.fit[n - 4]);
-            let p1 = &self.fit[n - 3];
-            let p2 = &self.fit[n - 2];
-            let p3 = &self.fit[n - 1];
-            Self::emit_segment(p0, p1, p2, Some(p3), &mut pts);
-            pts.push(*p2);
-        }
-        if !pts.is_empty() {
-            generator.push(&pts, dabs, dual);
-        }
-    }
-
-    /// Incorporate a delayed force estimation update without appending duplicate points or emitting extra dabs.
-    pub fn update_pressure_estimate(&mut self, estimated_pressure: f32) {
-        if !estimated_pressure.is_finite() {
-            return;
-        }
-        let sanitized = Self::sanitize_pressure(estimated_pressure, self.smoothed_pressure.unwrap_or(0.5));
-        let prev = self.smoothed_pressure.unwrap_or(sanitized);
-        let updated = (prev * (1.0 - Self::PRESSURE_EMA_ALPHA) + sanitized * Self::PRESSURE_EMA_ALPHA).clamp(Self::MIN_PRESSURE, 1.0);
-        self.smoothed_pressure = Some(updated);
-        if let Some(last) = self.fit.last_mut() {
-            last.pressure = updated;
-        }
-        if let Some(raw) = self.last_raw.as_mut() {
-            raw.pressure = updated;
-        }
-    }
-
-    /// Finalize the stroke on stylus lift-off: discard noisy micro-hooks, clamp pressure monotonically,
-    /// flush the trailing spline segment, and smoothly taper the lifted tip along the exit tangent.
-    pub fn finish_liftoff(&mut self, end_sample: Option<StrokePoint>, generator: &mut DabGenerator, dabs: &mut Vec<Dab>, dual: &mut Vec<Dab>) {
-        let mut tail_pts = Vec::new();
-        let last_sm = self.smoothed_pressure.unwrap_or(0.5);
-        if let Some(mut end_pt) = end_sample.filter(|p| p.x.is_finite() && p.y.is_finite()) {
-            let raw_p = Self::sanitize_pressure(end_pt.pressure, last_sm);
-            // Monotonic lift-off decay: end pressure can never exceed the previous smoothed sample.
-            let ema_p = (last_sm * (1.0 - Self::PRESSURE_EMA_ALPHA) + raw_p * Self::PRESSURE_EMA_ALPHA).min(last_sm).clamp(Self::MIN_PRESSURE, 1.0);
-            self.smoothed_pressure = Some(ema_p);
-            end_pt.pressure = ema_p;
-
-            let hook = self.last_raw.is_some_and(|prev| {
-                let (dx, dy) = (end_pt.x - prev.x, end_pt.y - prev.y);
-                let dist = dx.hypot(dy);
-                dist < Self::MICRO_HOOK_MIN_DIST
-                    || (dist < Self::MICRO_HOOK_REVERSAL_MAX_DIST && self.last_valid_dir.is_some_and(|dir| (dx / dist) * dir[0] + (dy / dist) * dir[1] < Self::MICRO_HOOK_MIN_DOT))
-            });
-
-            if hook {
-                if self.fit.len() >= 2 {
-                    let n = self.fit.len();
-                    let p0 = (n >= 3).then(|| &self.fit[n - 3]);
-                    Self::emit_segment(p0, &self.fit[n - 2], &self.fit[n - 1], None, &mut tail_pts);
-                    let mut clean_end = self.fit[n - 1];
-                    clean_end.pressure = ema_p;
-                    tail_pts.push(clean_end);
-                }
-            } else {
-                if let Some(prev) = self.last_raw {
-                    let (dx, dy) = (end_pt.x - prev.x, end_pt.y - prev.y);
-                    let dist = dx.hypot(dy);
-                    if dist >= Self::MICRO_HOOK_MIN_DIST {
-                        self.last_valid_dir = Some([dx / dist, dy / dist]);
-                    }
-                }
-                self.last_raw = Some(end_pt);
-                self.fit.push(end_pt);
-                if self.fit.len() > 4 {
-                    self.fit.remove(0);
-                }
-                let n = self.fit.len();
-                if n >= 3 {
-                    let p0 = (n >= 4).then(|| &self.fit[n - 4]);
-                    Self::emit_segment(p0, &self.fit[n - 3], &self.fit[n - 2], Some(&self.fit[n - 1]), &mut tail_pts);
-                    tail_pts.push(self.fit[n - 2]);
-                }
-                if n >= 2 {
-                    let p0 = (n >= 3).then(|| &self.fit[n - 3]);
-                    Self::emit_segment(p0, &self.fit[n - 2], &self.fit[n - 1], None, &mut tail_pts);
-                    tail_pts.push(self.fit[n - 1]);
-                }
-            }
-        } else if self.fit.len() >= 2 {
-            let n = self.fit.len();
-            let p0 = (n >= 3).then(|| &self.fit[n - 3]);
-            Self::emit_segment(p0, &self.fit[n - 2], &self.fit[n - 1], None, &mut tail_pts);
-            tail_pts.push(self.fit[n - 1]);
-        }
-
-        if let (Some(dir), Some(anchor)) = (self.last_valid_dir, tail_pts.last().or(self.last_raw.as_ref()).copied()) {
-            let tail_span = f64::from(generator.builder.brush.size * 0.25).clamp(2.5, 8.0);
-            let base_p = anchor.pressure.min(self.smoothed_pressure.unwrap_or(anchor.pressure));
-            for step in 1..=3 {
-                let frac = f64::from(step) / 3.0;
-                let decay = (1.0 - frac as f32 * 0.85).clamp(0.01, 1.0);
-                tail_pts.push(StrokePoint {
-                    x: anchor.x + dir[0] * (tail_span * frac),
-                    y: anchor.y + dir[1] * (tail_span * frac),
-                    pressure: (base_p * decay).clamp(Self::MIN_PRESSURE, base_p),
-                    time: anchor.time + f64::from(step) * 2.0,
-                    ..anchor
-                });
-            }
-        }
-
-        let start_dab_idx = dabs.len();
-        if !tail_pts.is_empty() {
-            generator.push(&tail_pts, dabs, dual);
-        }
-        generator.finish(dabs, dual);
-        if dabs.len() > start_dab_idx {
-            let tail = &mut dabs[start_dab_idx..];
-            let count = tail.len();
-            for (idx, dab) in tail.iter_mut().enumerate() {
-                let t = (idx + 1) as f32 / count as f32;
-                let taper = (1.0 - t * 0.88).clamp(0.05, 1.0);
-                let smooth = (taper * std::f32::consts::FRAC_PI_2).sin();
-                dab.radius = (dab.radius * smooth).max(0.2);
-                dab.opacity = (dab.opacity * smooth).clamp(0.0, 1.0);
-            }
-        }
-    }
-}
-
 /// Incremental dab generation for a whole brush (primary and optional dual dabs).
 #[derive(Clone, Debug)]
 pub struct DabGenerator {
@@ -1689,8 +1366,6 @@ pub struct DabGenerator {
     /// The brush the step length is read from, apart from the builder so the walker can read it
     /// while its callback has the builder.
     step_brush: std::sync::Arc<BrushSettings>,
-    recent_points: [StrokePoint; 5],
-    recent_count: usize,
 }
 
 impl DabGenerator {
@@ -1727,18 +1402,11 @@ impl DabGenerator {
             dual: dual_on.then(|| DualBuilder::new(&brush)),
             scratch: Vec::new(),
             step_brush: std::sync::Arc::new(brush),
-            recent_points: [StrokePoint::default(); 5],
-            recent_count: 0,
         }
     }
 
     fn walk(&mut self, pts: &[StrokePoint], dabs: &mut Vec<Dab>, dual: &mut Vec<Dab>) {
         for p in pts {
-            for i in 0..4 {
-                self.recent_points[i] = self.recent_points[i + 1];
-            }
-            self.recent_points[4] = *p;
-            self.recent_count = (self.recent_count + 1).min(5);
             let p = apply_pose(&self.builder.brush, *p);
             // Each step becomes its dabs as the walker emits it: a long segment never holds its
             // step list (the pixel-grid mode can emit 1e7 steps for one).
@@ -2039,75 +1707,6 @@ mod streaming_tests {
             assert!(spacing > 1e-3, "duplicate dab found at index {i}");
             assert!((spacing - expected_step).abs() < 1e-5, "non-uniform dab spacing {spacing} at {i}");
         }
-    }
-
-    #[test]
-    fn smoothing_zero_drops_sub_half_pt_duplicates_and_out_of_order_estimate_updates_emit_zero_extra_dabs() {
-        let mut brush = BrushSettings { size: 16.0, spacing: 0.25, pressure_size: true, pressure_opacity: true, ..BrushSettings::default() };
-        brush.smoothing.amount = 0.0;
-
-        let mut cond = StylusConditioner::new();
-        let mut dgen = DabGenerator::new(&brush, 1.0);
-        let (mut dabs, mut dual) = (Vec::new(), Vec::new());
-
-        cond.push(StrokePoint::new(10.0, 20.0, 0.5), &mut dgen, &mut dabs, &mut dual);
-        cond.push(StrokePoint::new(30.0, 20.0, 0.5), &mut dgen, &mut dabs, &mut dual);
-        cond.push(StrokePoint::new(50.0, 20.0, 0.5), &mut dgen, &mut dabs, &mut dual);
-        let count_before_dups = dabs.len();
-
-        // Feed exact duplicate and sub-0.5 pt oscillating hardware jitter + out-of-order force estimates
-        cond.push(StrokePoint::new(50.0, 20.0, 0.9), &mut dgen, &mut dabs, &mut dual);
-        cond.push(StrokePoint::new(50.3, 20.2, 0.95), &mut dgen, &mut dabs, &mut dual);
-        cond.push(StrokePoint::new(49.85, 20.0, 0.85), &mut dgen, &mut dabs, &mut dual);
-        cond.update_pressure_estimate(0.42);
-        cond.update_pressure_estimate(0.38);
-
-        assert_eq!(dabs.len(), count_before_dups, "duplicates, sub-0.5pt jitter, and force estimate updates must emit zero extra dabs");
-    }
-
-    #[test]
-    fn smoothing_zero_liftoff_discards_micro_hook_clamps_force_spike_and_tapers_tail() {
-        let mut brush = BrushSettings { size: 24.0, spacing: 0.25, pressure_size: true, pressure_opacity: true, taper_end_length: 0.0, ..BrushSettings::default() };
-        brush.smoothing.amount = 0.0;
-
-        let mut cond = StylusConditioner::new();
-        let mut dgen = DabGenerator::new(&brush, 1.0);
-        let (mut dabs, mut dual) = (Vec::new(), Vec::new());
-
-        // Steady forward stroke +X with gradual release pressure down to ~0.35
-        let samples = [
-            StrokePoint::new(10.0, 40.0, 0.70),
-            StrokePoint::new(24.0, 40.0, 0.60),
-            StrokePoint::new(38.0, 40.0, 0.50),
-            StrokePoint::new(52.0, 40.0, 0.35),
-        ];
-        for s in samples {
-            cond.push(s, &mut dgen, &mut dabs, &mut dual);
-        }
-        let body_last = *dabs.last().expect("body dabs emitted");
-
-        // Simulated noisy Apple Pencil touchesEnded: tiny backward micro-hook (-0.7 pt X, +0.4 pt Y)
-        // combined with a 1.0 capacitance spike!
-        let noisy_liftoff = StrokePoint::new(51.3, 40.4, 1.0);
-        cond.finish_liftoff(Some(noisy_liftoff), &mut dgen, &mut dabs, &mut dual);
-
-        assert!(dabs.len() > 2);
-        let tail_start = dabs.iter().position(|d| d.center.x >= body_last.center.x - 1e-4).unwrap_or(0);
-        let tail = &dabs[tail_start..];
-        assert!(tail.len() >= 2, "must emit clean exit tail after body");
-
-        // Zero backward crack: tail x keeps moving monotonically forward (+X) past body without reversing into the hook
-        for w in dabs.windows(2) {
-            assert!(w[1].center.x >= w[0].center.x - 0.1, "stroke cracked/reversed backwards: {} -> {}", w[0].center.x, w[1].center.x);
-        }
-        // Monotonic tapering radius & opacity, zero 1.0 force dot spike
-        for dab in tail {
-            assert!(dab.radius <= body_last.radius + 1e-4, "end dot spiked wider ({}) than body ({})", dab.radius, body_last.radius);
-            assert!(dab.opacity <= body_last.opacity + 1e-4, "end dot spiked darker ({}) than body ({})", dab.opacity, body_last.opacity);
-        }
-        let tip = dabs.last().unwrap();
-        assert!(tip.radius < body_last.radius * 0.6, "tip radius {} should taper smoothly below body {}", tip.radius, body_last.radius);
-        assert!(tip.opacity < body_last.opacity * 0.6, "tip opacity {} should taper smoothly below body {}", tip.opacity, body_last.opacity);
     }
 
     #[test]

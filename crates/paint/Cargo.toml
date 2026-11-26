@@ -12,6 +12,7 @@ photocraft-geom = { workspace = true }
 photocraft-color = { workspace = true }
 photocraft-raster = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 rustc-hash = { workspace = true }
 # The tile serde form and commands that take file bytes as base64 text.
 base64 = "0.23"
@@ -22,4 +23,3 @@ rayon = { workspace = true }
 
 [dev-dependencies]
 craft-cms = { workspace = true }
-serde_json = { workspace = true }

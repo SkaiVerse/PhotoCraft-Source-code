@@ -1359,9 +1359,9 @@ fn handle_canvas_tool_stroke(
         let base = app.stylus.last_point_ms().map_or(now_ms, |t| t.min(now_ms));
         let n = positions.len();
         for (k, p) in positions.into_iter().enumerate() {
-            app.stylus.clock_ms = spread_ms(base, now_ms, k, n);
-            // This move's share of the pen samples the frame brought (pressure, tilt, rotation).
+            // This move's share of the pen samples the frame brought (pressure, tilt, rotation, timestamp).
             app.stylus.select(k, n);
+            app.stylus.clock_ms = app.stylus.hardware_clock_ms().unwrap_or_else(|| spread_ms(base, now_ms, k, n));
             let d = xf.to_doc(p);
             tool_input::tool_event_with_view(
                 app,
@@ -1405,6 +1405,9 @@ fn handle_canvas_tool_stroke(
         }
         let p = at.map(|p| xf.to_doc(p)).or_else(|| app.drag.as_ref().and_then(|d| d.points.last().map(|q| [q[0], q[1]])));
         if let Some(d) = p {
+            if let Some(hw_ms) = app.stylus.hardware_clock_ms() {
+                app.stylus.clock_ms = hw_ms;
+            }
             tap_at_peak_pressure(app);
             tool_input::tool_event_with_view(
                 app,
@@ -1422,6 +1425,9 @@ fn handle_canvas_tool_stroke(
         if let Some(d) = p
             && app.drag.is_some()
         {
+            if let Some(hw_ms) = app.stylus.hardware_clock_ms() {
+                app.stylus.clock_ms = hw_ms;
+            }
             tap_at_peak_pressure(app);
             tool_input::tool_event_with_view(
                 app,

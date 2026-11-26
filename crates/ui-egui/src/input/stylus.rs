@@ -73,10 +73,14 @@ const FEED_QUEUE: usize = 1024;
 struct FeedState {
     /// The current sample (`None` = no pen down).
     latest: Option<PenSample>,
+    /// Optional platform hardware timestamp (monotonic seconds) paired with `latest`.
+    latest_ts_s: Option<f64>,
     /// Forward predicted touch sample and screen position (`None` = no prediction).
     predicted: Option<(PenSample, egui::Pos2)>,
     /// Every sample set since the canvas last drained them, oldest first.
     queue: VecDeque<PenSample>,
+    /// Optional platform hardware timestamps (monotonic seconds) paired 1:1 with `queue`.
+    queue_ts_s: VecDeque<Option<f64>>,
 }
 
 /// Shared state a platform backend writes pen samples into. Cloning shares it. Each sample both
@@ -88,14 +92,23 @@ pub struct StylusFeed(Arc<Mutex<FeedState>>);
 impl StylusFeed {
     /// The current sample (`None` = no pen down); a sample is also queued for [`Self::drain`].
     pub fn set(&self, s: Option<PenSample>) {
+        self.set_with_timestamp(s, None);
+    }
+
+    /// Push a stylus sample together with its real hardware timestamp in monotonic seconds.
+    pub fn set_with_timestamp(&self, s: Option<PenSample>, timestamp_s: Option<f64>) {
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let s = s.map(PenSample::sanitized);
+        let ts = timestamp_s.filter(|t| t.is_finite() && *t > 0.0);
         g.latest = s;
+        g.latest_ts_s = s.and(ts);
         if let Some(s) = s {
             if g.queue.len() >= FEED_QUEUE {
                 g.queue.pop_front();
+                g.queue_ts_s.pop_front();
             }
             g.queue.push_back(s);
+            g.queue_ts_s.push_back(ts);
         } else {
             g.predicted = None;
         }
@@ -125,16 +138,33 @@ impl StylusFeed {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).latest
     }
 
+    pub fn get_with_timestamp(&self) -> (Option<PenSample>, Option<f64>) {
+        let g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        (g.latest, g.latest_ts_s)
+    }
+
     /// The samples set since the last drain, oldest first.
     pub fn drain(&self) -> Vec<PenSample> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).queue.drain(..).collect()
+        let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        g.queue_ts_s.clear();
+        g.queue.drain(..).collect()
     }
 
     /// Drains samples directly into an existing buffer without heap reallocations.
     pub fn drain_into(&self, target: &mut Vec<PenSample>) {
         target.clear();
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        g.queue_ts_s.clear();
         target.extend(g.queue.drain(..));
+    }
+
+    /// Drains samples and their paired hardware timestamps into caller buffers without reallocating.
+    pub fn drain_into_with_timestamps(&self, target: &mut Vec<PenSample>, timestamps: &mut Vec<Option<f64>>) {
+        target.clear();
+        timestamps.clear();
+        let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        target.extend(g.queue.drain(..));
+        timestamps.extend(g.queue_ts_s.drain(..));
     }
 }
 
@@ -163,10 +193,20 @@ pub struct Stylus {
     lifted: bool,
     /// This frame's pen samples, oldest first (the feed's queue and the touch forces).
     frame: Vec<PenSample>,
+    /// Optional platform hardware timestamps (seconds) paired 1:1 with `frame`.
+    frame_ts_s: Vec<Option<f64>>,
     /// The last pen sample of an earlier frame: where this frame's interpolation starts.
     prev: Option<PenSample>,
+    /// Optional platform hardware timestamp (seconds) of `prev`.
+    prev_ts_s: Option<f64>,
     /// The sample [`Self::select`] interpolated for the pointer move being processed.
     current: Option<PenSample>,
+    /// Optional hardware timestamp (seconds) [`Self::select`] interpolated for the move.
+    current_ts_s: Option<f64>,
+    /// Anchor hardware timestamp (seconds) captured on [`Self::begin_stroke`].
+    hw_t0_s: Option<f64>,
+    /// Anchor stroke clock (ms) paired with `hw_t0_s` on [`Self::begin_stroke`].
+    stroke_t0_ms: f64,
     /// The highest pen pressure (before the curve) since the drag began, for a tap's one dab.
     peak: f32,
     /// The pen's touch contacts in the raw input, so a held pen is no press-and-hold right click.
@@ -197,8 +237,13 @@ impl Default for Stylus {
             touch_pen: false,
             lifted: false,
             frame: Vec::new(),
+            frame_ts_s: Vec::new(),
             prev: None,
+            prev_ts_s: None,
             current: None,
+            current_ts_s: None,
+            hw_t0_s: None,
+            stroke_t0_ms: 0.0,
             peak: 0.0,
             pen_contacts: PenContacts::default(),
             updated_frame: None,
@@ -228,9 +273,11 @@ impl Stylus {
         }
         if let Some(last) = self.frame.last() {
             self.prev = Some(*last);
+            self.prev_ts_s = self.frame_ts_s.last().copied().flatten();
         }
-        self.feed.drain_into(&mut self.frame);
+        self.feed.drain_into_with_timestamps(&mut self.frame, &mut self.frame_ts_s);
         self.current = None;
+        self.current_ts_s = None;
         for e in events {
             if let egui::Event::Touch { id, phase, force, .. } = e {
                 let force = force.filter(|f| f.is_finite()).map(|f| f.clamp(0.0, 1.0));
@@ -262,6 +309,7 @@ impl Stylus {
                         if let Some(f) = force {
                             self.touch = Some(f);
                             self.frame.push(PenSample { pressure: f, ..Default::default() });
+                            self.frame_ts_s.push(None);
                         }
                     }
                     egui::TouchPhase::End | egui::TouchPhase::Cancel => {
@@ -275,7 +323,16 @@ impl Stylus {
         // contact, so a frame that also touched keeps only its contact samples. A stroke's last
         // moves then keep the pressure the pen left with, and a tap its own (#1798).
         if self.frame.iter().any(|s| s.pressure > 0.0) {
-            self.frame.retain(|s| s.pressure > 0.0);
+            let mut keep = Vec::with_capacity(self.frame.len());
+            for (idx, s) in self.frame.iter().enumerate() {
+                if s.pressure > 0.0 {
+                    keep.push(idx);
+                }
+            }
+            let new_frame = keep.iter().map(|&i| self.frame[i]).collect();
+            let new_ts = keep.iter().map(|&i| self.frame_ts_s.get(i).copied().flatten()).collect();
+            self.frame = new_frame;
+            self.frame_ts_s = new_ts;
         }
         self.peak = self.frame.iter().fold(self.peak, |m, s| m.max(s.pressure));
     }
@@ -289,6 +346,14 @@ impl Stylus {
         match self.frame.last() {
             Some(s) if s.pressure > 0.0 && feed.is_none_or(|f| f.pressure <= 0.0) => Some(*s),
             _ => feed,
+        }
+    }
+
+    fn latest_ts_s(&self) -> Option<f64> {
+        let (feed, feed_ts) = self.feed.get_with_timestamp();
+        match self.frame.last() {
+            Some(s) if s.pressure > 0.0 && feed.is_none_or(|f| f.pressure <= 0.0) => self.frame_ts_s.last().copied().flatten(),
+            _ => feed_ts,
         }
     }
 
@@ -321,12 +386,15 @@ impl Stylus {
     /// mouse, or a frame without pen samples, keeps the current sample.
     pub(crate) fn select(&mut self, k: usize, n: usize) {
         self.current = None;
+        self.current_ts_s = None;
         if !self.use_pressure || n == 0 || self.frame.is_empty() || self.sample().is_none() {
             return;
         }
         let m = self.frame.len();
         let start = self.prev.or(self.frame.first().copied()).unwrap_or_default();
         let at = |i: usize| if i == 0 { start } else { self.frame.get(i - 1).copied().unwrap_or(start) };
+        let start_ts = self.prev_ts_s.or_else(|| self.frame_ts_s.first().copied().flatten());
+        let at_ts = |i: usize| if i == 0 { start_ts } else { self.frame_ts_s.get(i - 1).copied().flatten().or(start_ts) };
         let pos = (k + 1).min(n) as f32 / n as f32 * m as f32;
         let i = pos.floor() as usize;
         let (a, b, t) = (at(i), at((i + 1).min(m)), pos - pos.floor());
@@ -343,11 +411,29 @@ impl Stylus {
             }
             .sanitized(),
         );
+        self.current_ts_s = match (at_ts(i), at_ts((i + 1).min(m))) {
+            (Some(ta), Some(tb)) if ta.is_finite() && tb.is_finite() => Some(ta + (tb - ta) * f64::from(t)),
+            (Some(ta), _) => Some(ta),
+            (_, Some(tb)) => Some(tb),
+            _ => None,
+        };
     }
 
     /// Back to the current sample after a frame's moves.
     pub(crate) fn clear_selection(&mut self) {
         self.current = None;
+        self.current_ts_s = None;
+    }
+
+    /// Real hardware sample timestamp mapped onto the current stroke's clock (ms), when available.
+    pub(crate) fn hardware_clock_ms(&self) -> Option<f64> {
+        let t0_s = self.hw_t0_s?;
+        let ts_s = self.current_ts_s.or_else(|| self.latest_ts_s())?;
+        if !(t0_s.is_finite() && ts_s.is_finite()) {
+            return None;
+        }
+        let raw_ms = self.stroke_t0_ms + ((ts_s - t0_s) * 1000.0).max(0.0);
+        Some(self.last_point_ms().map_or(raw_ms, |prev| raw_ms.max(prev)))
     }
 
     /// Did the pen just flip to its eraser end (`Some(true)`) or back to its tip (`Some(false)`)?
@@ -409,6 +495,9 @@ impl Stylus {
         // A new stroke's first moves interpolate from this frame's samples, never from a sample
         // left over from an earlier stroke.
         self.prev = None;
+        self.prev_ts_s = None;
+        self.hw_t0_s = self.latest_ts_s();
+        self.stroke_t0_ms = self.clock_ms;
         self.peak = self.frame.iter().fold(0.0, |m, s| m.max(s.pressure));
         self.stroke.clear();
         self.times.clear();
@@ -419,7 +508,8 @@ impl Stylus {
     pub(crate) fn record_point(&mut self) {
         let s = self.sample().unwrap_or_default();
         self.stroke.push([s.tilt_x, s.tilt_y, s.rotation]);
-        self.times.push(self.clock_ms);
+        let t = self.last_point_ms().map_or(self.clock_ms, |prev| self.clock_ms.max(prev));
+        self.times.push(t);
     }
 
     /// Time of the drag's last recorded point.

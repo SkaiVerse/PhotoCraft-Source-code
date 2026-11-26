@@ -52,11 +52,12 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private var hoverLogged = 0
     private var keyLogged = 0
 
-    // Pencil samples wait a moment for iPadOS to deliver their true pressure.
+    // Pencil samples wait briefly at touchdown for iPadOS to refine estimated force.
     private struct PenItem {
         var phase: Int32
         var location: CGPoint
-        var force: CGFloat
+        var normForce: Float
+        var isUnknownForce: Bool
         var altitude: CGFloat
         var azimuth: CGVector
         var roll: CGFloat
@@ -69,7 +70,10 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private var penQueue: [PenItem] = []
     private var penQueueHead = 0
     private var lastQueuedLocation: CGPoint?
-    private var smoothedPressure: Float = 0
+    private var lastConfirmedForce: Float? = nil
+    /// Toggleable raw Pencil touch-stream recorder (off by default, zero overhead when false).
+    var recordTouchStream: Bool = false
+    private var recordedTouches: [(x: Double, y: Double, force: Float, maxForce: Float, estimated: Bool, index: Int64, altitude: Float, azimuth: Float, timestamp: Double, phase: UInt8)] = []
 
     // Fingers: one finger is decided on by the Rust side (tap, scroll, pan or draw);
     // two or more fingers are gestures.
@@ -943,10 +947,53 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         fingerTouch = nil
     }
 
-    /// Adds a Pencil sample. Always keeps sub-0.5 pt duplicate rejection and calibrated pressure wait.
+    /// Inspect `estimatedProperties.contains(.force)` and `estimatedPropertiesExpectingUpdates.contains(.force)`
+    /// on every Pencil sample. Never pass unrefined or bogus `0.00` placeholder force into the brush engine:
+    /// - At stroke start (`touchesBegan`): hold briefly (<= 16 ms / 1-2 frames) until a confirmed force arrives.
+    /// - Mid-stroke / lift: substitute `lastConfirmedForce` immediately with zero queue delay.
+    private func backfillPendingForce(_ confirmed: Float) {
+        for i in penQueueHead..<penQueue.count where penQueue[i].isUnknownForce {
+            penQueue[i].normForce = confirmed
+            penQueue[i].isUnknownForce = false
+            penQueue[i].ready = true
+        }
+    }
+
+    private func recordDebugTouch(_ touch: UITouch, loc: CGPoint, forceEstimated: Bool, phase: UInt8) {
+        if !recordTouchStream { return }
+        let az = touch.azimuthUnitVector(in: self)
+        let azRad = Float(atan2(az.dy, az.dx))
+        let idx = touch.estimationUpdateIndex?.int64Value ?? -1
+        let f = Float(touch.force)
+        let mf = Float(touch.maximumPossibleForce)
+        let alt = Float(touch.altitudeAngle)
+        recordedTouches.append((Double(loc.x), Double(loc.y), f, mf, forceEstimated, idx, alt, azRad, touch.timestamp, phase))
+        if let h = handle, pc_touch_recorder_is_enabled(h) != 0 {
+            pc_touch_recorder_record(h, Double(loc.x), Double(loc.y), f, mf, forceEstimated ? 1 : 0, idx, alt, azRad, touch.timestamp, phase)
+        }
+    }
+
+    func exportRecordedTouchesJSON() -> String {
+        let rows = recordedTouches.map { r -> String in
+            let idx = r.index >= 0 ? "\(r.index)" : "null"
+            return "{\"x\":\(r.x),\"y\":\(r.y),\"force\":\(r.force),\"max_force\":\(r.maxForce),\"is_force_estimated\":\(r.estimated),\"estimation_update_index\":\(idx),\"altitude\":\(r.altitude),\"azimuth\":\(r.azimuth),\"timestamp\":\(r.timestamp),\"phase\":\(r.phase)}"
+        }
+        return "[\n" + rows.joined(separator: ",\n") + "\n]"
+    }
+
+    func exportRecordedTouchesCSV() -> String {
+        var out = "x,y,force,max_force,is_force_estimated,estimation_update_index,altitude,azimuth,timestamp,phase\n"
+        for r in recordedTouches {
+            let idx = r.index >= 0 ? "\(r.index)" : ""
+            out += "\(r.x),\(r.y),\(r.force),\(r.maxForce),\(r.estimated),\(idx),\(r.altitude),\(r.azimuth),\(r.timestamp),\(r.phase)\n"
+        }
+        return out
+    }
+
     private func queuePen(_ touch: UITouch, phase: Int32, event: UIEvent?, mods: UInt32) {
         if phase == 0 {
             lastQueuedLocation = touch.preciseLocation(in: self)
+            lastConfirmedForce = nil
         }
         var samples: [UITouch] = [touch]
         if phase == 1, let more = event?.coalescedTouches(for: touch), !more.isEmpty { samples = more }
@@ -965,22 +1012,64 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 lastQueuedLocation = loc
             }
             let maxForce = c.maximumPossibleForce
-            let normForce = max(0.0009765625, min(1.0, maxForce > 0 ? (c.force / maxForce) : 0.5))
-            let waiting = c.estimationUpdateIndex != nil && c.estimatedPropertiesExpectingUpdates.contains(.force)
+            let rawNorm: Float = maxForce > 0 ? Float(min(1.0, max(0.0, c.force / maxForce))) : 0.5
+            let expectingUpdate = c.estimationUpdateIndex != nil && c.estimatedPropertiesExpectingUpdates.contains(.force)
+            let forceEstimated = c.estimatedProperties.contains(.force) || expectingUpdate
+            let bogusZero = rawNorm <= 1e-4
+            let isUnknown = forceEstimated || bogusZero
+            recordDebugTouch(c, loc: loc, forceEstimated: forceEstimated, phase: UInt8(clamping: phase))
+
             var roll: CGFloat = 0
             if #available(iOS 17.5, *) { roll = c.rollAngle }
-            penQueue.append(PenItem(
-                phase: phase,
-                location: loc,
-                force: normForce,
-                altitude: c.altitudeAngle,
-                azimuth: c.azimuthUnitVector(in: self),
-                roll: roll,
-                mods: mods,
-                index: waiting ? c.estimationUpdateIndex : nil,
-                ready: !waiting,
-                time: CACurrentMediaTime(),
-                stamp: c.timestamp))
+
+            if !isUnknown {
+                let confirmed = max(0.0009765625, min(1.0, rawNorm))
+                lastConfirmedForce = confirmed
+                backfillPendingForce(confirmed)
+                penQueue.append(PenItem(
+                    phase: phase,
+                    location: loc,
+                    normForce: confirmed,
+                    isUnknownForce: false,
+                    altitude: c.altitudeAngle,
+                    azimuth: c.azimuthUnitVector(in: self),
+                    roll: roll,
+                    mods: mods,
+                    index: nil,
+                    ready: true,
+                    time: CACurrentMediaTime(),
+                    stamp: c.timestamp))
+            } else if let confirmed = lastConfirmedForce {
+                // Mid-stroke or lift-off: forward last confirmed force immediately without queue delay.
+                penQueue.append(PenItem(
+                    phase: phase,
+                    location: loc,
+                    normForce: confirmed,
+                    isUnknownForce: false,
+                    altitude: c.altitudeAngle,
+                    azimuth: c.azimuthUnitVector(in: self),
+                    roll: roll,
+                    mods: mods,
+                    index: nil,
+                    ready: true,
+                    time: CACurrentMediaTime(),
+                    stamp: c.timestamp))
+            } else {
+                // Stroke start before first confirmed force: hold briefly (<= 16 ms) for force refinement.
+                penQueue.append(PenItem(
+                    phase: phase,
+                    location: loc,
+                    normForce: 0,
+                    isUnknownForce: true,
+                    altitude: c.altitudeAngle,
+                    azimuth: c.azimuthUnitVector(in: self),
+                    roll: roll,
+                    mods: mods,
+                    index: expectingUpdate ? c.estimationUpdateIndex : nil,
+                    ready: false,
+                    time: CACurrentMediaTime(),
+                    stamp: c.timestamp))
+            }
         }
         if phase != 1 {
             lastQueuedLocation = nil
@@ -994,26 +1083,36 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         guard let h = handle else { return }
         for t in touches where t.type == .pencil {
             let maxForce = t.maximumPossibleForce
-            let normForce = max(0.0009765625, min(1.0, maxForce > 0 ? (t.force / maxForce) : 0.5))
+            let rawNorm: Float = maxForce > 0 ? Float(min(1.0, max(0.0, t.force / maxForce))) : 0.5
+            let expecting = t.estimatedPropertiesExpectingUpdates.contains(.force)
+            let stillEstimated = t.estimatedProperties.contains(.force) || expecting
+            let confirmedNow = !stillEstimated && rawNorm > 1e-4
+            recordDebugTouch(t, loc: t.preciseLocation(in: self), forceEstimated: stillEstimated, phase: 4)
+            let confirmedForce = max(0.0009765625, min(1.0, rawNorm))
+
             var updatedQueued = false
             if let index = t.estimationUpdateIndex {
                 for i in penQueueHead..<penQueue.count {
                     if penQueue[i].index == index {
-                        penQueue[i].force = normForce
                         penQueue[i].altitude = t.altitudeAngle
-                        if !t.estimatedPropertiesExpectingUpdates.contains(.force) { penQueue[i].ready = true }
+                        if confirmedNow || (!expecting && rawNorm > 1e-4) {
+                            lastConfirmedForce = confirmedForce
+                            penQueue[i].normForce = confirmedForce
+                            penQueue[i].isUnknownForce = false
+                            penQueue[i].ready = true
+                            backfillPendingForce(confirmedForce)
+                        }
                         updatedQueued = true
                         break
                     }
                 }
             }
-            if !updatedQueued && t === pencilTouch {
-                let rawP = Float(normForce)
-                smoothedPressure = smoothedPressure > 0 ? max(0.0009765625, min(1.0, smoothedPressure * 0.6 + rawP * 0.4)) : rawP
+            if !updatedQueued && t === pencilTouch && confirmedNow {
+                lastConfirmedForce = confirmedForce
                 let (tx, ty) = self.tilt(altitude: t.altitudeAngle, azimuth: t.azimuthUnitVector(in: self))
                 var roll: Float = 0
                 if #available(iOS 17.5, *) { roll = Float(t.rollAngle * 180 / CGFloat.pi) }
-                pc_pen_update_estimate(h, smoothedPressure, tx, ty, roll)
+                pc_pen_update_estimate(h, confirmedForce, tx, ty, roll)
             }
         }
         flushPen(all: false)
@@ -1022,19 +1121,20 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private func flushPen(all: Bool) {
         let now = CACurrentMediaTime()
         while penQueueHead < penQueue.count {
-            let item = penQueue[penQueueHead]
-            // Hold dab #1 in transient predicted pass until first finalized force estimate arrives
-            // (or up to 2 samples, or 35ms timeout) to eliminate uncalibrated force dots/blots.
-            if item.phase == 0 && !item.ready && (penQueue.count - penQueueHead) < 2 && (now - item.time < 0.035) && !all {
-                if let h = handle {
-                    let (tx, ty) = self.tilt(altitude: Double(item.altitude), azimuth: item.azimuth)
-                    var roll: Float = 0
-                    if #available(iOS 17.5, *) { roll = Float(item.roll * 180 / CGFloat.pi) }
-                    pc_pen_predicted(h, Float(item.location.x), Float(item.location.y), Float(item.force), tx, ty, roll)
-                }
-                break
-            }
-            if item.ready || all || now - item.time > 0.016 {
+            var item = penQueue[penQueueHead]
+            if item.ready {
+                penQueueHead += 1
+                sendPen(item)
+            } else if all || now - item.time >= 0.016 {
+                // Bounded 1-2 frame touchdown timeout or immediate stroke-end flush: never emit 0.00.
+                let fallback = lastConfirmedForce
+                    ?? (penQueueHead..<penQueue.count).compactMap({ !penQueue[$0].isUnknownForce ? penQueue[$0].normForce : nil }).first
+                    ?? 0.25
+                lastConfirmedForce = fallback
+                backfillPendingForce(fallback)
+                item.normForce = fallback
+                item.isUnknownForce = false
+                item.ready = true
                 penQueueHead += 1
                 sendPen(item)
             } else {
@@ -1056,6 +1156,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         var tiltX: Float
         var tiltY: Float
         var roll: Float
+        var stamp: TimeInterval
     }
 
     /// The last few real samples. Each new sample lets the curve between the two before it be drawn smoothly.
@@ -1067,21 +1168,11 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     private func sendPen(_ item: PenItem) {
         guard handle != nil else { return }
-        // The Pencil's normalized force (0.0009765625 to 1.0)
-        var pressure = Float(max(0.0009765625, min(1.0, item.force)))
-        let prevSmoothed = smoothedPressure
-        // Baseline EMA pressure filter (alpha = 0.4), always active even when smoothing == 0.
-        if item.phase == 0 {
-            smoothedPressure = pressure
-        } else {
-            let candidate = smoothedPressure * 0.6 + pressure * 0.4
-            // Monotonic lift-off decay: touchesEnded force spikes can never exceed prior smoothed pressure.
-            smoothedPressure = item.phase >= 2 ? min(candidate, prevSmoothed) : candidate
-        }
-        pressure = max(0.0009765625, min(1.0, smoothedPressure))
+        // Single lightweight EMA lives in Rust (PressureFilter); Swift forwards confirmed normalized force cleanly.
+        let pressure = max(0.0009765625, min(1.0, item.normForce))
         let (tx, ty) = self.tilt(altitude: Double(item.altitude), azimuth: item.azimuth)
         var point = PenPoint(x: Double(item.location.x), y: Double(item.location.y), pressure: pressure, tiltX: tx, tiltY: ty,
-                             roll: Float(item.roll * 180 / CGFloat.pi))
+                             roll: Float(item.roll * 180 / CGFloat.pi), stamp: item.stamp)
 
         // How late the sample reaches the app, measured from the moment of the touch.
         let delay = (ProcessInfo.processInfo.systemUptime - item.stamp) * 1000
@@ -1174,7 +1265,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                         pressure: max(0.0009765625, point.pressure * decay),
                         tiltX: point.tiltX,
                         tiltY: point.tiltY,
-                        roll: point.roll)
+                        roll: point.roll,
+                        stamp: point.stamp + 0.002 * Double(step))
                     emitPen(tp, phase: step == 2 ? item.phase : 1, mods: item.mods)
                 }
             } else {
@@ -1182,12 +1274,13 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             }
             fit.removeAll()
             lastValidDir = nil
+            lastConfirmedForce = nil
         }
     }
 
     private func emitPen(_ p: PenPoint, phase: Int32, mods: UInt32) {
         guard let h = handle else { return }
-        pc_pen(h, Float(p.x), Float(p.y), phase, p.pressure, p.tiltX, p.tiltY, p.roll, mods)
+        pc_pen(h, Float(p.x), Float(p.y), phase, p.pressure, p.tiltX, p.tiltY, p.roll, mods, p.stamp)
     }
 
     /// Extra points along a smooth (centripetal Catmull-Rom) curve from `p1` to `p2`, so a fast
@@ -1214,11 +1307,11 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         // is strictly the backward difference (p2 - p1)/dt12. This eliminates division-by-zero tangent spikes
         // and wild overshoots from duplicate or near-duplicate points.
         let len01 = p0 != nil ? ((p0!.x - p1.x) * (p0!.x - p1.x) + (p0!.y - p1.y) * (p0!.y - p1.y)).squareRoot() : 0.0
-        let a = (p0 != nil && len01 >= 0.5) ? p0! : PenPoint(x: 2 * p1.x - p2.x, y: 2 * p1.y - p2.y, pressure: p1.pressure, tiltX: p1.tiltX, tiltY: p1.tiltY, roll: p1.roll)
+        let a = (p0 != nil && len01 >= 0.5) ? p0! : PenPoint(x: 2 * p1.x - p2.x, y: 2 * p1.y - p2.y, pressure: p1.pressure, tiltX: p1.tiltX, tiltY: p1.tiltY, roll: p1.roll, stamp: p1.stamp)
         let dt01 = (p0 != nil && len01 >= 0.5) ? dist(a, p1) : dt12
 
         let len23 = p3 != nil ? ((p3!.x - p2.x) * (p3!.x - p2.x) + (p3!.y - p2.y) * (p3!.y - p2.y)).squareRoot() : 0.0
-        let d = (p3 != nil && len23 >= 0.5) ? p3! : PenPoint(x: 2 * p2.x - p1.x, y: 2 * p2.y - p1.y, pressure: p2.pressure, tiltX: p2.tiltX, tiltY: p2.tiltY, roll: p2.roll)
+        let d = (p3 != nil && len23 >= 0.5) ? p3! : PenPoint(x: 2 * p2.x - p1.x, y: 2 * p2.y - p1.y, pressure: p2.pressure, tiltX: p2.tiltX, tiltY: p2.tiltY, roll: p2.roll, stamp: p2.stamp)
         let dt23 = (p3 != nil && len23 >= 0.5) ? dist(p2, d) : dt12
 
         let t0 = 0.0
@@ -1252,11 +1345,13 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
             let f = Float(u)
             let midPressure = max(0.0009765625, min(1.0, p1.pressure + (p2.pressure - p1.pressure) * f))
+            let midStamp = p1.stamp + (p2.stamp - p1.stamp) * u
             let mid = PenPoint(x: C.0, y: C.1,
                                pressure: midPressure,
                                tiltX: p1.tiltX + (p2.tiltX - p1.tiltX) * f,
                                tiltY: p1.tiltY + (p2.tiltY - p1.tiltY) * f,
-                               roll: p1.roll + rollDelta * f)
+                               roll: p1.roll + rollDelta * f,
+                               stamp: midStamp)
             emitPen(mid, phase: 1, mods: mods)
         }
     }
@@ -1287,7 +1382,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 quickShapeTimer = nil
                 quickShapeActive = false
                 quickShapeStartPos = t.location(in: self)
-                penQueue.removeAll()
+                penQueue.removeAll(keepingCapacity: true)
+                penQueueHead = 0
+                lastConfirmedForce = nil
                 queuePen(t, phase: 0, event: event, mods: mods)
             case .indirectPointer:
                 stopInertia()
@@ -1365,12 +1462,14 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                     if let predicted = event?.predictedTouches(for: t), !predicted.isEmpty {
                         for pt in predicted {
                             let maxForce = pt.maximumPossibleForce
-                            let normForce = max(0.0009765625, min(1.0, maxForce > 0 ? (pt.force / maxForce) : 0.5))
+                            let rawNorm: Float = maxForce > 0 ? Float(min(1.0, max(0.0, pt.force / maxForce))) : 0.5
+                            let est = pt.estimatedProperties.contains(.force) || pt.estimatedPropertiesExpectingUpdates.contains(.force)
+                            let safeForce = (!est && rawNorm > 1e-4) ? max(0.0009765625, min(1.0, rawNorm)) : (lastConfirmedForce ?? 0.25)
                             let loc = pt.preciseLocation(in: self)
                             let (tx, ty) = self.tilt(altitude: pt.altitudeAngle, azimuth: pt.azimuthUnitVector(in: self))
                             var roll: Float = 0
                             if #available(iOS 17.5, *) { roll = Float(pt.rollAngle * 180 / CGFloat.pi) }
-                            pc_pen_predicted(h, Float(loc.x), Float(loc.y), Float(normForce), tx, ty, roll)
+                            pc_pen_predicted(h, Float(loc.x), Float(loc.y), safeForce, tx, ty, roll, pt.timestamp)
                         }
                     } else {
                         pc_pen_predicted_clear(h)

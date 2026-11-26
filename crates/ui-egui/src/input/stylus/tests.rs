@@ -489,3 +489,34 @@ fn test_phase6_five_input_devices_routing_regression() {
     let _ = app.run("edit.undo", serde_json::json!({}));
     let _ = app.run("edit.redo", serde_json::json!({}));
 }
+
+#[test]
+fn hardware_timestamps_drive_stroke_times_without_synthetic_spread() {
+    let mut s = Stylus::default();
+    // Touch down at hardware timestamp 100.000 s, frame clock 500.0 ms.
+    s.clock_ms = 500.0;
+    s.feed.set_with_timestamp(Some(pen(0.4)), Some(100.000));
+    s.update(&[]);
+    s.begin_stroke();
+
+    // Two coalesced moves arrive in one frame with uneven real timestamps (+3.5 ms, +11.2 ms).
+    s.feed.set_with_timestamp(Some(pen(0.5)), Some(100.0035));
+    s.feed.set_with_timestamp(Some(pen(0.6)), Some(100.0147));
+    s.update(&[]);
+
+    s.select(0, 2);
+    s.clock_ms = s.hardware_clock_ms().expect("hardware clock active");
+    s.record_point();
+
+    s.select(1, 2);
+    s.clock_ms = s.hardware_clock_ms().expect("hardware clock active");
+    s.record_point();
+
+    let out = s.stroke_points(&[[0.0, 0.0, 0.4], [10.0, 0.0, 0.5], [30.0, 0.0, 0.6]]);
+    let t0 = *out[0].last().unwrap();
+    let t1 = *out[1].last().unwrap();
+    let t2 = *out[2].last().unwrap();
+    assert!((t0 - 0.0).abs() < 1e-6);
+    assert!((t1 - 3.5).abs() < 1e-4, "expected real +3.5 ms, got {t1}");
+    assert!((t2 - 14.7).abs() < 1e-4, "expected real +14.7 ms, got {t2}");
+}
