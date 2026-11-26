@@ -325,6 +325,21 @@ pub fn apply_directional_damping(
     }
 }
 
+/// Minimum internal smoothing fraction when smoothing is enabled (UI `0%` -> `5%` real smoothing)
+/// so baseline smoothing and stroke-end catch-up are never bypassed.
+pub const SMOOTHING_FLOOR: f32 = 0.05;
+
+/// Map user-facing smoothing settings (`amount` in `0.0..=1.0`, corresponding to `0%..100%`)
+/// to the effective internal smoothing fraction (`0.05 + 0.95 * amount` when enabled, `0.0` when disabled).
+#[inline]
+pub fn effective_smoothing_amount(cfg: &Smoothing) -> f32 {
+    if !cfg.enabled {
+        0.0
+    } else {
+        SMOOTHING_FLOOR + (1.0 - SMOOTHING_FLOOR) * cfg.amount.clamp(0.0, 1.0)
+    }
+}
+
 /// Incremental stroke smoothing: exponential (with optional time-based catch-up) or pulled string.
 #[derive(Clone, Debug)]
 pub struct Smoother {
@@ -349,8 +364,13 @@ impl Smoother {
         }
     }
 
+    #[inline]
+    fn effective_amount(&self) -> f64 {
+        f64::from(effective_smoothing_amount(&self.cfg))
+    }
+
     fn active(&self) -> bool {
-        self.cfg.enabled && self.cfg.amount > 0.0
+        self.cfg.enabled && self.effective_amount() > 0.0
     }
 
     /// Feed one input point; returns the brush positions to paint through.
@@ -378,7 +398,7 @@ impl Smoother {
             out.push(p);
             return;
         };
-        let amount = f64::from(self.cfg.amount.clamp(0.0, 1.0));
+        let amount = self.effective_amount();
         if self.cfg.pulled_string {
             let mut len = amount * MAX_STRING_PX;
             if self.cfg.adjust_for_zoom {
@@ -437,10 +457,10 @@ impl Smoother {
         (self.active() && (pos.x != last.x || pos.y != last.y)).then_some(([pos.x, pos.y], [last.x, last.y]))
     }
 
-    /// End of stroke: with Catch-Up On Stroke End the brush finishes at the last pointer position
-    /// and pose.
+    /// End of stroke: with Catch-Up On Stroke End—or at UI 0% where the 5% baseline floor is
+    /// active with Catch-Up greyed out—the brush finishes at the last pointer position and pose.
     pub fn finish(&mut self, out: &mut Vec<StrokePoint>) {
-        if !self.active() || !self.cfg.catch_up_on_end {
+        if !self.active() || !(self.cfg.catch_up_on_end || self.cfg.amount <= 0.0) {
             return;
         }
         if let (Some(pos), Some(last)) = (self.pos, self.last_input)
@@ -1679,6 +1699,7 @@ mod streaming_tests {
     #[test]
     fn smoothing_zero_carries_distance_remainder_continuously_without_boundary_duplicates() {
         let mut brush = BrushSettings { size: 20.0, spacing: 0.25, pressure_size: false, pressure_opacity: false, ..BrushSettings::default() };
+        brush.smoothing.enabled = false;
         brush.smoothing.amount = 0.0;
         let expected_step = 5.0; // 20 * 0.25
 

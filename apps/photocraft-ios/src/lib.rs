@@ -1507,6 +1507,26 @@ pub unsafe extern "C" fn pc_pen(
     mods: u32,
     timestamp: f64,
 ) {
+    unsafe { pc_pen_ex(h, x, y, phase, pressure, tilt_x, tilt_y, rotation, mods, timestamp, 0, 0) };
+}
+
+/// Pencil sample with iPadOS `estimationUpdateIndex` and `estimatedPropertiesExpectingUpdates` bitmask.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_pen_ex(
+    h: *mut c_void,
+    x: f32,
+    y: f32,
+    phase: c_int,
+    pressure: f32,
+    tilt_x: f32,
+    tilt_y: f32,
+    rotation: f32,
+    mods: u32,
+    timestamp: f64,
+    estimation_index: u64,
+    expecting_mask: u32,
+) {
     if let Some(h) = unsafe { host(h) } {
         h.set_modifiers(to_mods(mods));
         let pos = h.pt(x, y);
@@ -1546,7 +1566,7 @@ pub unsafe extern "C" fn pc_pen(
                     h.fast_stroke_active = false;
                     h.cached_prims = None;
                     h.cached_screen = None;
-                    h.feed.set_with_timestamp(Some(sample), ts_s);
+                    h.feed.set_with_timestamp_est(Some(sample), ts_s, estimation_index, expecting_mask);
                     h.push(egui::Event::PointerMoved(pos));
                     h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
                     h.ctx.request_repaint();
@@ -1560,7 +1580,7 @@ pub unsafe extern "C" fn pc_pen(
             }
             1 => {
                 if h.pen_down {
-                    h.feed.set_with_timestamp(Some(sample), ts_s);
+                    h.feed.set_with_timestamp_est(Some(sample), ts_s, estimation_index, expecting_mask);
                     h.push(egui::Event::PointerMoved(pos));
                     h.ctx.request_repaint();
                 } else if h.gesture.is_some_and(|g| g.pen) {
@@ -1576,14 +1596,13 @@ pub unsafe extern "C" fn pc_pen(
                 h.cached_screen = None;
                 if h.pen_down {
                     h.pen_down = false;
-                    // Push the final clamped lift-off sample before PointerMoved so Stylus::frame
-                    // retains it for the final move instead of falling back to 1.0 mouse pressure.
-                    h.feed.set_with_timestamp(Some(sample), ts_s);
+                    // Final lift-off sample is immediately finalized (expecting_mask = 0).
+                    h.feed.set_with_timestamp_est(Some(sample), ts_s, estimation_index, 0);
                     h.push(egui::Event::PointerMoved(pos));
                     h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
                     // The stroke's last samples keep their pressure; nothing is held after this.
                     h.feed.set(None);
-                    h.feed.set_predicted(None);
+                    h.feed.clear_predicted();
                     h.ctx.request_repaint();
                 } else if h.gesture.is_some_and(|g| g.pen) {
                     h.gesture_end(x, y, phase == 3);
@@ -1617,7 +1636,7 @@ pub unsafe extern "C" fn pc_pen_predicted(
                 rotation: rotation.rem_euclid(360.0),
                 eraser: false,
             };
-            h.feed.set_predicted(Some((sample, pos)));
+            h.feed.push_predicted(sample, pos);
             h.ctx.request_repaint();
         }
     }
@@ -1626,7 +1645,7 @@ pub unsafe extern "C" fn pc_pen_predicted(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_pen_predicted_clear(h: *mut c_void) {
     if let Some(h) = unsafe { host(h) } {
-        h.feed.set_predicted(None);
+        h.feed.clear_predicted();
     }
 }
 
@@ -1651,6 +1670,43 @@ pub unsafe extern "C" fn pc_pen_update_estimate(
             };
             h.feed.update_latest(sample);
         }
+    }
+}
+
+/// Patch an unfinalized tail sample matching `estimation_index` in place with finalized force,
+/// tilt, roll, and remaining expected-update bitmask. Negative `pressure` preserves existing force.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_pen_update_estimate_ex(
+    h: *mut c_void,
+    estimation_index: u64,
+    pressure: f32,
+    tilt_x: f32,
+    tilt_y: f32,
+    rotation: f32,
+    remaining_expected: u32,
+) {
+    if let Some(h) = unsafe { host(h) } {
+        if !h.pen_down {
+            return;
+        }
+        let calibrated_p = if pressure >= 0.0 && pressure.is_finite() {
+            let norm = (pressure / h.pressure_divisor.max(0.01)).clamp(photocraft_paint::PressureFilter::MIN_PRESSURE, 1.0);
+            Some(photocraft_paint::calibrate_stylus_pressure(norm).clamp(photocraft_paint::PressureFilter::MIN_PRESSURE, 1.0))
+        } else {
+            None
+        };
+        let tx = tilt_x.is_finite().then_some(tilt_x);
+        let ty = tilt_y.is_finite().then_some(tilt_y);
+        let rot = rotation.is_finite().then(|| rotation.rem_euclid(360.0));
+        h.feed.push_estimate_update(photocraft_ui_egui::stylus::EstimateUpdate {
+            estimation_index,
+            pressure: calibrated_p,
+            tilt_x: tx,
+            tilt_y: ty,
+            rotation: rot,
+            remaining_expected,
+        });
+        h.ctx.request_repaint();
     }
 }
 

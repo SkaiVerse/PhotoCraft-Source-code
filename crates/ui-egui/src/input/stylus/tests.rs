@@ -520,3 +520,47 @@ fn hardware_timestamps_drive_stroke_times_without_synthetic_spread() {
     assert!((t1 - 3.5).abs() < 1e-4, "expected real +3.5 ms, got {t1}");
     assert!((t2 - 14.7).abs() < 1e-4, "expected real +14.7 ms, got {t2}");
 }
+
+#[test]
+fn live_tail_estimate_update_patches_point_and_predicted_never_leaks_on_commit() {
+    use photocraft_paint::EST_FORCE;
+
+    let mut s = Stylus::default();
+    s.clock_ms = 100.0;
+    s.feed.set_with_timestamp_est(Some(pen(0.35)), Some(10.000), 501, EST_FORCE);
+    s.feed.push_predicted(pen(0.99), egui::pos2(999.0, 999.0));
+    s.update_for_frame(1, &[]);
+    assert_eq!(s.frame_predicted.len(), 1);
+    assert!(s.feed.predicted().is_none(), "predicted buffer cleared across frame advance");
+
+    s.begin_stroke();
+    assert_eq!(s.stroke_est, vec![(501, EST_FORCE)]);
+
+    // Asynchronous estimation refinement arrives for index 501.
+    s.feed.push_estimate_update(crate::stylus::EstimateUpdate {
+        estimation_index: 501,
+        pressure: Some(0.88),
+        tilt_x: Some(14.0),
+        tilt_y: Some(-6.0),
+        rotation: None,
+        remaining_expected: 0,
+    });
+    s.update_for_frame(2, &[]);
+    assert!(s.frame_predicted.is_empty(), "predicted trail must not persist when none pushed on next frame");
+    assert_eq!(s.pending_updates.len(), 1);
+    assert_eq!(s.pending_updates[0].estimation_index, 501);
+    assert!((s.pending_updates[0].pressure.unwrap() - 0.88).abs() < 1e-6);
+
+    // Feed into a real engine LiveStroke and verify update_estimate patches points cleanly without leaking predicted coords.
+    let mut session = photocraft_engine::Session::new();
+    session.execute("file.new", serde_json::json!({"width": 128, "height": 128, "background": "white"})).unwrap();
+    let p = serde_json::json!({"points": [[20.0, 40.0, 0.35]], "brush": {"size": 16, "pressureSize": true}});
+    let mut live = photocraft_engine::brush_cmds::LiveStroke::begin_with_tagged(&session, "paint.stroke", &p, &[(501, EST_FORCE)]).unwrap();
+    live.push_tagged(&[(photocraft_engine::paint::StrokePoint::new(50.0, 40.0, 0.4), 502, EST_FORCE)]).unwrap();
+    live.update_estimate(501, Some(0.88), Some(14.0), Some(-6.0), None, 0).unwrap();
+    let commit = live.into_commit().unwrap();
+    // Predicted coordinate (999, 999) must never appear inside committed points or bounds.
+    assert!(commit.points().iter().all(|pt| pt.x < 100.0 && pt.y < 100.0));
+    assert!((commit.points()[0].pressure - 0.88).abs() < 1e-6);
+    assert_eq!(commit.points().len(), 2);
+}

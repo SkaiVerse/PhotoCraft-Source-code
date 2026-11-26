@@ -7,7 +7,7 @@
 //! buffer is sparse and compositing always starts from the pre-stroke pixels, strokes can be fed in
 //! chunks and re-composited incrementally for interactive painting (see [`StrokeRenderer`]).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -1181,6 +1181,16 @@ impl StrokeRenderer {
         (dmg, tail_rect)
     }
 
+    /// Copy coverage tile values into an existing recycled `CovTile` without shrinking or freeing buffers.
+    fn clone_cov_tile_into(src: &CovTile, dst: &mut CovTile) {
+        dst.cov.resize(src.cov.len(), 0.0);
+        dst.cov.copy_from_slice(&src.cov);
+        dst.depth.clear();
+        dst.depth.extend_from_slice(&src.depth);
+        dst.col.clear();
+        dst.col.extend_from_slice(&src.col);
+    }
+
     /// Mark the coverage tiles over `r` for the next `composite` (e.g. to redraw over a preview).
     pub fn mark_dirty(&mut self, r: Rect) {
         if r.is_empty() {
@@ -1713,6 +1723,374 @@ impl GeneralTip<'_> {
             }
             *dst = val * d.alpha;
         }
+    }
+}
+
+/// Bitmask of Pencil touch properties still expecting asynchronous refinement from iPadOS.
+pub const EST_FORCE: u32 = 1 << 0;
+pub const EST_ALTITUDE: u32 = 1 << 1;
+pub const EST_AZIMUTH: u32 = 1 << 2;
+
+/// Maximum unfinalized tail samples retained in the editable tail before forcing the oldest sample into finalized storage.
+const MAX_UNFINALIZED_TAIL: usize = 24;
+
+/// A single live-stroke sample tagged with its iPadOS `estimationUpdateIndex` and remaining
+/// estimated-property mask (`0` = already finalized).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TailPoint {
+    pub point: StrokePoint,
+    /// `UITouch.estimationUpdateIndex` (`0` when already finalized or unavailable).
+    pub estimation_index: u64,
+    /// Bitmask of `estimatedPropertiesExpectingUpdates` (`0` = finalized).
+    pub expecting_updates: u32,
+}
+
+impl TailPoint {
+    pub const fn new(point: StrokePoint, estimation_index: u64, expecting_updates: u32) -> Self {
+        Self { point, estimation_index, expecting_updates }
+    }
+
+    pub const fn finalized(point: StrokePoint) -> Self {
+        Self { point, estimation_index: 0, expecting_updates: 0 }
+    }
+}
+
+/// Split live-stroke renderer: maintains a permanently baked `finalized` wet-stroke head and an
+/// editable `tail` of recent samples still awaiting iPadOS force/tilt/azimuth refinement.
+///
+/// Oldest samples whose `expecting_updates == 0` are baked once into `finalized`, advancing the
+/// watermark cleanly without re-rendering finalized tiles. The short unfinalized tail is redrawn
+/// in place over the finalized wet texture each frame using pooled buffers (zero per-frame heap
+/// allocations in steady state).
+#[derive(Clone, Debug)]
+pub struct SplitStroke {
+    finalized: StrokeRenderer,
+    tail: VecDeque<TailPoint>,
+    tail_dabs: Vec<Dab>,
+    tail_duals: Vec<Dab>,
+    tail_keys: HashSet<u64>,
+    tail_renderer: StrokeRenderer,
+    tile_pool: Vec<CovTile>,
+    baked_batch: Vec<StrokePoint>,
+    region_scratch: Vec<f32>,
+}
+
+impl SplitStroke {
+    pub fn new(brush: &BrushSettings, fmt: Option<PixelFormat>, zoom: f32) -> Self {
+        Self {
+            finalized: StrokeRenderer::new(brush, fmt, zoom),
+            tail: VecDeque::with_capacity(32),
+            tail_dabs: Vec::with_capacity(64),
+            tail_duals: Vec::with_capacity(64),
+            tail_keys: HashSet::with_capacity(64),
+            tail_renderer: StrokeRenderer::new(brush, fmt, zoom),
+            tile_pool: Vec::with_capacity(32),
+            baked_batch: Vec::with_capacity(16),
+            region_scratch: Vec::new(),
+        }
+    }
+
+    pub fn with_clip(mut self, clip: Rect) -> Self {
+        self.finalized = self.finalized.with_clip(clip);
+        self.tail_renderer = self.tail_renderer.with_clip(clip);
+        self
+    }
+
+    pub fn with_dab_area_budget(mut self, pixels: u64) -> Self {
+        self.finalized = self.finalized.with_dab_area_budget(pixels);
+        self.tail_renderer = self.tail_renderer.with_dab_area_budget(pixels);
+        self
+    }
+
+    pub fn record_dabs(mut self) -> Self {
+        self.finalized = self.finalized.record_dabs();
+        self
+    }
+
+    pub fn finalized(&self) -> &StrokeRenderer {
+        &self.finalized
+    }
+
+    pub fn finalized_mut(&mut self) -> &mut StrokeRenderer {
+        &mut self.finalized
+    }
+
+    pub fn dabs(&self) -> &[Dab] {
+        self.finalized.dabs()
+    }
+
+    pub fn dab_count(&self) -> usize {
+        self.finalized.dab_count()
+    }
+
+    pub fn tail_len(&self) -> usize {
+        self.tail.len()
+    }
+
+    pub fn tail_points(&self) -> &VecDeque<TailPoint> {
+        &self.tail
+    }
+
+    pub fn bounds(&self) -> Rect {
+        self.finalized.bounds().union(&self.tail_renderer.cov.bounds)
+    }
+
+    pub fn wants_time(&self) -> bool {
+        if self.tail.is_empty() {
+            return self.finalized.wants_time();
+        }
+        let mut generator = self.finalized.generator.clone();
+        let mut dabs = Vec::new();
+        let mut duals = Vec::new();
+        for t in &self.tail {
+            generator.push(&[t.point], &mut dabs, &mut duals);
+        }
+        generator.wants_time()
+    }
+
+    pub fn smoothing_string(&self) -> Option<([f64; 2], [f64; 2])> {
+        if self.tail.is_empty() {
+            return self.finalized.smoothing_string();
+        }
+        let mut generator = self.finalized.generator.clone();
+        let mut dabs = Vec::new();
+        let mut duals = Vec::new();
+        for t in &self.tail {
+            generator.push(&[t.point], &mut dabs, &mut duals);
+        }
+        generator.smoothing_string()
+    }
+
+    /// Push samples tagged with their estimation metadata, immediately baking any finalized prefix
+    /// once into the wet-stroke buffer and keeping newer unfinalized points in the editable tail.
+    pub fn push_tagged(&mut self, samples: &[TailPoint]) {
+        self.tail.extend(samples.iter().copied());
+        self.bake_finalized_prefix();
+    }
+
+    /// Convenience helper for already-finalized points (desktop/automation callers).
+    pub fn push(&mut self, pts: &[StrokePoint]) {
+        self.tail.extend(pts.iter().copied().map(TailPoint::finalized));
+        self.bake_finalized_prefix();
+    }
+
+    /// Bake the oldest finalized samples (`expecting_updates == 0`)—and any overflow past
+    /// `MAX_UNFINALIZED_TAIL`—once into `finalized`, advancing the finalized watermark cleanly.
+    fn bake_finalized_prefix(&mut self) {
+        self.baked_batch.clear();
+        while let Some(front) = self.tail.front() {
+            if front.expecting_updates == 0 || self.tail.len() > MAX_UNFINALIZED_TAIL {
+                if let Some(popped) = self.tail.pop_front() {
+                    self.baked_batch.push(popped.point);
+                }
+            } else {
+                break;
+            }
+        }
+        if !self.baked_batch.is_empty() {
+            self.finalized.push(&self.baked_batch);
+            self.baked_batch.clear();
+        }
+    }
+
+    /// Patch unfinalized sample(s) matching `estimation_index` in place when iPadOS delivers
+    /// `touchesEstimatedPropertiesUpdated`, then bake any newly-finalized head prefix cleanly.
+    /// Returns `true` if at least one tail sample matched.
+    pub fn update_estimate(
+        &mut self,
+        estimation_index: u64,
+        pressure: Option<f32>,
+        tilt_x: Option<f32>,
+        tilt_y: Option<f32>,
+        rotation: Option<f32>,
+        remaining_expected: u32,
+    ) -> bool {
+        let mut matched = false;
+        for t in &mut self.tail {
+            if t.expecting_updates != 0 && t.estimation_index == estimation_index {
+                if let Some(p) = pressure.filter(|v| v.is_finite()) {
+                    t.point.pressure = p.clamp(0.0, 1.0);
+                }
+                if let Some(tx) = tilt_x.filter(|v| v.is_finite()) {
+                    t.point.tilt_x = tx.clamp(-90.0, 90.0);
+                }
+                if let Some(ty) = tilt_y.filter(|v| v.is_finite()) {
+                    t.point.tilt_y = ty.clamp(-90.0, 90.0);
+                }
+                if let Some(rot) = rotation.filter(|v| v.is_finite()) {
+                    t.point.rotation = rot.rem_euclid(360.0) % 360.0;
+                }
+                t.expecting_updates = remaining_expected;
+                matched = true;
+            }
+        }
+        if matched {
+            self.bake_finalized_prefix();
+        }
+        matched
+    }
+
+    /// Preview all primary dabs (`finalized` + current `tail` without mutating `finalized`).
+    pub fn preview_dabs(&self) -> Vec<Dab> {
+        let mut out = self.finalized.dabs().to_vec();
+        let mut generator = self.finalized.generator.clone();
+        let mut duals = Vec::new();
+        for t in &self.tail {
+            generator.push(&[t.point], &mut out, &mut duals);
+        }
+        generator.finish(&mut out, &mut duals);
+        out
+    }
+
+    /// Flush every remaining unfinalized tail sample into the wet buffer and finish the stroke.
+    pub fn finish(&mut self) {
+        if !self.tail.is_empty() {
+            self.baked_batch.clear();
+            while let Some(t) = self.tail.pop_front() {
+                self.baked_batch.push(t.point);
+            }
+            self.finalized.push(&self.baked_batch);
+            self.baked_batch.clear();
+        }
+        self.recycle_tail_tiles();
+        self.finalized.finish();
+    }
+
+    fn recycle_tail_tiles(&mut self) {
+        for (_, tile) in self.tail_renderer.cov.tiles.drain() {
+            self.tile_pool.push(tile);
+        }
+        if let Some(dual) = self.tail_renderer.dual.as_mut() {
+            for (_, tile) in dual.tiles.drain() {
+                self.tile_pool.push(tile);
+            }
+            dual.dirty.clear();
+            dual.bounds = Rect::EMPTY;
+        }
+        self.tail_renderer.cov.dirty.clear();
+        self.tail_renderer.cov.bounds = Rect::EMPTY;
+    }
+
+    fn populate_tail_renderer(&mut self) -> bool {
+        self.recycle_tail_tiles();
+        let mut generator = self.finalized.generator.clone();
+        self.tail_dabs.clear();
+        self.tail_duals.clear();
+        for t in &self.tail {
+            generator.push(&[t.point], &mut self.tail_dabs, &mut self.tail_duals);
+        }
+        generator.finish(&mut self.tail_dabs, &mut self.tail_duals);
+        if self.tail_dabs.is_empty() && self.tail_duals.is_empty() {
+            return false;
+        }
+        self.tail_keys.clear();
+        let mut area_left = self.finalized.area_left;
+        let mut dual_area_left = self.finalized.dual_area_left;
+        let mut refused = self.finalized.refused;
+        let clip = self.finalized.clip;
+        let mut collect_keys = |dabs: &[Dab], dual: bool, budget: &mut u64| {
+            for d in dabs {
+                let r = self.finalized.ctx.dab_rect(d, dual);
+                if !admit(clip, budget, &mut refused, r) || r.is_empty() {
+                    continue;
+                }
+                for ty in r.y0.div_euclid(COV_TILE)..=(r.y1 - 1).div_euclid(COV_TILE) {
+                    for tx in r.x0.div_euclid(COV_TILE)..=(r.x1 - 1).div_euclid(COV_TILE) {
+                        self.tail_keys.insert(tile_key((tx, ty)));
+                    }
+                }
+            }
+        };
+        collect_keys(&self.tail_dabs, false, &mut area_left);
+        collect_keys(&self.tail_duals, true, &mut dual_area_left);
+
+        if self.tail_keys.is_empty() {
+            return false;
+        }
+        self.tail_renderer.cov.bounds = self.finalized.cov.bounds;
+        for &k in &self.tail_keys {
+            if let Some(src) = self.finalized.cov.tiles.get(&k) {
+                let mut dst = self.tile_pool.pop().unwrap_or_else(CovTile::new);
+                StrokeRenderer::clone_cov_tile_into(src, &mut dst);
+                self.tail_renderer.cov.tiles.insert(k, dst);
+            }
+            if let (Some(dst_dual), Some(src_dual)) = (self.tail_renderer.dual.as_mut(), self.finalized.dual.as_ref())
+                && let Some(src) = src_dual.tiles.get(&k)
+            {
+                let mut dst = self.tile_pool.pop().unwrap_or_else(CovTile::new);
+                StrokeRenderer::clone_cov_tile_into(src, &mut dst);
+                dst_dual.tiles.insert(k, dst);
+            }
+        }
+        if let (Some(dst_dual), Some(src_dual)) = (self.tail_renderer.dual.as_mut(), self.finalized.dual.as_ref()) {
+            dst_dual.bounds = src_dual.bounds;
+        }
+        self.tail_renderer.area_left = self.finalized.area_left;
+        self.tail_renderer.dual_area_left = self.finalized.dual_area_left;
+        self.tail_renderer.refused = self.finalized.refused;
+        self.tail_renderer.dab_buf.clear();
+        self.tail_renderer.dab_buf.extend_from_slice(&self.tail_dabs);
+        self.tail_renderer.dual_buf.clear();
+        self.tail_renderer.dual_buf.extend_from_slice(&self.tail_duals);
+        self.tail_renderer.raster_pending();
+        for &k in self.tail_renderer.cov.tiles.keys() {
+            self.tail_renderer.cov.dirty.insert(tile_coords(k));
+        }
+        self.tail_keys.clear();
+        self.tail_keys.extend(self.tail_renderer.cov.tiles.keys().copied());
+        true
+    }
+
+    /// Composite dirty finalized tiles plus the freshly rendered unfinalized/catch-up tail onto
+    /// `target` without mutating finalized tiles or double-stamping updated tail dabs.
+    pub fn composite_live(
+        &mut self,
+        old: Rect,
+        pre: &Surface,
+        target: &mut Surface,
+        selection: Option<&Surface>,
+        lock_transparency: bool,
+    ) -> (Rect, Rect) {
+        let has_tail = self.populate_tail_renderer();
+        if !old.is_empty() {
+            self.finalized.mark_dirty(old);
+            let bounds = self.finalized.bounds();
+            let tail_bounds = if has_tail { self.tail_renderer.bounds() } else { Rect::EMPTY };
+            for ty in old.y0.div_euclid(COV_TILE)..=(old.y1 - 1).div_euclid(COV_TILE) {
+                for tx in old.x0.div_euclid(COV_TILE)..=(old.x1 - 1).div_euclid(COV_TILE) {
+                    let tile = Rect::new(tx * COV_TILE, ty * COV_TILE, (tx + 1) * COV_TILE, (ty + 1) * COV_TILE);
+                    let part = tile.intersect(&old);
+                    let k = tile_key((tx, ty));
+                    let written = if has_tail && self.tail_keys.contains(&k) {
+                        tile.intersect(&tail_bounds)
+                    } else if self.finalized.cov.tiles.contains_key(&k) {
+                        tile.intersect(&bounds)
+                    } else {
+                        Rect::EMPTY
+                    };
+                    if part.is_empty() || written.contains_rect(&part) {
+                        continue;
+                    }
+                    let need = pre.format().channels() * part.width() as usize * part.height() as usize;
+                    self.region_scratch.resize(need, 0.0);
+                    pre.read_region_into(part, &mut self.region_scratch);
+                    target.write_region(part, &self.region_scratch);
+                }
+            }
+        }
+        self.finalized.cov.dirty.retain(|k| !has_tail || !self.tail_keys.contains(&tile_key(*k)));
+        let mut dmg = old.union(&self.finalized.composite(pre, target, selection, lock_transparency, false));
+        let tail_rect = if has_tail {
+            self.tail_renderer.composite(pre, target, selection, lock_transparency, false)
+        } else {
+            Rect::EMPTY
+        };
+        dmg = dmg.union(&tail_rect);
+        (dmg, tail_rect)
+    }
+
+    pub fn composite(&mut self, pre: &Surface, target: &mut Surface, selection: Option<&Surface>, lock_transparency: bool, all: bool) -> Rect {
+        self.finalized.composite(pre, target, selection, lock_transparency, all)
     }
 }
 

@@ -229,6 +229,10 @@ pub fn resolve_brush(s: &Session, p: &Value, cmd: &str) -> Result<BrushSettings>
         b.smoothing.enabled = true;
         b.smoothing.amount = v.clamp(0.0, 1.0);
     }
+    if flag(p, "unsmoothedLine", false) {
+        b.smoothing.enabled = false;
+        b.smoothing.amount = 0.0;
+    }
     b.color = color(p.get("color"), s.tools.foreground);
     b.color_cmyk = s.tools.picked_cmyk([b.color[0], b.color[1], b.color[2]]).map(|k| ([b.color[0], b.color[1], b.color[2]], k));
     b.background = s.tools.background;
@@ -557,7 +561,7 @@ pub struct LiveStroke {
     /// Jitter seed to pass to `paint.stroke`.
     pub seed: u64,
     cmd: String,
-    renderer: StrokeRenderer,
+    renderer: photocraft_paint::SplitStroke,
     symmetry: Option<crate::symmetry_cmds::PaintingSymmetry>,
     mirrors: Vec<StrokeRenderer>,
     mirror_distinct: Vec<bool>,
@@ -577,6 +581,8 @@ pub struct LiveStroke {
     cmyk: Option<std::sync::Arc<photocraft_color::convert::CmykSpace>>,
     /// Every point rendered so far, in order.
     points: Vec<StrokePoint>,
+    /// Estimation metadata `(estimation_index, expecting_mask)` paired 1:1 with `points`.
+    point_est: Vec<(u64, u32)>,
     /// The document and revision the stroke started on.
     base: (photocraft_doc::DocId, u64),
 }
@@ -599,6 +605,11 @@ pub struct LiveCommit {
 }
 
 impl LiveCommit {
+    /// Committed points captured by the live stroke.
+    pub fn points(&self) -> &[StrokePoint] {
+        &self.points
+    }
+
     /// The params that decide the pixels, without the points and seed (compared separately).
     fn settings(p: &Value) -> Value {
         let mut p = p.clone();
@@ -628,6 +639,11 @@ impl LiveStroke {
     /// Start a live stroke of `cmd`: `paint.stroke` (the Brush and Eraser) or `paint.pencil`.
     /// Committing `cmd` with the same params and `"seed": live.seed` gives the same pixels.
     pub fn begin_with(s: &Session, cmd: &str, p: &Value) -> Result<Self> {
+        Self::begin_with_tagged(s, cmd, p, &[])
+    }
+
+    /// Start a live stroke carrying per-point estimation tags (`estimation_index`, `expecting_mask`).
+    pub fn begin_with_tagged(s: &Session, cmd: &str, p: &Value, est_tags: &[(u64, u32)]) -> Result<Self> {
         let captured = crate::channel_cmds::inject_target(s, cmd, p.clone());
         let p = &captured;
         has_paintable(s).map_err(EngineError::Other)?;
@@ -654,7 +670,7 @@ impl LiveStroke {
             let fg = table.as_ref().map_or(fg, |t| crate::mode_cmds::table_color(t, fg));
             apply_auto_erase(&mut brush, surf, pts.first(), fg, s.tools.background);
         }
-        let renderer = StrokeRenderer::new(&brush, Some(surf.format()), zoom).with_clip(clip);
+        let renderer = photocraft_paint::SplitStroke::new(&brush, Some(surf.format()), zoom).with_clip(clip);
         let symmetry = s.active().and_then(|st| st.symmetry.clone());
         let mirrors: Vec<_> =
             (0..symmetry.as_ref().map_or(0, |s| s.mirror_count())).map(|_| StrokeRenderer::new(&brush, Some(surf.format()), zoom).with_clip(clip)).collect();
@@ -678,9 +694,14 @@ impl LiveStroke {
             tail: Rect::EMPTY,
             cmyk: doc_cmyk_space(s),
             points: Vec::new(),
+            point_est: Vec::new(),
             base,
         };
-        live.push(&pts)?;
+        let tagged: Vec<_> = pts.into_iter().enumerate().map(|(i, pt)| {
+            let (idx, mask) = est_tags.get(i).copied().unwrap_or((0, 0));
+            (pt, idx, mask)
+        }).collect();
+        live.push_tagged(&tagged)?;
         Ok(live)
     }
 
@@ -725,58 +746,116 @@ impl LiveStroke {
     /// nothing new appears on release.
     /// Invalid coordinates reject the whole batch without changing the preview.
     pub fn push(&mut self, pts: &[StrokePoint]) -> Result<Rect> {
-        check_coords(pts, &self.cmd)?;
-        self.points.extend_from_slice(pts);
+        let tagged: Vec<(StrokePoint, u64, u32)> = pts.iter().copied().map(|p| (p, 0, 0)).collect();
+        self.push_tagged(&tagged)
+    }
+
+    /// Push points carrying iPadOS `estimationUpdateIndex` and `expecting_updates` masks so
+    /// unfinalized tail samples stay editable until refined by `touchesEstimatedPropertiesUpdated`.
+    pub fn push_tagged(&mut self, samples: &[(StrokePoint, u64, u32)]) -> Result<Rect> {
+        let pts: Vec<StrokePoint> = samples.iter().map(|(p, _, _)| *p).collect();
+        check_coords(&pts, &self.cmd)?;
+        self.points.extend_from_slice(&pts);
+        self.point_est.extend(samples.iter().map(|&(_, idx, mask)| (idx, mask)));
+        let tail_samples: Vec<photocraft_paint::TailPoint> =
+            samples.iter().map(|&(p, idx, mask)| photocraft_paint::TailPoint::new(p, idx, mask)).collect();
         let cmyk = self.cmyk.clone();
         let dmg = photocraft_color::convert::with_cmyk_space(cmyk.as_ref(), || -> Result<Rect> {
-            self.renderer.push(pts);
+            self.renderer.push_tagged(&tail_samples);
             if let Some(symmetry) = &self.symmetry {
-                for ((mirror, distinct), reflected) in self.mirrors.iter_mut().zip(&mut self.mirror_distinct).zip(symmetry.reflected_passes(pts)) {
-                    *distinct |= crate::symmetry_cmds::SymmetryAxis::has_distinct_mirror(pts, &reflected);
+                for ((mirror, distinct), reflected) in self.mirrors.iter_mut().zip(&mut self.mirror_distinct).zip(symmetry.reflected_passes(&pts)) {
+                    *distinct |= crate::symmetry_cmds::SymmetryAxis::has_distinct_mirror(&pts, &reflected);
                     mirror.push(&reflected);
                 }
             }
-            let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
-            if self.mirror_distinct.iter().any(|d| *d) {
-                // The stroke and its distinct mirrors composite as one stroke, as the commit
-                // merges them; only the tiles that changed are redrawn.
-                let old = self.tail;
-                let passes = 1 + self.mirror_distinct.iter().filter(|d| **d).count();
-                let (mut live, full, mut dmg) = match self.union_live.take() {
-                    Some((live, merged)) => (live, merged != passes, Rect::EMPTY),
-                    None => {
-                        // Leaving the single-pass preview: take its smoothing tail back first.
-                        if !old.is_empty() {
-                            surf.write_region(old, &self.pre.read_region(old));
-                        }
-                        (photocraft_paint::UnionLive::default(), true, old)
-                    }
-                };
-                let mut renderers: Vec<&mut StrokeRenderer> = std::iter::once(&mut self.renderer)
-                    .chain(self.mirrors.iter_mut().zip(&self.mirror_distinct).filter(|(_, d)| **d).map(|(r, _)| r))
-                    .collect();
-                dmg = dmg.union(&StrokeRenderer::composite_union_live(&mut renderers, &mut live, full, &self.pre, surf, self.sel.as_ref(), self.lock));
-                self.tail = old.union(&live.bounds());
-                self.union_live = Some((live, passes));
-                if let Some(colors) = self.colors {
-                    crate::color_channels::restrict_region(&self.pre, surf, colors, dmg)?;
-                }
-                return Ok(dmg);
-            }
-            let old = std::mem::replace(&mut self.tail, Rect::EMPTY);
-            let (dmg, tail) = self.renderer.composite_live(old, &self.pre, surf, self.sel.as_ref(), self.lock);
-            self.tail = tail;
-            if let Some(colors) = self.colors {
-                crate::color_channels::restrict_region(&self.pre, surf, colors, dmg)?;
-            }
-            Ok(dmg)
+            self.composite_current()
         })?;
-        // The preview shows the pixels the commit keeps (see `stroke_with`).
         if let Some(table) = crate::mode_cmds::paint_color_table(&self.doc, &self.params) {
             let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
             crate::mode_cmds::keep_in_color_table(&table, &self.pre, surf, dmg);
         }
         Ok(dmg)
+    }
+
+    /// Patch unfinalized sample(s) in place by `estimation_index` and re-render only the short tail
+    /// over finalized wet tiles without mutating finalized tiles or duplicating dabs.
+    pub fn update_estimate(
+        &mut self,
+        estimation_index: u64,
+        pressure: Option<f32>,
+        tilt_x: Option<f32>,
+        tilt_y: Option<f32>,
+        rotation: Option<f32>,
+        remaining_expected: u32,
+    ) -> Result<Rect> {
+        let mut matched = false;
+        for (pt, est) in self.points.iter_mut().zip(&mut self.point_est) {
+            if est.1 != 0 && est.0 == estimation_index {
+                if let Some(p) = pressure.filter(|v| v.is_finite()) {
+                    pt.pressure = p.clamp(0.0, 1.0);
+                }
+                if let Some(tx) = tilt_x.filter(|v| v.is_finite()) {
+                    pt.tilt_x = tx.clamp(-90.0, 90.0);
+                }
+                if let Some(ty) = tilt_y.filter(|v| v.is_finite()) {
+                    pt.tilt_y = ty.clamp(-90.0, 90.0);
+                }
+                if let Some(rot) = rotation.filter(|v| v.is_finite()) {
+                    pt.rotation = rot.rem_euclid(360.0) % 360.0;
+                }
+                est.1 = remaining_expected;
+                matched = true;
+            }
+        }
+        if !self.renderer.update_estimate(estimation_index, pressure, tilt_x, tilt_y, rotation, remaining_expected) && !matched {
+            return Ok(Rect::EMPTY);
+        }
+        let cmyk = self.cmyk.clone();
+        let dmg = photocraft_color::convert::with_cmyk_space(cmyk.as_ref(), || self.composite_current())?;
+        if let Some(table) = crate::mode_cmds::paint_color_table(&self.doc, &self.params) {
+            let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
+            crate::mode_cmds::keep_in_color_table(&table, &self.pre, surf, dmg);
+        }
+        Ok(dmg)
+    }
+
+    fn composite_current(&mut self) -> Result<Rect> {
+        let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
+        if self.mirror_distinct.iter().any(|d| *d) {
+            let old = self.tail;
+            let passes = 1 + self.mirror_distinct.iter().filter(|d| **d).count();
+            let (mut live, full, mut dmg) = match self.union_live.take() {
+                Some((live, merged)) => (live, merged != passes, Rect::EMPTY),
+                None => {
+                    if !old.is_empty() {
+                        surf.write_region(old, &self.pre.read_region(old));
+                    }
+                    (photocraft_paint::UnionLive::default(), true, old)
+                }
+            };
+            let mut renderers: Vec<&mut StrokeRenderer> = std::iter::once(self.renderer.finalized_mut())
+                .chain(self.mirrors.iter_mut().zip(&self.mirror_distinct).filter(|(_, d)| **d).map(|(r, _)| r))
+                .collect();
+            dmg = dmg.union(&StrokeRenderer::composite_union_live(&mut renderers, &mut live, full, &self.pre, surf, self.sel.as_ref(), self.lock));
+            self.tail = old.union(&live.bounds());
+            self.union_live = Some((live, passes));
+            if let Some(colors) = self.colors {
+                crate::color_channels::restrict_region(&self.pre, surf, colors, dmg)?;
+            }
+            return Ok(dmg);
+        }
+        let old = std::mem::replace(&mut self.tail, Rect::EMPTY);
+        let (dmg, tail) = self.renderer.composite_live(old, &self.pre, surf, self.sel.as_ref(), self.lock);
+        self.tail = tail;
+        if let Some(colors) = self.colors {
+            crate::color_channels::restrict_region(&self.pre, surf, colors, dmg)?;
+        }
+        Ok(dmg)
+    }
+
+    /// Preview primary dabs including unfinalized tail samples (for tests).
+    pub fn preview_dabs(&self) -> Vec<photocraft_paint::Dab> {
+        self.renderer.preview_dabs()
     }
 
     /// Finalize the live stroke: finish the renderer (smoothing catch-up and final dabs),
@@ -794,7 +873,7 @@ impl LiveStroke {
             }
             let (surf, _) = crate::channel_cmds::target_surface(std::sync::Arc::make_mut(&mut self.doc), self.layer, &self.params)?;
             if self.mirror_distinct.iter().any(|d| *d) {
-                let mut renderers: Vec<&mut StrokeRenderer> = std::iter::once(&mut self.renderer)
+                let mut renderers: Vec<&mut StrokeRenderer> = std::iter::once(self.renderer.finalized_mut())
                     .chain(self.mirrors.iter_mut().zip(&self.mirror_distinct).filter(|(_, d)| **d).map(|(r, _)| r))
                     .collect();
                 let mut live = self.union_live.take().map(|(l, _)| l).unwrap_or_default();
@@ -804,7 +883,7 @@ impl LiveStroke {
             }
             let old = std::mem::replace(&mut self.tail, Rect::EMPTY);
             if !old.is_empty() {
-                self.renderer.mark_dirty(old);
+                self.renderer.finalized_mut().mark_dirty(old);
             }
             let dmg = old.union(&self.renderer.composite(&self.pre, surf, self.sel.as_ref(), self.lock, false));
             self.tail = Rect::EMPTY;

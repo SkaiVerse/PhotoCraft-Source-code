@@ -473,3 +473,48 @@ fn rotation_shortcuts_repeat_rebind_persist_and_respect_dialogs() {
     assert_eq!(app.ui.views[0].rotation, 45.0, "a dialog owns its keys");
     assert_eq!(app.session.active().unwrap().history.past_len(), 0);
 }
+
+#[test]
+fn two_finger_rotation_pivots_on_midpoint_at_3_deg_and_releases_cardinal_detents() {
+    let rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+    let mut view = View { zoom: 1.5, center: [120.0, 140.0], doc_size: [400, 300], fit_pending: false, ..Default::default() };
+    let pivot = pos2(280.0, 210.0);
+    let xf0 = ViewXform { rect, zoom: view.zoom, center: view.center, flip: false, rotation: view.rotation, aspect: 1.0 };
+    let doc_anchor = xf0.to_doc(pivot);
+
+    let (mut raw_acc, mut last_out) = (None, None);
+
+    // 1. Small twist inside ±3° snaps to 0° while raw accumulator records 2.0°.
+    let snapped = step_magnetic_rotation(&mut view, &xf0, pivot, 2.0, &mut raw_acc, &mut last_out, 1.0);
+    assert!(snapped);
+    assert_eq!(view.rotation, 0.0);
+
+    // 2. Simultaneous next step pushing past 3° (total 3.5°) cleanly breaks out of detent without trapping at 0°.
+    let xf1 = ViewXform { rect, zoom: view.zoom, center: view.center, flip: false, rotation: view.rotation, aspect: 1.0 };
+    let snapped2 = step_magnetic_rotation(&mut view, &xf1, pivot, 1.5, &mut raw_acc, &mut last_out, 1.0);
+    assert!(!snapped2);
+    assert!(view.rotation > 0.0, "rotation past ±3° must release cleanly: {}", view.rotation);
+
+    // 3. Verify rotation stays anchored 1:1 around the off-center 2-finger midpoint pivot.
+    let xf_mid = ViewXform { rect, zoom: view.zoom, center: view.center, flip: false, rotation: view.rotation, aspect: 1.0 };
+    let doc_after = xf_mid.to_doc(pivot);
+    assert!(
+        (doc_after[0] - doc_anchor[0]).abs() < 0.05 && (doc_after[1] - doc_anchor[1]).abs() < 0.05,
+        "pivot drifted: before={doc_anchor:?}, after={doc_after:?}"
+    );
+
+    // 4. Clean cardinal detent snap & breakout at 90°, 180°, -90° (270°).
+    for cardinal in [90.0f32, 180.0, -90.0] {
+        view.rotation = wrap_deg(cardinal - 2.0);
+        raw_acc = None;
+        last_out = None;
+        let xf_c = ViewXform { rect, zoom: view.zoom, center: view.center, flip: false, rotation: view.rotation, aspect: 1.0 };
+        // Inside ±3° -> snaps to cardinal
+        assert!(step_magnetic_rotation(&mut view, &xf_c, pivot, 0.5, &mut raw_acc, &mut last_out, 1.0));
+        assert!((wrap_deg(view.rotation - cardinal)).abs() < 1e-4, "expected snap at {cardinal}, got {}", view.rotation);
+        // Push +3.0° further (total +1.5° past cardinal -> wait +3.0 from -1.5 = +1.5, +4.0 total past cardinal breaks out)
+        let xf_s = ViewXform { rect, zoom: view.zoom, center: view.center, flip: false, rotation: view.rotation, aspect: 1.0 };
+        assert!(!step_magnetic_rotation(&mut view, &xf_s, pivot, 5.0, &mut raw_acc, &mut last_out, 1.0));
+        assert!((wrap_deg(view.rotation - cardinal)).abs() > 0.5, "expected breakout from {cardinal}, got {}", view.rotation);
+    }
+}

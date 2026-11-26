@@ -18,6 +18,9 @@ use crate::theme::Tokens;
 /// Snap increment, in degrees, while Shift is held.
 pub const SNAP_DEG: f32 = 15.0;
 
+/// Subtle magnetic cardinal detent window (±degrees around 0°, 90°, 180°, -90°).
+pub const MAGNETIC_DETENT_DEG: f32 = 3.0;
+
 /// A Rotate View drag in progress.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RotateDrag {
@@ -50,6 +53,85 @@ pub fn wrap_deg(a: f32) -> f32 {
         x += 360.0;
     }
     x as f32
+}
+
+/// Subtle magnetic cardinal detent around 0°, ±90°, 180° within ±`detent_deg` (3.0°):
+/// - Within `|diff| <= detent_deg`, snaps cleanly to the cardinal orientation (`is_snapped = true`).
+/// - Beyond `detent_deg`, releases smoothly (ramp over `detent_deg..2*detent_deg`, exact 1:1 beyond)
+///   so breakout never feels sticky or snaps back when accumulated continuously.
+pub fn smooth_magnetic_detent(raw_deg: f32, detent_deg: f32) -> (f32, bool) {
+    let w = wrap_deg(raw_deg);
+    let detent = if detent_deg.is_finite() { detent_deg.max(0.0) } else { MAGNETIC_DETENT_DEG };
+    if detent <= 0.0 {
+        return (w, false);
+    }
+    let cardinals = [0.0f32, 90.0, -90.0, 180.0];
+    let mut best_cardinal = 0.0f32;
+    let mut best_signed = f32::MAX;
+    for &c in &cardinals {
+        let diff = wrap_deg(w - c);
+        if diff.abs() < best_signed.abs() {
+            best_cardinal = c;
+            best_signed = diff;
+        }
+    }
+    let abs_diff = best_signed.abs();
+    if abs_diff <= detent {
+        let out = if best_cardinal == 180.0 && w < 0.0 { -180.0 } else { best_cardinal };
+        return (wrap_deg(out), true);
+    }
+    if abs_diff < detent * 2.0 {
+        let t = (abs_diff - detent) / detent;
+        return (wrap_deg(best_cardinal + best_signed * t), false);
+    }
+    (w, false)
+}
+
+/// Rotate `view` to `rotation_deg` while pinning the document point currently beneath screen
+/// `pivot` (e.g., 2-finger midpoint), stopping any zoom transition so panning/rotation align 1:1.
+pub fn rotate_about(view: &mut View, xf: &ViewXform, pivot: Pos2, rotation_deg: f32, ppp: f32) {
+    let next_rot = wrap_deg(rotation_deg);
+    if !pivot.x.is_finite() || !pivot.y.is_finite() {
+        view.rotation = next_rot;
+        return;
+    }
+    let doc = xf.to_doc(pivot);
+    let ppp = if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
+    view.zoom_animating = false;
+    view.zoom_anchor = None;
+    let mut next_xf = *xf;
+    next_xf.zoom = view.zoom / ppp;
+    next_xf.rotation = next_rot;
+    let d = next_xf.unmap_vec((pivot - xf.rect.center()) / next_xf.zoom);
+    view.rotation = next_rot;
+    if d.is_finite() && doc[0].is_finite() && doc[1].is_finite() {
+        view.center = [doc[0] as f32 - d.x, doc[1] as f32 - d.y];
+    }
+}
+
+/// Apply an incremental screen-space rotation `delta_screen_deg` around screen `pivot`, tracking
+/// a continuous un-detented `raw_acc` accumulator so `±3°` cardinal detents break out smoothly and
+/// never trap subsequent small deltas. External edits (`view.rotation != last_out`) reset cleanly.
+pub fn step_magnetic_rotation(
+    view: &mut View,
+    xf: &ViewXform,
+    pivot: Pos2,
+    delta_screen_deg: f32,
+    raw_acc: &mut Option<f32>,
+    last_out: &mut Option<f32>,
+    ppp: f32,
+) -> bool {
+    if !delta_screen_deg.is_finite() {
+        return false;
+    }
+    let synchronized = last_out.is_some_and(|prev| (prev - view.rotation).abs() <= 1e-3);
+    let base = if synchronized { raw_acc.unwrap_or(view.rotation) } else { view.rotation };
+    let raw = wrap_deg(base + delta_screen_deg);
+    *raw_acc = Some(raw);
+    let (target, snapped) = smooth_magnetic_detent(raw, MAGNETIC_DETENT_DEG);
+    rotate_about(view, xf, pivot, target, ppp);
+    *last_out = Some(view.rotation);
+    snapped
 }
 
 /// Nearest multiple of `step` degrees, wrapped. A non-positive or non-finite step is ignored.

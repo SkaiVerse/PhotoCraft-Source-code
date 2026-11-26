@@ -63,6 +63,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         var roll: CGFloat
         var mods: UInt32
         var index: NSNumber?
+        var estIndex: UInt64
+        var expectingMask: UInt32
         var ready: Bool
         var time: CFTimeInterval
         var stamp: TimeInterval
@@ -548,8 +550,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     // MARK: Gestures
 
     private func setupGestures() {
-        let direct = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
-
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(hoverMoved(_:)))
         hover.delegate = self
         addGestureRecognizer(hover)
@@ -561,26 +561,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         wheel.delegate = self
         addGestureRecognizer(wheel)
 
-        let twoFinger = UIPanGestureRecognizer(target: self, action: #selector(twoFingerScroll(_:)))
-        twoFinger.minimumNumberOfTouches = 2
-        twoFinger.maximumNumberOfTouches = 2
-        twoFinger.allowedTouchTypes = direct
-        twoFinger.cancelsTouchesInView = false
-        twoFinger.delegate = self
-        addGestureRecognizer(twoFinger)
-
-        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:)))
-        pinch.allowedTouchTypes = direct
-        pinch.cancelsTouchesInView = false
-        pinch.delegate = self
-        addGestureRecognizer(pinch)
-
-        let twist = UIRotationGestureRecognizer(target: self, action: #selector(twisted(_:)))
-        twist.allowedTouchTypes = direct
-        twist.cancelsTouchesInView = false
-        twist.delegate = self
-        twistRecognizer = twist
-        addGestureRecognizer(twist)
+        // Two-finger pan, pinch-zoom and rotation are handled in one unified direct-touch tracker
+        // so UIRotationGestureRecognizer's ~15° deadzone and recognizer conflicts never block rotation.
 
         // Press-and-hold on canvas opens context menu (finger and Apple Pencil)
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(canvasLongPress(_:)))
@@ -688,10 +670,21 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if t != .zero { pc_scroll(h, Float(t.x), Float(t.y), modBits(g.modifierFlags)) }
     }
 
-    private var pinchTotal: CGFloat = 1
-    private var twistRecognizer: UIRotationGestureRecognizer?
-    private var twistEngaged = false
-    private var twistSent: CGFloat = 0
+    // Unified 2-finger gesture state (simultaneous pan, pinch-zoom and ~2.5° midpoint rotation)
+    private var twoFingerPair: (ObjectIdentifier, ObjectIdentifier)?
+    private var twoFingerStartMid = CGPoint.zero
+    private var twoFingerStartSpan: CGFloat = 0
+    private var twoFingerPrevMid = CGPoint.zero
+    private var twoFingerPrevSpan: CGFloat = 0
+    private var twoFingerPrevAngle: CGFloat = 0
+    private var twoFingerTotalTwistRad: CGFloat = 0
+    private var twoFingerNavEngaged = false
+    private var twoFingerRotateEngaged = false
+    private var twoFingerRotateSentRad: CGFloat = 0
+    private var twoFingerPanVel = CGPoint.zero
+    private var twoFingerScaleVel: CGFloat = 0
+    private var twoFingerTwistVel: CGFloat = 0
+    private var twoFingerLastTime: CFTimeInterval = 0
 
     // Canvas Inertia & Glide Physics
     private var inertialPanVelocity: CGPoint?
@@ -700,6 +693,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private var inertialPinchCenter: CGPoint?
     private var inertialPinchLastTime: CFTimeInterval?
     private var inertialTwistVelocity: CGFloat?
+    private var inertialTwistCenter: CGPoint?
     private var inertialTwistLastTime: CFTimeInterval?
     private var wasSnappedToCardinal: Bool = false
     private let snapHaptic = UIImpactFeedbackGenerator(style: .light)
@@ -711,7 +705,157 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         inertialPinchCenter = nil
         inertialPinchLastTime = nil
         inertialTwistVelocity = nil
+        inertialTwistCenter = nil
         inertialTwistLastTime = nil
+    }
+
+    private func resetTwoFingerNav(applyInertia: Bool) {
+        if applyInertia && twoFingerNavEngaged && (CACurrentMediaTime() - twoFingerLastTime) < 0.08 {
+            if hypot(twoFingerPanVel.x, twoFingerPanVel.y) > 60.0 {
+                inertialPanVelocity = twoFingerPanVel
+                inertialPanLastTime = CACurrentMediaTime()
+            }
+            if abs(twoFingerScaleVel) > 0.15 {
+                inertialPinchVelocity = twoFingerScaleVel
+                inertialPinchCenter = twoFingerPrevMid
+                inertialPinchLastTime = CACurrentMediaTime()
+            }
+            if twoFingerRotateEngaged && abs(twoFingerTwistVel) > 0.10 {
+                inertialTwistVelocity = twoFingerTwistVel
+                inertialTwistCenter = twoFingerPrevMid
+                inertialTwistLastTime = CACurrentMediaTime()
+            }
+        }
+        if twoFingerNavEngaged, let h = handle {
+            pc_pointer_gone(h)
+        }
+        twoFingerPair = nil
+        twoFingerNavEngaged = false
+        twoFingerRotateEngaged = false
+        twoFingerTotalTwistRad = 0
+        twoFingerRotateSentRad = 0
+        twoFingerPanVel = .zero
+        twoFingerScaleVel = 0
+        twoFingerTwistVel = 0
+    }
+
+    private func sortedDirectPair() -> (UITouch, UITouch)? {
+        guard directTouches.count == 2 else { return nil }
+        let arr = Array(directTouches)
+        if ObjectIdentifier(arr[0]).hashValue <= ObjectIdentifier(arr[1]).hashValue {
+            return (arr[0], arr[1])
+        }
+        return (arr[1], arr[0])
+    }
+
+    private func updateTwoFingerStateIfNeeded() {
+        guard !pencilNear, let (t0, t1) = sortedDirectPair() else {
+            if twoFingerPair != nil {
+                resetTwoFingerNav(applyInertia: directTouches.count < 2)
+            }
+            return
+        }
+        let idPair = (ObjectIdentifier(t0), ObjectIdentifier(t1))
+        let p0 = t0.location(in: self)
+        let p1 = t1.location(in: self)
+        let mid = CGPoint(x: (p0.x + p1.x) * 0.5, y: (p0.y + p1.y) * 0.5)
+        let dx = p1.x - p0.x, dy = p1.y - p0.y
+        let span = hypot(dx, dy)
+        let ang = atan2(dy, dx)
+        let now = CACurrentMediaTime()
+
+        if twoFingerPair == nil || twoFingerPair! != idPair {
+            stopInertia()
+            cancelFinger()
+            twoFingerPair = idPair
+            twoFingerStartMid = mid
+            twoFingerStartSpan = span
+            twoFingerPrevMid = mid
+            twoFingerPrevSpan = span
+            twoFingerPrevAngle = ang
+            twoFingerTotalTwistRad = 0
+            twoFingerNavEngaged = false
+            twoFingerRotateEngaged = false
+            twoFingerRotateSentRad = 0
+            twoFingerPanVel = .zero
+            twoFingerScaleVel = 0
+            twoFingerTwistVel = 0
+            twoFingerLastTime = now
+            wasSnappedToCardinal = false
+            snapHaptic.prepare()
+            return
+        }
+
+        var dAng = ang - twoFingerPrevAngle
+        if dAng > .pi { dAng -= 2 * .pi } else if dAng < -.pi { dAng += 2 * .pi }
+        twoFingerTotalTwistRad += dAng
+
+        let panDistFromStart = hypot(mid.x - twoFingerStartMid.x, mid.y - twoFingerStartMid.y)
+        let pinchDistFromStart = abs(span - twoFingerStartSpan)
+        let rotateThresholdRad: CGFloat = 2.5 * .pi / 180.0
+
+        if !twoFingerNavEngaged {
+            if panDistFromStart > 6.0 || pinchDistFromStart > 6.0 || abs(twoFingerTotalTwistRad) >= rotateThresholdRad {
+                twoFingerNavEngaged = true
+                multiTouchExceededSlop = true
+                cancelFinger()
+            }
+        }
+        if !twoFingerRotateEngaged && abs(twoFingerTotalTwistRad) >= rotateThresholdRad {
+            twoFingerRotateEngaged = true
+            twoFingerRotateSentRad = 0
+        }
+
+        guard let h = handle, twoFingerNavEngaged else {
+            twoFingerPrevMid = mid
+            twoFingerPrevSpan = span
+            twoFingerPrevAngle = ang
+            twoFingerLastTime = now
+            return
+        }
+
+        let dt = max(0.001, min(0.05, now - twoFingerLastTime))
+        let dMid = CGPoint(x: mid.x - twoFingerPrevMid.x, y: mid.y - twoFingerPrevMid.y)
+        pc_pointer_moved(h, Float(mid.x), Float(mid.y))
+        if abs(dMid.x) > 0.01 || abs(dMid.y) > 0.01 {
+            pc_scroll(h, Float(dMid.x), Float(dMid.y), 0)
+            let instPan = CGPoint(x: dMid.x / CGFloat(dt), y: dMid.y / CGFloat(dt))
+            twoFingerPanVel = CGPoint(x: twoFingerPanVel.x * 0.6 + instPan.x * 0.4,
+                                      y: twoFingerPanVel.y * 0.6 + instPan.y * 0.4)
+        }
+        if twoFingerPrevSpan > 4.0 && span > 4.0 {
+            let scale = span / twoFingerPrevSpan
+            if abs(scale - 1.0) > 0.0005 {
+                pc_zoom(h, Float(scale), Float(mid.x), Float(mid.y))
+                let instScale = (scale - 1.0) / CGFloat(dt)
+                twoFingerScaleVel = twoFingerScaleVel * 0.6 + instScale * 0.4
+            }
+        }
+        if twoFingerRotateEngaged {
+            let dRot = twoFingerTotalTwistRad - twoFingerRotateSentRad
+            twoFingerRotateSentRad = twoFingerTotalTwistRad
+            if abs(dRot) > 0.0001 {
+                pc_rotate(h, Float(dRot), Float(mid.x), Float(mid.y))
+                let instTwist = dRot / CGFloat(dt)
+                twoFingerTwistVel = twoFingerTwistVel * 0.6 + instTwist * 0.4
+            }
+            var isSnapped: Int32 = 0
+            let currentRot = pc_canvas_rotation(h)
+            _ = pc_apply_magnetic_rotation(currentRot, 3.0, &isSnapped)
+            if isSnapped != 0 {
+                if !wasSnappedToCardinal {
+                    snapHaptic.impactOccurred()
+                    wasSnappedToCardinal = true
+                }
+            } else {
+                wasSnappedToCardinal = false
+            }
+        }
+
+        twoFingerPrevMid = mid
+        twoFingerPrevSpan = span
+        twoFingerPrevAngle = ang
+        twoFingerLastTime = now
     }
 
     private func updateInertia() {
@@ -767,15 +911,15 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             let decay = exp(-6.0 * dt)
             let dRot = tv * CGFloat(dt)
             if abs(dRot) > 0.001 {
-                let cx = Float(bounds.midX)
-                let cy = Float(bounds.midY)
-                pc_rotate(h, Float(dRot), cx, cy)
+                let center = inertialTwistCenter ?? CGPoint(x: bounds.midX, y: bounds.midY)
+                pc_rotate(h, Float(dRot), Float(center.x), Float(center.y))
             }
             let nextTv = tv * CGFloat(decay)
             if abs(nextTv) > 0.05 {
                 inertialTwistVelocity = nextTv
             } else {
                 inertialTwistVelocity = nil
+                inertialTwistCenter = nil
                 inertialTwistLastTime = nil
             }
         }
@@ -792,114 +936,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if pc_quickshape_trigger(h, Int32(isConstrained)) == 1 {
             quickShapeActive = true
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        }
-    }
-
-    @objc private func twoFingerScroll(_ g: UIPanGestureRecognizer) {
-        guard let h = handle else { return }
-        if g.state == .began {
-            cancelFinger()
-            stopInertia()
-        }
-        if g.state == .ended {
-            let vel = g.velocity(in: self)
-            if hypot(vel.x, vel.y) > 60.0 {
-                inertialPanVelocity = vel
-                inertialPanLastTime = CACurrentMediaTime()
-            }
-            pc_pointer_gone(h)
-            return
-        }
-        if g.state == .cancelled {
-            pc_pointer_gone(h)
-            return
-        }
-        guard g.state != .failed else { return }
-        let t = g.translation(in: self)
-        g.setTranslation(.zero, in: self)
-        let c = g.location(in: self)
-        pc_pointer_moved(h, Float(c.x), Float(c.y))
-        if t != .zero {
-            pc_scroll(h, Float(t.x), Float(t.y), 0)
-        }
-    }
-
-    /// Two-finger twist turns the canvas view only. It starts after a small twist (fluid like Affinity),
-    /// allowing simultaneous two-finger pan, pinch zoom, and rotation.
-    @objc private func twisted(_ g: UIRotationGestureRecognizer) {
-        guard let h = handle else { return }
-        switch g.state {
-        case .began:
-            cancelFinger()
-            stopInertia()
-            twistEngaged = false
-            twistSent = 0
-            wasSnappedToCardinal = false
-            snapHaptic.prepare()
-        case .changed:
-            let total = g.rotation   // radians since the twist began, clockwise is positive
-            if !twistEngaged {
-                let degrees = abs(total) * 180 / CGFloat.pi
-                if degrees < 1.0 { return }
-                twistEngaged = true
-                twistSent = total
-                return
-            }
-            let delta = total - twistSent
-            twistSent = total
-            // Always rotate around the canvas center.
-            let cx = Float(bounds.midX)
-            let cy = Float(bounds.midY)
-            pc_rotate(h, Float(delta), cx, cy)
-
-            // Soft magnetic detent check with haptic feedback
-            var isSnapped: Int32 = 0
-            let currentRot = pc_canvas_rotation(h)
-            _ = pc_apply_magnetic_rotation(currentRot, 4.0, &isSnapped)
-            if isSnapped != 0 {
-                if !wasSnappedToCardinal {
-                    snapHaptic.impactOccurred()
-                    wasSnappedToCardinal = true
-                }
-            } else {
-                wasSnappedToCardinal = false
-            }
-        case .ended:
-            let vel = g.velocity
-            if abs(vel) > 0.10 {
-                inertialTwistVelocity = vel
-                inertialTwistLastTime = CACurrentMediaTime()
-            }
-            twistEngaged = false
-        case .cancelled:
-            twistEngaged = false
-        default: break
-        }
-    }
-
-    @objc private func pinched(_ g: UIPinchGestureRecognizer) {
-        guard let h = handle else { return }
-        switch g.state {
-        case .began:
-            cancelFinger()
-            stopInertia()
-            pinchTotal = 1
-        case .changed:
-            let p = g.location(in: self)
-            pinchTotal *= g.scale
-            pc_zoom(h, Float(g.scale), Float(p.x), Float(p.y))
-            g.scale = 1
-        case .ended:
-            let vel = g.velocity
-            if abs(vel) > 0.15 {
-                inertialPinchVelocity = vel
-                inertialPinchCenter = g.location(in: self)
-                inertialPinchLastTime = CACurrentMediaTime()
-            }
-            pc_pointer_gone(h)
-        case .cancelled:
-            pc_pointer_gone(h)
-        default: break
         }
     }
 
@@ -1015,6 +1051,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             let rawNorm: Float = maxForce > 0 ? Float(min(1.0, max(0.0, c.force / maxForce))) : 0.5
             let expectingUpdate = c.estimationUpdateIndex != nil && c.estimatedPropertiesExpectingUpdates.contains(.force)
             let forceEstimated = c.estimatedProperties.contains(.force) || expectingUpdate
+            let estMask = estimationMask(for: c)
+            let estIdx: UInt64 = (estMask != 0 && c.estimationUpdateIndex != nil) ? UInt64(c.estimationUpdateIndex!.int64Value) : 0
             let bogusZero = rawNorm <= 1e-4
             let isUnknown = forceEstimated || bogusZero
             recordDebugTouch(c, loc: loc, forceEstimated: forceEstimated, phase: UInt8(clamping: phase))
@@ -1035,7 +1073,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                     azimuth: c.azimuthUnitVector(in: self),
                     roll: roll,
                     mods: mods,
-                    index: nil,
+                    index: estMask != 0 ? c.estimationUpdateIndex : nil,
+                    estIndex: estIdx,
+                    expectingMask: phase >= 2 ? 0 : estMask,
                     ready: true,
                     time: CACurrentMediaTime(),
                     stamp: c.timestamp))
@@ -1050,7 +1090,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                     azimuth: c.azimuthUnitVector(in: self),
                     roll: roll,
                     mods: mods,
-                    index: nil,
+                    index: estMask != 0 ? c.estimationUpdateIndex : nil,
+                    estIndex: estIdx,
+                    expectingMask: phase >= 2 ? 0 : estMask,
                     ready: true,
                     time: CACurrentMediaTime(),
                     stamp: c.timestamp))
@@ -1066,6 +1108,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                     roll: roll,
                     mods: mods,
                     index: expectingUpdate ? c.estimationUpdateIndex : nil,
+                    estIndex: estIdx,
+                    expectingMask: phase >= 2 ? 0 : estMask,
                     ready: false,
                     time: CACurrentMediaTime(),
                     stamp: c.timestamp))
@@ -1075,6 +1119,15 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             lastQueuedLocation = nil
         }
         flushPen(all: phase >= 2)
+    }
+
+    private func estimationMask(for touch: UITouch) -> UInt32 {
+        var mask: UInt32 = 0
+        let exp = touch.estimatedPropertiesExpectingUpdates
+        if exp.contains(.force) { mask |= 1 }
+        if exp.contains(.altitude) { mask |= 2 }
+        if exp.contains(.azimuth) { mask |= 4 }
+        return mask
     }
 
     /// iPadOS refines the Pencil's pressure a few milliseconds after the touch. Matching the
@@ -1089,12 +1142,15 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             let confirmedNow = !stillEstimated && rawNorm > 1e-4
             recordDebugTouch(t, loc: t.preciseLocation(in: self), forceEstimated: stillEstimated, phase: 4)
             let confirmedForce = max(0.0009765625, min(1.0, rawNorm))
+            let remainingMask = estimationMask(for: t)
 
             var updatedQueued = false
             if let index = t.estimationUpdateIndex {
                 for i in penQueueHead..<penQueue.count {
                     if penQueue[i].index == index {
                         penQueue[i].altitude = t.altitudeAngle
+                        penQueue[i].azimuth = t.azimuthUnitVector(in: self)
+                        penQueue[i].expectingMask = remainingMask
                         if confirmedNow || (!expecting && rawNorm > 1e-4) {
                             lastConfirmedForce = confirmedForce
                             penQueue[i].normForce = confirmedForce
@@ -1107,11 +1163,17 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                     }
                 }
             }
-            if !updatedQueued && t === pencilTouch && confirmedNow {
+            if confirmedNow {
                 lastConfirmedForce = confirmedForce
-                let (tx, ty) = self.tilt(altitude: t.altitudeAngle, azimuth: t.azimuthUnitVector(in: self))
-                var roll: Float = 0
-                if #available(iOS 17.5, *) { roll = Float(t.rollAngle * 180 / CGFloat.pi) }
+            }
+            let (tx, ty) = self.tilt(altitude: t.altitudeAngle, azimuth: t.azimuthUnitVector(in: self))
+            var roll: Float = 0
+            if #available(iOS 17.5, *) { roll = Float(t.rollAngle * 180 / CGFloat.pi) }
+            if let index = t.estimationUpdateIndex, !updatedQueued {
+                let estIdx = UInt64(index.int64Value)
+                let forceArg: Float = confirmedNow ? confirmedForce : -1.0
+                pc_pen_update_estimate_ex(h, estIdx, forceArg, tx, ty, roll, remainingMask)
+            } else if !updatedQueued && t === pencilTouch && confirmedNow {
                 pc_pen_update_estimate(h, confirmedForce, tx, ty, roll)
             }
         }
@@ -1157,6 +1219,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         var tiltY: Float
         var roll: Float
         var stamp: TimeInterval
+        var estIndex: UInt64
+        var expectingMask: UInt32
     }
 
     /// The last few real samples. Each new sample lets the curve between the two before it be drawn smoothly.
@@ -1172,7 +1236,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         let pressure = max(0.0009765625, min(1.0, item.normForce))
         let (tx, ty) = self.tilt(altitude: Double(item.altitude), azimuth: item.azimuth)
         var point = PenPoint(x: Double(item.location.x), y: Double(item.location.y), pressure: pressure, tiltX: tx, tiltY: ty,
-                             roll: Float(item.roll * 180 / CGFloat.pi), stamp: item.stamp)
+                             roll: Float(item.roll * 180 / CGFloat.pi), stamp: item.stamp,
+                             estIndex: item.estIndex, expectingMask: item.expectingMask)
 
         // How late the sample reaches the app, measured from the moment of the touch.
         let delay = (ProcessInfo.processInfo.systemUptime - item.stamp) * 1000
@@ -1266,7 +1331,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                         tiltX: point.tiltX,
                         tiltY: point.tiltY,
                         roll: point.roll,
-                        stamp: point.stamp + 0.002 * Double(step))
+                        stamp: point.stamp + 0.002 * Double(step),
+                        estIndex: 0,
+                        expectingMask: 0)
                     emitPen(tp, phase: step == 2 ? item.phase : 1, mods: item.mods)
                 }
             } else {
@@ -1280,7 +1347,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     private func emitPen(_ p: PenPoint, phase: Int32, mods: UInt32) {
         guard let h = handle else { return }
-        pc_pen(h, Float(p.x), Float(p.y), phase, p.pressure, p.tiltX, p.tiltY, p.roll, mods, p.stamp)
+        pc_pen_ex(h, Float(p.x), Float(p.y), phase, p.pressure, p.tiltX, p.tiltY, p.roll, mods, p.stamp, p.estIndex, p.expectingMask)
     }
 
     /// Extra points along a smooth (centripetal Catmull-Rom) curve from `p1` to `p2`, so a fast
@@ -1307,11 +1374,11 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         // is strictly the backward difference (p2 - p1)/dt12. This eliminates division-by-zero tangent spikes
         // and wild overshoots from duplicate or near-duplicate points.
         let len01 = p0 != nil ? ((p0!.x - p1.x) * (p0!.x - p1.x) + (p0!.y - p1.y) * (p0!.y - p1.y)).squareRoot() : 0.0
-        let a = (p0 != nil && len01 >= 0.5) ? p0! : PenPoint(x: 2 * p1.x - p2.x, y: 2 * p1.y - p2.y, pressure: p1.pressure, tiltX: p1.tiltX, tiltY: p1.tiltY, roll: p1.roll, stamp: p1.stamp)
+        let a = (p0 != nil && len01 >= 0.5) ? p0! : PenPoint(x: 2 * p1.x - p2.x, y: 2 * p1.y - p2.y, pressure: p1.pressure, tiltX: p1.tiltX, tiltY: p1.tiltY, roll: p1.roll, stamp: p1.stamp, estIndex: 0, expectingMask: 0)
         let dt01 = (p0 != nil && len01 >= 0.5) ? dist(a, p1) : dt12
 
         let len23 = p3 != nil ? ((p3!.x - p2.x) * (p3!.x - p2.x) + (p3!.y - p2.y) * (p3!.y - p2.y)).squareRoot() : 0.0
-        let d = (p3 != nil && len23 >= 0.5) ? p3! : PenPoint(x: 2 * p2.x - p1.x, y: 2 * p2.y - p1.y, pressure: p2.pressure, tiltX: p2.tiltX, tiltY: p2.tiltY, roll: p2.roll, stamp: p2.stamp)
+        let d = (p3 != nil && len23 >= 0.5) ? p3! : PenPoint(x: 2 * p2.x - p1.x, y: 2 * p2.y - p1.y, pressure: p2.pressure, tiltX: p2.tiltX, tiltY: p2.tiltY, roll: p2.roll, stamp: p2.stamp, estIndex: 0, expectingMask: 0)
         let dt23 = (p3 != nil && len23 >= 0.5) ? dist(p2, d) : dt12
 
         let t0 = 0.0
@@ -1351,7 +1418,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                                tiltX: p1.tiltX + (p2.tiltX - p1.tiltX) * f,
                                tiltY: p1.tiltY + (p2.tiltY - p1.tiltY) * f,
                                roll: p1.roll + rollDelta * f,
-                               stamp: midStamp)
+                               stamp: midStamp,
+                               estIndex: p2.estIndex,
+                               expectingMask: p2.expectingMask)
             emitPen(mid, phase: 1, mods: mods)
         }
     }
@@ -1372,6 +1441,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             switch t.type {
             case .pencil:
                 stopInertia()
+                resetTwoFingerNav(applyInertia: false)
                 // Anything already resting on the screen is a palm.
                 for d in directTouches { ignoredTouches.insert(d) }
                 directTouches.removeAll()
@@ -1414,6 +1484,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                     // Multi-touch gesture (2-finger undo/pan/zoom/rotate or 3-finger redo):
                     // Discard any pending or active single-finger touch immediately so zero pixels are stamped!
                     cancelFinger()
+                    updateTwoFingerStateIfNeeded()
                 } else if directTouches.count == 1 {
                     // Buffer initial single-finger touch briefly (45ms) to arbitrate against a 2nd or 3rd finger landing.
                     pendingFingerTouch = t
@@ -1459,6 +1530,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                         }
                     }
                     queuePen(t, phase: 1, event: event, mods: mods)
+                    pc_pen_predicted_clear(h)
                     if let predicted = event?.predictedTouches(for: t), !predicted.isEmpty {
                         for pt in predicted {
                             let maxForce = pt.maximumPossibleForce
@@ -1471,8 +1543,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                             if #available(iOS 17.5, *) { roll = Float(pt.rollAngle * 180 / CGFloat.pi) }
                             pc_pen_predicted(h, Float(loc.x), Float(loc.y), safeForce, tx, ty, roll, pt.timestamp)
                         }
-                    } else {
-                        pc_pen_predicted_clear(h)
                     }
                 }
             case .indirectPointer:
@@ -1483,6 +1553,10 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                     if (dx * dx + dy * dy) > (15.0 * 15.0) {
                         multiTouchExceededSlop = true
                     }
+                }
+                if directTouches.count == 2 {
+                    updateTwoFingerStateIfNeeded()
+                    continue
                 }
                 if t === pendingFingerTouch {
                     let dx = p.x - pendingFingerPos.x, dy = p.y - pendingFingerPos.y
@@ -1547,6 +1621,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                     }
                 }
                 directTouches.remove(t)
+                if twoFingerPair != nil && directTouches.count < 2 {
+                    resetTwoFingerNav(applyInertia: !cancelled)
+                }
                 if t === fingerTouch {
                     pc_finger(h, cancelled ? 3 : 2, Float(p.x), Float(p.y), mods)
                     fingerTouch = nil

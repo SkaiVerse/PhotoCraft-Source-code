@@ -757,3 +757,132 @@ fn test_magnetic_rotation_angle_snapping_detent_and_breakout() {
     assert!(!is_snap);
     assert_eq!(nan_angle, 0.0, "NaN angle must safely return 0.0 without NaN propagation");
 }
+
+#[test]
+fn ui_smoothing_zero_maps_to_five_percent_floor_and_runs_catch_up() {
+    use crate::dynamics::{SMOOTHING_FLOOR, Smoother, effective_smoothing_amount, smooth_points};
+
+    let cfg_zero = Smoothing { enabled: true, amount: 0.0, catch_up_on_end: true, ..Default::default() };
+    let cfg_half = Smoothing { enabled: true, amount: 0.5, ..Default::default() };
+    let cfg_full = Smoothing { enabled: true, amount: 1.0, ..Default::default() };
+    let cfg_off = Smoothing { enabled: false, amount: 0.5, ..Default::default() };
+
+    assert!((effective_smoothing_amount(&cfg_zero) - SMOOTHING_FLOOR).abs() < 1e-6);
+    assert!((effective_smoothing_amount(&cfg_half) - 0.525).abs() < 1e-6);
+    assert!((effective_smoothing_amount(&cfg_full) - 1.0).abs() < 1e-6);
+    assert_eq!(effective_smoothing_amount(&cfg_off), 0.0);
+
+    // At UI 0% smoothing (5% effective floor), Smoother runs exponential pull and catch-up on end.
+    let mut smoother = Smoother::new(&cfg_zero, 1.0);
+    let mut out = Vec::new();
+    smoother.push(StrokePoint::new(0.0, 0.0, 1.0), &mut out);
+    smoother.push(StrokePoint { time: 4.0, ..StrokePoint::new(100.0, 0.0, 1.0) }, &mut out);
+    assert!(out.last().unwrap().x < 100.0, "5% smoothing floor must engage instead of bypassing");
+    smoother.finish(&mut out);
+    assert!((out.last().unwrap().x - 100.0).abs() < 1e-6, "catch-up on end must complete at UI 0%");
+
+    // Pressure -> Size with UI 0% smoothing produces continuous smooth dabs with no beaded gaps.
+    let brush = BrushSettings {
+        size: 36.0,
+        spacing: 0.25,
+        pressure_size: true,
+        pressure_opacity: false,
+        smoothing: Smoothing { enabled: true, amount: 0.0, catch_up_on_end: true, ..Default::default() },
+        ..Default::default()
+    };
+    let pts: Vec<StrokePoint> = (0..12)
+        .map(|i| StrokePoint {
+            time: f64::from(i) * 4.0,
+            ..StrokePoint::new(10.0 + f64::from(i) * 10.0, 20.0, 0.4 + 0.04 * i as f32)
+        })
+        .collect();
+    let smoothed = smooth_points(&brush.smoothing, 1.0, &pts);
+    assert!(smoothed.len() >= pts.len());
+    let stroke = crate::Stroke { brush, points: pts };
+    let dabs = crate::dabs(&stroke);
+    assert!(dabs.len() > 8);
+    for w in dabs.windows(2) {
+        let gap = (w[1].center.x - w[0].center.x).hypot(w[1].center.y - w[0].center.y);
+        assert!(gap <= f64::from(w[0].radius.max(w[1].radius)) * 0.65, "excessive dab gap {gap} indicates dot beading");
+    }
+}
+
+#[test]
+fn split_stroke_updates_tail_in_place_without_duplicate_dabs() {
+    use crate::render::{EST_ALTITUDE, EST_FORCE, SplitStroke, TailPoint, render_stroke};
+    use photocraft_color::PixelFormat;
+    use photocraft_geom::Rect;
+    use photocraft_raster::Surface;
+
+    let fmt = PixelFormat::RGBA8;
+    let brush = BrushSettings {
+        size: 24.0,
+        spacing: 0.25,
+        hardness: 1.0,
+        pressure_size: true,
+        smoothing: Smoothing { enabled: true, amount: 0.0, catch_up_on_end: true, ..Default::default() },
+        color: [0.0, 0.0, 0.0, 1.0],
+        ..Default::default()
+    };
+    let mut split = SplitStroke::new(&brush, Some(fmt), 1.0).record_dabs();
+
+    // 4 finalized head samples followed by 3 unfinalized tail samples expecting updates.
+    let head: Vec<TailPoint> = (0..4)
+        .map(|i| TailPoint::finalized(StrokePoint {
+            time: f64::from(i) * 4.0,
+            ..StrokePoint::new(10.0 + f64::from(i) * 12.0, 40.0, 0.5)
+        }))
+        .collect();
+    split.push_tagged(&head);
+    assert_eq!(split.tail_len(), 0, "finalized head samples bake immediately");
+    let baked_head_dabs = split.dab_count();
+    assert!(baked_head_dabs > 0);
+
+    let tail = vec![
+        TailPoint::new(StrokePoint { time: 16.0, ..StrokePoint::new(58.0, 40.0, 0.25) }, 101, EST_FORCE | EST_ALTITUDE),
+        TailPoint::new(StrokePoint { time: 20.0, ..StrokePoint::new(70.0, 40.0, 0.25) }, 102, EST_FORCE),
+        TailPoint::new(StrokePoint { time: 24.0, ..StrokePoint::new(82.0, 40.0, 0.30) }, 103, EST_FORCE),
+    ];
+    split.push_tagged(&tail);
+    assert_eq!(split.tail_len(), 3, "unfinalized samples stay in editable tail");
+    assert_eq!(split.dab_count(), baked_head_dabs, "finalized dab buffer must not mutate for unfinalized tail");
+
+    let pre = Surface::new(fmt);
+    let mut live_surf = pre.clone();
+    let (_, old_tail) = split.composite_live(Rect::EMPTY, &pre, &mut live_surf, None, false);
+
+    // Refine middle tail point #102 in place from pressure 0.25 -> 0.95 (keeps same finalized head).
+    assert!(split.update_estimate(102, Some(0.95), Some(12.0), Some(-6.0), None, 0));
+    assert_eq!(split.dab_count(), baked_head_dabs, "finalized watermark does not advance past #101 until #101 finalizes");
+
+    let preview_after_update = split.preview_dabs();
+    // Zero duplicate dabs at the exact same position in the updated preview.
+    for (i, w) in preview_after_update.windows(2).enumerate() {
+        let sep = (w[1].center.x - w[0].center.x).hypot(w[1].center.y - w[0].center.y);
+        assert!(sep > 0.25, "duplicate dab found at index {i} after in-place estimate patch");
+    }
+
+    let (_, _new_tail) = split.composite_live(old_tail, &pre, &mut live_surf, None, false);
+    // Finalize remaining tail and verify pixel-exact match against a clean full-stroke render with finalized values.
+    split.finish();
+    let old_tail2 = Rect::new(0, 0, 140, 80);
+    split.finalized_mut().mark_dirty(old_tail2);
+    split.composite(&pre, &mut live_surf, None, false, true);
+
+    let mut expected_pts: Vec<StrokePoint> = head.iter().map(|t| t.point).collect();
+    expected_pts.push(tail[0].point);
+    let mut updated_102 = tail[1].point;
+    updated_102.pressure = 0.95;
+    updated_102.tilt_x = 12.0;
+    updated_102.tilt_y = -6.0;
+    expected_pts.push(updated_102);
+    expected_pts.push(tail[2].point);
+
+    let mut expected_surf = pre.clone();
+    render_stroke(&mut expected_surf, &brush, &expected_pts, None, false, 1.0);
+    for y in 0..80 {
+        for x in 0..140 {
+            assert_eq!(live_surf.rgba(x, y), expected_surf.rgba(x, y), "pixel mismatch at ({x}, {y})");
+        }
+    }
+}

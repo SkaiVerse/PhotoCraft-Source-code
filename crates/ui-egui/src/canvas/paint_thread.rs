@@ -42,6 +42,10 @@ impl Shown {
 struct State {
     /// Points handed over that the stroke hasn't painted yet.
     pending: Vec<StrokePoint>,
+    /// Estimation-tagged points handed over that the stroke hasn't painted yet.
+    pending_tagged: Vec<(StrokePoint, u64, u32)>,
+    /// Asynchronous estimation updates for in-flight tail points.
+    pending_updates: Vec<crate::stylus::EstimateUpdate>,
     /// The stroke, while nothing is painting with it.
     stroke: Option<EngineStroke>,
     /// Steps painted since the canvas last took them, and what the last one shows.
@@ -62,7 +66,7 @@ struct State {
 
 impl State {
     fn idle(&self) -> bool {
-        self.stroke.is_some() && self.pending.is_empty()
+        self.stroke.is_some() && self.pending.is_empty() && self.pending_tagged.is_empty() && self.pending_updates.is_empty()
     }
 }
 
@@ -76,26 +80,66 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Paint the pending points, if the stroke is free.
+    /// Paint the pending points and estimation updates, if the stroke is free.
     fn paint_pending(&self) {
-        let (pts, stroke) = {
+        let (updates, tagged, pts, stroke) = {
             let mut st = self.lock();
-            if st.pending.is_empty() {
+            if st.pending.is_empty() && st.pending_tagged.is_empty() && st.pending_updates.is_empty() {
                 return;
             }
             let Some(stroke) = st.stroke.take() else { return };
-            (std::mem::take(&mut st.pending), stroke)
+            (
+                std::mem::take(&mut st.pending_updates),
+                std::mem::take(&mut st.pending_tagged),
+                std::mem::take(&mut st.pending),
+                stroke,
+            )
         };
         #[cfg(test)]
         self.test_hooks();
         let mut stroke = stroke;
-        let step = stroke.push(&pts);
+        let mut step = Ok(Rect::EMPTY);
+        for u in &updates {
+            match stroke.update_estimate(u) {
+                Ok(r) => {
+                    if let Ok(acc) = step.as_mut() {
+                        *acc = acc.union(&r);
+                    }
+                }
+                Err(e) => {
+                    step = Err(e);
+                    break;
+                }
+            }
+        }
+        if step.is_ok() && !tagged.is_empty() {
+            match stroke.push_tagged(&tagged) {
+                Ok(r) => {
+                    if let Ok(acc) = step.as_mut() {
+                        *acc = acc.union(&r);
+                    }
+                }
+                Err(e) => step = Err(e),
+            }
+        }
+        if step.is_ok() && !pts.is_empty() {
+            match stroke.push(&pts) {
+                Ok(r) => {
+                    if let Ok(acc) = step.as_mut() {
+                        *acc = acc.union(&r);
+                    }
+                }
+                Err(e) => step = Err(e),
+            }
+        }
         let mut st = self.lock();
         if step.is_ok() {
             st.shown = Shown::of(&stroke);
         } else {
             st.failed = true;
             st.pending.clear();
+            st.pending_tagged.clear();
+            st.pending_updates.clear();
         }
         st.steps.push(step);
         st.stroke = Some(stroke);
@@ -119,7 +163,7 @@ impl Shared {
         loop {
             {
                 let mut st = self.lock();
-                while st.pending.is_empty() && !st.closed {
+                while st.pending.is_empty() && st.pending_tagged.is_empty() && st.pending_updates.is_empty() && !st.closed {
                     st = self.changed.wait(st).unwrap_or_else(PoisonError::into_inner);
                 }
                 if st.closed {
@@ -144,6 +188,8 @@ impl PaintThread {
         let shown = Shown::of(&stroke);
         let state = State {
             pending: Vec::new(),
+            pending_tagged: Vec::new(),
+            pending_updates: Vec::new(),
             stroke: Some(stroke),
             steps: Vec::new(),
             shown: shown.clone(),
@@ -166,6 +212,7 @@ impl PaintThread {
     }
 
     /// Hand points over to be painted (none after a failed step).
+    #[cfg(test)]
     pub(super) fn push(&mut self, pts: Vec<StrokePoint>) {
         if pts.is_empty() {
             return;
@@ -176,6 +223,44 @@ impl PaintThread {
                 return;
             }
             st.pending.extend(pts);
+        }
+        if self.thread.is_some() {
+            self.shared.changed.notify_all();
+        } else {
+            self.shared.paint_pending();
+        }
+    }
+
+    /// Hand estimation-tagged points over to be painted (none after a failed step).
+    pub(super) fn push_tagged(&mut self, pts: Vec<(StrokePoint, u64, u32)>) {
+        if pts.is_empty() {
+            return;
+        }
+        {
+            let mut st = self.shared.lock();
+            if st.failed {
+                return;
+            }
+            st.pending_tagged.extend(pts);
+        }
+        if self.thread.is_some() {
+            self.shared.changed.notify_all();
+        } else {
+            self.shared.paint_pending();
+        }
+    }
+
+    /// Queue asynchronous estimation updates to patch in-flight tail points in place.
+    pub(super) fn push_updates(&mut self, updates: &[crate::stylus::EstimateUpdate]) {
+        if updates.is_empty() {
+            return;
+        }
+        {
+            let mut st = self.shared.lock();
+            if st.failed {
+                return;
+            }
+            st.pending_updates.extend_from_slice(updates);
         }
         if self.thread.is_some() {
             self.shared.changed.notify_all();

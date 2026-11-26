@@ -879,15 +879,15 @@ fn smoothing_modes() {
     assert_eq!(sm.last().map(|p| (p.x, p.y)), zig.last().map(|p| (p.x, p.y)));
     let no = smooth_points(&Smoothing { catch_up_on_end: false, ..cfg.clone() }, 1.0, &zig);
     assert!(no.last().unwrap().x < zig.last().unwrap().x - 1.0);
-    // Pulled string: jitter smaller than the string moves nothing; the brush trails by the string.
+    // Pulled string (0.2 -> effective 0.24 = 24 px): jitter smaller than the string moves nothing; the brush trails by the string.
     let ps = Smoothing { amount: 0.2, pulled_string: true, catch_up_on_end: false, ..Default::default() };
     let jitter: Vec<StrokePoint> = (0..20).map(|i| StrokePoint::new(if i % 2 == 0 { 0.0 } else { 5.0 }, 0.0, 1.0)).collect();
-    assert_eq!(smooth_points(&ps, 1.0, &jitter).len(), 1, "within the 20 px string: no motion");
+    assert_eq!(smooth_points(&ps, 1.0, &jitter).len(), 1, "within the 24 px string: no motion");
     let far = smooth_points(&ps, 1.0, &[StrokePoint::new(0.0, 0.0, 1.0), StrokePoint::new(100.0, 0.0, 1.0)]);
-    assert!((far.last().unwrap().x - 80.0).abs() < 1e-4);
+    assert!((far.last().unwrap().x - 76.0).abs() < 1e-4);
     // Adjust for zoom: at 200 % zoom the string is half as long in image pixels.
     let far = smooth_points(&ps, 2.0, &[StrokePoint::new(0.0, 0.0, 1.0), StrokePoint::new(100.0, 0.0, 1.0)]);
-    assert!((far.last().unwrap().x - 90.0).abs() < 1e-4);
+    assert!((far.last().unwrap().x - 88.0).abs() < 1e-4);
     // Stroke catch-up: a pause (timestamps) lets the brush converge on the pointer.
     let mut a = StrokePoint::new(0.0, 0.0, 1.0);
     a.time = 0.0;
@@ -953,7 +953,7 @@ fn smoothing_string_runs_from_the_lagging_brush_to_the_pointer() {
     let (brush, pointer) = s.string().unwrap();
     assert!(brush[0] > 0.0 && brush[0] < 100.0, "the brush lags: {brush:?}");
     assert_eq!(pointer, [100.0, 0.0]);
-    let mut off = Smoother::new(&Smoothing { amount: 0.0, ..cfg }, 1.0);
+    let mut off = Smoother::new(&Smoothing { enabled: false, amount: 0.0, ..cfg }, 1.0);
     off.push(StrokePoint::new(0.0, 0.0, 1.0), &mut out);
     off.push(StrokePoint::new(100.0, 0.0, 1.0), &mut out);
     assert_eq!(off.string(), None, "smoothing off: no string");
@@ -975,8 +975,8 @@ fn smoothing_pulls_by_time_not_by_how_often_the_device_reports() {
         out.last().map_or(0.0, |p| p.x)
     };
     let (fast, slow) = (run(1.0), run(16.0));
-    // Two 16 ms steps of a 0.2 pull: 1 - 0.8² = 36 % of the way.
-    assert!((slow - 36.0).abs() < 1e-4, "{slow}");
+    // Two 16 ms steps of a 0.19 pull (effective smoothing 0.8 -> 0.81): 1 - 0.81² = 34.39 % of the way.
+    assert!((slow - 34.39).abs() < 1e-4, "{slow}");
     assert!((fast - slow).abs() < 1e-4, "1000 Hz {fast} vs 60 Hz {slow}");
     // Without timestamps each point is one step, as before.
     let mut s = Smoother::new(&cfg, 1.0);
@@ -984,7 +984,7 @@ fn smoothing_pulls_by_time_not_by_how_often_the_device_reports() {
     for x in [0.0, 100.0] {
         s.push(StrokePoint::new(x, 0.0, 1.0), &mut out);
     }
-    assert!((out.last().map_or(0.0, |p| p.x) - 20.0).abs() < 1e-4);
+    assert!((out.last().map_or(0.0, |p| p.x) - 19.0).abs() < 1e-4);
 }
 
 #[test]
@@ -1024,13 +1024,13 @@ fn a_pulled_string_brush_takes_the_pose_along_the_string() {
     let a = StrokePoint { rotation: 350.0, ..StrokePoint::new(0.0, 0.0, 1.0) };
     let b = StrokePoint { rotation: 10.0, tilt_x: 40.0, ..StrokePoint::new(100.0, 0.0, 0.0) };
     let out = smooth_points(&ps, 1.0, &[a, b]);
-    // The 20 px string leaves the brush 80 % of the way to the pointer.
+    // The 24 px effective string (0.2 -> 0.24) leaves the brush 76 % of the way to the pointer.
     let p = out.last().unwrap();
-    assert!((p.x - 80.0).abs() < 1e-4, "{}", p.x);
-    assert!((p.pressure - 0.2).abs() < 1e-4, "{}", p.pressure);
-    assert!((p.tilt_x - 32.0).abs() < 1e-3, "{}", p.tilt_x);
-    // Rotation the short way round: 350° + 80 % of 20°.
-    assert!((p.rotation - 6.0).abs() < 1e-3, "{}", p.rotation);
+    assert!((p.x - 76.0).abs() < 1e-4, "{}", p.x);
+    assert!((p.pressure - 0.24).abs() < 1e-4, "{}", p.pressure);
+    assert!((p.tilt_x - 30.4).abs() < 1e-3, "{}", p.tilt_x);
+    // Rotation the short way round: 350° + 76 % of 20°.
+    assert!((p.rotation - 5.2).abs() < 1e-3, "{}", p.rotation);
 }
 
 #[test]
@@ -1570,7 +1570,7 @@ fn brush_projection_foreshortens_along_tilt_and_turns_with_rotation() {
 
 #[test]
 fn spacing_off_spaces_dabs_by_pointer_speed() {
-    let mut b = BrushSettings { size: 20.0, spacing_enabled: false, ..brush() };
+    let mut b = BrushSettings { size: 20.0, spacing_enabled: false, smoothing: Smoothing { enabled: false, ..Default::default() }, ..brush() };
     let timed = |ms: f64| vec![StrokePoint { time: 0.0, ..StrokePoint::new(0.0, 10.0, 1.0) }, StrokePoint { time: ms, ..StrokePoint::new(100.0, 10.0, 1.0) }];
     // 100 px in 400 ms: a dab every 8 ms = every 2 px; in 40 ms: every 20 px.
     let slow = dabs_of(&b, &timed(400.0)).len();

@@ -43,8 +43,8 @@ pub use brush::{
 };
 pub use curve::ResponseCurve;
 pub use dynamics::{
-    DynamicsLut, PressureFilter, apply_directional_damping, apply_magnetic_rotation, blend_wet_mix, calibrate_stylus_pressure, eval_height_map_grain,
-    filter_circular_angle,
+    DynamicsLut, PressureFilter, SMOOTHING_FLOOR, apply_directional_damping, apply_magnetic_rotation, blend_wet_mix, calibrate_stylus_pressure,
+    effective_smoothing_amount, eval_height_map_grain, filter_circular_angle,
 };
 pub use touch_stream::{RawTouchRecord, TouchForceResolver, TouchRecorder};
 pub use mip_cache::{mip_cache_bytes, purge_mip_cache};
@@ -52,7 +52,10 @@ pub use mixer::MixerSettings;
 pub use quickshape::{
     QuickShapeKind, classify_quickshape, generate_quickshape_stroke, snap_line_angle_15_deg, update_quickshape_drag,
 };
-pub use render::{BrushContext, StrokeRenderer, UnionLive, grid_center, grid_square, render_stroke, render_stroke_clipped};
+pub use render::{
+    BrushContext, EST_ALTITUDE, EST_AZIMUTH, EST_FORCE, SplitStroke, StrokeRenderer, TailPoint, UnionLive, grid_center, grid_square, render_stroke,
+    render_stroke_clipped,
+};
 pub use tile::{GrayTile, StoredTile};
 
 /// One input sample. Missing stylus data defaults to "mouse": full pressure, no tilt/rotation.

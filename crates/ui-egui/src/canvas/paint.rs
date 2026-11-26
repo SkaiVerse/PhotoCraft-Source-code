@@ -608,6 +608,51 @@ pub(super) fn draw_drag_preview(app: &mut PhotocraftApp, painter: &egui::Painter
             if let Some(s) = app.live_stroke.as_ref().and_then(|l| l.smoothing_string()) {
                 draw_smoothing_string(painter, xf, s);
             }
+            // Transient iPadOS predicted-touch preview: drawn cleanly above the unfinalized tail
+            // for this frame only, never entering committed stroke points or undo history.
+            if !app.stylus.frame_predicted.is_empty() {
+                let brush = &app.session.tools.brush;
+                let base_color = if brush.erase || d.erase {
+                    Color32::from_rgba_unmultiplied(245, 245, 245, 110)
+                } else {
+                    let c = brush.color;
+                    let a = (brush.opacity * brush.flow * 165.0).clamp(28.0, 210.0) as u8;
+                    Color32::from_rgba_unmultiplied(
+                        (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+                        (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+                        (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+                        a,
+                    )
+                };
+                let mut prev_pos = d.points.last().map(|p| xf.to_screen(p[0] as f32, p[1] as f32));
+                let mut prev_pressure = d.points.last().map_or(1.0f32, |p| p[2] as f32);
+                for &(pred_sample, pred_pos) in &app.stylus.frame_predicted {
+                    if !(pred_pos.x.is_finite() && pred_pos.y.is_finite()) {
+                        continue;
+                    }
+                    let eff_p = app.stylus.apply_pressure_curve(pred_sample.pressure);
+                    let radius_for = |p: f32| {
+                        let scale = if brush.pressure_size { p.clamp(0.05, 1.0) } else { 1.0 };
+                        (0.5 * brush.size * scale * xf.zoom).max(0.75)
+                    };
+                    let r1 = radius_for(eff_p);
+                    if let Some(p0) = prev_pos {
+                        let r0 = radius_for(prev_pressure);
+                        let dist = (pred_pos - p0).length();
+                        let steps = ((dist / (r1.max(1.0) * 0.65)).ceil() as usize).clamp(1, 16);
+                        for step in 1..=steps {
+                            let f = step as f32 / steps as f32;
+                            let pos = p0.lerp(pred_pos, f);
+                            let rad = r0 + (r1 - r0) * f;
+                            painter.circle_filled(pos, rad, base_color);
+                        }
+                    } else {
+                        painter.circle_filled(pred_pos, r1, base_color);
+                    }
+                    prev_pos = Some(pred_pos);
+                    prev_pressure = eff_p;
+                }
+            }
         }
         t if t.is_brushlike() || t == Tool::QuickSelection => {
             // Retouching strokes preview as a translucent trail of the brush footprint: a mask,

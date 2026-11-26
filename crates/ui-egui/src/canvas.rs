@@ -680,6 +680,14 @@ fn update_canvas_navigation(app: &mut PhotocraftApp, view: &mut View, input: Can
                     let at = wheel_anchor(&input.xf, p, view.doc_size);
                     zoom_about(view, &input.xf, at, nz, false, input.ppp);
                 }
+                if let Some(scroll) = crate::wheel_nav::simultaneous_pan(input.ctx, touch_gestures) {
+                    let xf_now = ViewXform { zoom: view.zoom / input.ppp, center: view.center, rotation: view.rotation, ..input.xf };
+                    let d = xf_now.unmap_vec(scroll) / (view.zoom / input.ppp);
+                    if d.is_finite() {
+                        view.center[0] -= d.x;
+                        view.center[1] -= d.y;
+                    }
+                }
             }
             (Some(crate::wheel_nav::Wheel::SnapZoom(n)), Some(p)) => {
                 let dir = if n > 0 { 1 } else { -1 };
@@ -700,14 +708,13 @@ fn update_canvas_navigation(app: &mut PhotocraftApp, view: &mut View, input: Can
         }
         let rotate_trackpad = app.session.prefs().enhanced_controls.rotate_view_with_trackpad || touch_gestures;
         if let Some(delta) = crate::rotate_view::trackpad_delta(input.ctx, rotate_trackpad, touch_gestures) {
-            view.zoom_animating = false;
-            view.zoom_anchor = None;
-            let next = view.rotation + crate::rotate_view::screen_delta(delta, input.xf.flip);
-            if next.is_finite() {
-                let wrapped = crate::rotate_view::wrap_deg(next);
-                let (mag, _) = photocraft_paint::apply_magnetic_rotation(wrapped, 4.0);
-                view.rotation = mag;
-            }
+            let xf_now = ViewXform { zoom: view.zoom / input.ppp, center: view.center, rotation: view.rotation, ..input.xf };
+            let pivot = input.ctx.input(|i| i.pointer.latest_pos().or(i.pointer.hover_pos())).unwrap_or_else(|| input.xf.rect.center());
+            let rot_state_id = egui::Id::unique(("pc-raw-rot", input.idx, input.ctx.viewport_id()));
+            let (mut raw_acc, mut last_out) = input.ctx.data(|d| d.get_temp::<(Option<f32>, Option<f32>)>(rot_state_id)).unwrap_or((None, None));
+            let screen_d = crate::rotate_view::screen_delta(delta, xf_now.flip);
+            crate::rotate_view::step_magnetic_rotation(view, &xf_now, pivot, screen_d, &mut raw_acc, &mut last_out, input.ppp);
+            input.ctx.data_mut(|d| d.insert_temp(rot_state_id, (raw_acc, last_out)));
         }
     }
 }
@@ -1844,7 +1851,13 @@ fn draw_canvas_tool_cursor(app: &mut PhotocraftApp, ui: &mut egui::Ui, input: &C
     let tool = input.tool;
     let panning = input.panning;
 
-    let predicted_p = app.stylus.feed.predicted().map(|(_, pos)| pos).filter(|p| response.rect.contains(*p));
+    let predicted_p = app
+        .stylus
+        .frame_predicted
+        .last()
+        .map(|(_, pos)| *pos)
+        .or_else(|| app.stylus.feed.predicted().map(|(_, pos)| pos))
+        .filter(|p| response.rect.contains(*p));
     let current_p = predicted_p
         .or_else(|| response.hover_pos())
         .or_else(|| response.interact_pointer_pos().filter(|p| response.rect.contains(*p)))

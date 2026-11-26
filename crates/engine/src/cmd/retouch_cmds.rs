@@ -145,10 +145,14 @@ pub fn stroke_brush(base: &BrushSettings, p: &Value) -> BrushSettings {
         flow: pct("flow", 100.0, 1.0, 100.0),
         // Brush Settings › Brush Tip Shape › Spacing, as the Brush uses it (#2140).
         spacing: pct("spacing", base.spacing * 100.0, 1.0, 1000.0),
-        // The options bar's Smoothing; the UI sends 0 for a ⇧-click line, which isn't smoothed (#11887).
-        smoothing: match p.get("smoothing") {
-            Some(_) => photocraft_paint::Smoothing { enabled: true, amount: pct("smoothing", 0.0, 0.0, 100.0), ..base.smoothing.clone() },
-            None => base.smoothing.clone(),
+        // The options bar's Smoothing; the UI sends 0 + unsmoothedLine for a ⇧-click line, which isn't smoothed (#11887).
+        smoothing: if p.get("unsmoothedLine").and_then(Value::as_bool) == Some(true) {
+            photocraft_paint::Smoothing { enabled: false, amount: 0.0, ..base.smoothing.clone() }
+        } else {
+            match p.get("smoothing") {
+                Some(_) => photocraft_paint::Smoothing { enabled: true, amount: pct("smoothing", 0.0, 0.0, 100.0), ..base.smoothing.clone() },
+                None => base.smoothing.clone(),
+            }
         },
         erase: false,
         ..base.clone()

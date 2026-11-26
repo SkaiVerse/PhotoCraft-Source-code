@@ -243,6 +243,29 @@ impl EngineStroke {
             Self::Mixer(s) => s.push(pts),
         }
     }
+    pub(super) fn push_tagged(&mut self, pts: &[(photocraft_engine::paint::StrokePoint, u64, u32)]) -> photocraft_engine::Result<DRect> {
+        match self {
+            Self::Brush(s) => s.push_tagged(pts),
+            Self::Retouch(s) => {
+                let raw: Vec<_> = pts.iter().map(|(p, _, _)| *p).collect();
+                s.push(&raw)
+            }
+            Self::Dab(s) => {
+                let raw: Vec<_> = pts.iter().map(|(p, _, _)| *p).collect();
+                s.push(&raw)
+            }
+            Self::Mixer(s) => {
+                let raw: Vec<_> = pts.iter().map(|(p, _, _)| *p).collect();
+                s.push(&raw)
+            }
+        }
+    }
+    pub(super) fn update_estimate(&mut self, u: &crate::stylus::EstimateUpdate) -> photocraft_engine::Result<DRect> {
+        match self {
+            Self::Brush(s) => s.update_estimate(u.estimation_index, u.pressure, u.tilt_x, u.tilt_y, u.rotation, u.remaining_expected),
+            Self::Retouch(_) | Self::Dab(_) | Self::Mixer(_) => Ok(DRect::EMPTY),
+        }
+    }
     pub(super) fn finish(&mut self) -> photocraft_engine::Result<DRect> {
         match self {
             Self::Brush(s) => s.finish(),
@@ -370,6 +393,7 @@ pub(super) fn stroke_params(app: &PhotocraftApp, d: &Drag, points: &[Vec<f64>]) 
 pub(crate) fn unsmoothed_line(p: &mut serde_json::Value, line: bool) {
     if line && let Some(o) = p.as_object_mut() {
         o.insert("smoothing".into(), json!(0.0));
+        o.insert("unsmoothedLine".into(), json!(true));
     }
 }
 
@@ -466,7 +490,9 @@ pub(super) fn begin_live_stroke(app: &PhotocraftApp) -> Option<LiveStroke> {
         EngineStroke::Retouch(Box::new(photocraft_engine::retouch_cmds::LiveRetouch::begin(&app.session, cmd, &p).ok()?))
     } else {
         let p = stroke_params(app, d, &app.stylus.stroke_points(&d.points));
-        EngineStroke::Brush(Box::new(photocraft_engine::brush_cmds::LiveStroke::begin_with(&app.session, stroke_command(app, d.tool), &p).ok()?))
+        EngineStroke::Brush(Box::new(
+            photocraft_engine::brush_cmds::LiveStroke::begin_with_tagged(&app.session, stroke_command(app, d.tool), &p, &app.stylus.stroke_est).ok()?,
+        ))
     };
     let n = STROKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xff_ffff;
     let damage = vec![stroke.bounds()];
@@ -511,26 +537,66 @@ pub(super) fn feed_live_stroke_waiting(app: &mut PhotocraftApp, wait: std::time:
     if app.defer_live_stroke {
         return;
     }
-    let (Some(l), Some(d)) = (app.live_stroke.as_mut(), app.drag.as_ref()) else { return };
+    // Apply pending iPadOS estimated-property updates in place to recorded drag points and stylus pose
+    // before handing them off to the live paint worker, so final commit matches live preview 1:1.
+    if !app.stylus.pending_updates.is_empty()
+        && let Some(d) = app.drag.as_mut()
+    {
+        for ui_idx in 0..app.stylus.pending_updates.len() {
+            let mut u = app.stylus.pending_updates[ui_idx];
+            if let Some(p) = u.pressure {
+                u.pressure = Some(app.stylus.apply_pressure_curve(p));
+                app.stylus.pending_updates[ui_idx].pressure = u.pressure;
+            }
+            for ((pt, pose), est) in d.points.iter_mut().zip(app.stylus.stroke.iter_mut()).zip(app.stylus.stroke_est.iter_mut()) {
+                if est.1 != 0 && est.0 == u.estimation_index {
+                    if let Some(p) = u.pressure {
+                        pt[2] = f64::from(p);
+                    }
+                    if let Some(tx) = u.tilt_x {
+                        pose[0] = tx;
+                    }
+                    if let Some(ty) = u.tilt_y {
+                        pose[1] = ty;
+                    }
+                    if let Some(r) = u.rotation {
+                        pose[2] = r;
+                    }
+                    est.1 = u.remaining_expected;
+                }
+            }
+        }
+    }
+    let (Some(l), Some(d)) = (app.live_stroke.as_mut(), app.drag.as_ref()) else {
+        app.stylus.pending_updates.clear();
+        return;
+    };
     if l.preview_failed {
+        app.stylus.pending_updates.clear();
         return;
     }
     let pose = &app.stylus.stroke;
+    let est = &app.stylus.stroke_est;
     // The same times `stroke_points` gives the commit (from the drag's first point).
     let t0 = app.stylus.point_ms(0);
     let pts: Vec<_> = (l.fed..d.points.len())
         .filter_map(|i| {
             let p = d.points.get(i)?;
             let t = pose.get(i).or(pose.last()).copied().unwrap_or_default();
+            let (est_idx, est_mask) = est.get(i).copied().unwrap_or((0, 0));
             let mut sp = photocraft_engine::paint::StrokePoint::new(p[0], p[1], p[2] as f32);
             (sp.tilt_x, sp.tilt_y, sp.rotation) = (t[0], t[1], t[2]);
             sp.time = app.stylus.point_ms(i) - t0;
-            Some(sp)
+            Some((sp, est_idx, est_mask))
         })
         .collect();
     l.fed = d.points.len();
     let started = crate::gpu_canvas::now_ms();
-    l.paint.push(pts);
+    if !app.stylus.pending_updates.is_empty() {
+        l.paint.push_updates(&app.stylus.pending_updates);
+        app.stylus.pending_updates.clear();
+    }
+    l.paint.push_tagged(pts);
     let steps = l.paint.catch_up(wait);
     let tool = d.tool;
     take_steps(app, tool, steps);

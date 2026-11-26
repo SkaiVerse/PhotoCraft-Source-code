@@ -577,6 +577,33 @@ fn unsmoothed_scroll(wheel: &[(MouseWheelUnit, Vec2, Modifiers, TouchPhase)], mo
     })
 }
 
+/// Simultaneous pan delta during an active pinch/rotate gesture (plain `Point` scroll or
+/// multi-touch pan delivered alongside `Event::Zoom` in the same frame).
+pub fn simultaneous_pan(ctx: &Context, touch_gestures: bool) -> Option<Vec2> {
+    let raw = ctx.input(|i| {
+        let mut sum = Vec2::ZERO;
+        for e in &i.events {
+            if let Event::MouseWheel { unit: MouseWheelUnit::Point, delta, modifiers, phase, .. } = e
+                && *phase != TouchPhase::End
+                && !modifiers.alt
+                && !modifiers.ctrl
+                && !modifiers.shift
+                && delta.is_finite()
+            {
+                sum += *delta;
+            }
+        }
+        if sum != Vec2::ZERO {
+            sum
+        } else if touch_gestures {
+            i.multi_touch().map_or(Vec2::ZERO, |m| m.translation_delta)
+        } else {
+            Vec2::ZERO
+        }
+    });
+    (raw.is_finite() && raw != Vec2::ZERO).then_some(raw)
+}
+
 fn is_alt_key(key: Key) -> bool {
     matches!(key, Key::AltLeft | Key::AltRight)
 }

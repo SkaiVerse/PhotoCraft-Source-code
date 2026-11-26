@@ -69,18 +69,35 @@ impl PenSample {
 /// Most samples a [`StylusFeed`] keeps between two frames (a stalled UI drops the oldest).
 const FEED_QUEUE: usize = 1024;
 
+/// Asynchronous refinement packet sent by iPadOS `touchesEstimatedPropertiesUpdated`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EstimateUpdate {
+    pub estimation_index: u64,
+    pub pressure: Option<f32>,
+    pub tilt_x: Option<f32>,
+    pub tilt_y: Option<f32>,
+    pub rotation: Option<f32>,
+    pub remaining_expected: u32,
+}
+
 #[derive(Debug, Default)]
 struct FeedState {
     /// The current sample (`None` = no pen down).
     latest: Option<PenSample>,
     /// Optional platform hardware timestamp (monotonic seconds) paired with `latest`.
     latest_ts_s: Option<f64>,
-    /// Forward predicted touch sample and screen position (`None` = no prediction).
-    predicted: Option<(PenSample, egui::Pos2)>,
+    /// Latest estimation metadata `(estimation_index, expecting_updates_mask)`.
+    latest_est: (u64, u32),
+    /// Forward predicted touch trail (transient per-frame preview; never enters committed history).
+    predicted: Vec<(PenSample, egui::Pos2)>,
     /// Every sample set since the canvas last drained them, oldest first.
     queue: VecDeque<PenSample>,
     /// Optional platform hardware timestamps (monotonic seconds) paired 1:1 with `queue`.
     queue_ts_s: VecDeque<Option<f64>>,
+    /// Estimation metadata `(estimation_index, expecting_updates_mask)` paired 1:1 with `queue`.
+    queue_est: VecDeque<(u64, u32)>,
+    /// Pending estimation updates for points already drained by earlier frames.
+    updates: VecDeque<EstimateUpdate>,
 }
 
 /// Shared state a platform backend writes pen samples into. Cloning shares it. Each sample both
@@ -97,31 +114,65 @@ impl StylusFeed {
 
     /// Push a stylus sample together with its real hardware timestamp in monotonic seconds.
     pub fn set_with_timestamp(&self, s: Option<PenSample>, timestamp_s: Option<f64>) {
+        self.set_with_timestamp_est(s, timestamp_s, 0, 0);
+    }
+
+    /// Push a stylus sample together with its real hardware timestamp (monotonic seconds) and
+    /// iPadOS estimation metadata (`estimation_index`, `expecting_mask`).
+    pub fn set_with_timestamp_est(&self, s: Option<PenSample>, timestamp_s: Option<f64>, estimation_index: u64, expecting_mask: u32) {
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let s = s.map(PenSample::sanitized);
         let ts = timestamp_s.filter(|t| t.is_finite() && *t > 0.0);
+        let est = if s.is_some() { (estimation_index, expecting_mask) } else { (0, 0) };
         g.latest = s;
         g.latest_ts_s = s.and(ts);
+        g.latest_est = est;
         if let Some(s) = s {
             if g.queue.len() >= FEED_QUEUE {
                 g.queue.pop_front();
                 g.queue_ts_s.pop_front();
+                g.queue_est.pop_front();
             }
             g.queue.push_back(s);
             g.queue_ts_s.push_back(ts);
+            g.queue_est.push_back(est);
         } else {
-            g.predicted = None;
+            g.predicted.clear();
         }
     }
 
-    /// Forward predicted touch sample and screen position for low-latency live preview.
+    /// Forward predicted touch sample and screen position for low-latency live preview (replaces previous).
     pub fn set_predicted(&self, p: Option<(PenSample, egui::Pos2)>) {
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        g.predicted = p.map(|(s, pos)| (s.sanitized(), pos));
+        g.predicted.clear();
+        if let Some((s, pos)) = p {
+            g.predicted.push((s.sanitized(), pos));
+        }
+    }
+
+    /// Append a predicted touch point into the current frame's transient predicted trail without reallocating.
+    pub fn push_predicted(&self, s: PenSample, pos: egui::Pos2) {
+        let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if g.predicted.len() < 16 {
+            g.predicted.push((s.sanitized(), pos));
+        }
+    }
+
+    /// Clear transient predicted touch points.
+    pub fn clear_predicted(&self) {
+        let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        g.predicted.clear();
+    }
+
+    /// Move current predicted touch points into `dst` (reusing allocation) and clear the feed buffer.
+    pub fn take_predicted_into(&self, dst: &mut Vec<(PenSample, egui::Pos2)>) {
+        dst.clear();
+        let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        dst.extend(g.predicted.drain(..));
     }
 
     pub fn predicted(&self) -> Option<(PenSample, egui::Pos2)> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).predicted
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).predicted.last().copied()
     }
 
     /// Update the latest pen sample with refined estimated properties without adding extra queue items.
@@ -132,6 +183,57 @@ impl StylusFeed {
         if let Some(last) = g.queue.back_mut() {
             *last = s;
         }
+    }
+
+    /// Record an asynchronous `touchesEstimatedPropertiesUpdated` refinement for matching index.
+    /// Updates any still-queued sample in place and queues the update for active live strokes.
+    pub fn push_estimate_update(&self, u: EstimateUpdate) {
+        let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let len = g.queue.len().min(g.queue_est.len());
+        for i in 0..len {
+            if g.queue_est[i].1 != 0 && g.queue_est[i].0 == u.estimation_index {
+                if let Some(p) = u.pressure.filter(|v| v.is_finite()) {
+                    g.queue[i].pressure = p.clamp(0.0, 1.0);
+                }
+                if let Some(tx) = u.tilt_x.filter(|v| v.is_finite()) {
+                    g.queue[i].tilt_x = tx.clamp(-90.0, 90.0);
+                }
+                if let Some(ty) = u.tilt_y.filter(|v| v.is_finite()) {
+                    g.queue[i].tilt_y = ty.clamp(-90.0, 90.0);
+                }
+                if let Some(r) = u.rotation.filter(|v| v.is_finite()) {
+                    g.queue[i].rotation = r.rem_euclid(360.0) % 360.0;
+                }
+                g.queue_est[i].1 = u.remaining_expected;
+            }
+        }
+        if g.latest_est.1 != 0 && g.latest_est.0 == u.estimation_index {
+            if let Some(latest) = g.latest.as_mut() {
+                if let Some(p) = u.pressure.filter(|v| v.is_finite()) {
+                    latest.pressure = p.clamp(0.0, 1.0);
+                }
+                if let Some(tx) = u.tilt_x.filter(|v| v.is_finite()) {
+                    latest.tilt_x = tx.clamp(-90.0, 90.0);
+                }
+                if let Some(ty) = u.tilt_y.filter(|v| v.is_finite()) {
+                    latest.tilt_y = ty.clamp(-90.0, 90.0);
+                }
+                if let Some(r) = u.rotation.filter(|v| v.is_finite()) {
+                    latest.rotation = r.rem_euclid(360.0) % 360.0;
+                }
+            }
+            g.latest_est.1 = u.remaining_expected;
+        }
+        if g.updates.len() >= FEED_QUEUE {
+            g.updates.pop_front();
+        }
+        g.updates.push_back(u);
+    }
+
+    /// Drain pending estimation updates into caller's reused buffer.
+    pub fn drain_updates_into(&self, dst: &mut Vec<EstimateUpdate>) {
+        let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        dst.extend(g.updates.drain(..));
     }
 
     pub fn get(&self) -> Option<PenSample> {
@@ -147,6 +249,7 @@ impl StylusFeed {
     pub fn drain(&self) -> Vec<PenSample> {
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         g.queue_ts_s.clear();
+        g.queue_est.clear();
         g.queue.drain(..).collect()
     }
 
@@ -155,6 +258,7 @@ impl StylusFeed {
         target.clear();
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         g.queue_ts_s.clear();
+        g.queue_est.clear();
         target.extend(g.queue.drain(..));
     }
 
@@ -163,8 +267,25 @@ impl StylusFeed {
         target.clear();
         timestamps.clear();
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        g.queue_est.clear();
         target.extend(g.queue.drain(..));
         timestamps.extend(g.queue_ts_s.drain(..));
+    }
+
+    /// Drains samples, hardware timestamps, and estimation metadata into caller buffers without reallocating.
+    pub fn drain_into_with_timestamps_and_est(
+        &self,
+        target: &mut Vec<PenSample>,
+        timestamps: &mut Vec<Option<f64>>,
+        est: &mut Vec<(u64, u32)>,
+    ) {
+        target.clear();
+        timestamps.clear();
+        est.clear();
+        let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        target.extend(g.queue.drain(..));
+        timestamps.extend(g.queue_ts_s.drain(..));
+        est.extend(g.queue_est.drain(..));
     }
 }
 
@@ -195,14 +316,20 @@ pub struct Stylus {
     frame: Vec<PenSample>,
     /// Optional platform hardware timestamps (seconds) paired 1:1 with `frame`.
     frame_ts_s: Vec<Option<f64>>,
+    /// Estimation metadata paired 1:1 with `frame`.
+    frame_est: Vec<(u64, u32)>,
     /// The last pen sample of an earlier frame: where this frame's interpolation starts.
     prev: Option<PenSample>,
     /// Optional platform hardware timestamp (seconds) of `prev`.
     prev_ts_s: Option<f64>,
+    /// Estimation metadata of `prev`.
+    prev_est: (u64, u32),
     /// The sample [`Self::select`] interpolated for the pointer move being processed.
     current: Option<PenSample>,
     /// Optional hardware timestamp (seconds) [`Self::select`] interpolated for the move.
     current_ts_s: Option<f64>,
+    /// Estimation metadata of `current`.
+    current_est: (u64, u32),
     /// Anchor hardware timestamp (seconds) captured on [`Self::begin_stroke`].
     hw_t0_s: Option<f64>,
     /// Anchor stroke clock (ms) paired with `hw_t0_s` on [`Self::begin_stroke`].
@@ -215,12 +342,18 @@ pub struct Stylus {
     updated_frame: Option<u64>,
     /// Tilt X, tilt Y, rotation of each point of the current drag (parallel to its points).
     pub(crate) stroke: Vec<[f32; 3]>,
+    /// Estimation metadata `(estimation_index, expecting_updates_mask)` parallel to `stroke` / `drag.points`.
+    pub(crate) stroke_est: Vec<(u64, u32)>,
     /// Time in milliseconds of each point of the current drag (parallel to its points), from
     /// [`Stylus::clock_ms`]. Speed spacing, airbrush build-up and smoothing catch-up use it.
     pub(crate) times: Vec<f64>,
     /// Time of the tool event being processed, in milliseconds. The canvas spreads a frame's
     /// samples between the previous and the current frame time (egui's events carry none).
     pub(crate) clock_ms: f64,
+    /// Current frame's ephemeral predicted touch trail (cleared on next frame advance).
+    pub(crate) frame_predicted: Vec<(PenSample, egui::Pos2)>,
+    /// Asynchronous estimation refinement packets waiting to be applied to the live stroke.
+    pub(crate) pending_updates: Vec<EstimateUpdate>,
 }
 
 impl Default for Stylus {
@@ -238,18 +371,24 @@ impl Default for Stylus {
             lifted: false,
             frame: Vec::new(),
             frame_ts_s: Vec::new(),
+            frame_est: Vec::new(),
             prev: None,
             prev_ts_s: None,
+            prev_est: (0, 0),
             current: None,
             current_ts_s: None,
+            current_est: (0, 0),
             hw_t0_s: None,
             stroke_t0_ms: 0.0,
             peak: 0.0,
             pen_contacts: PenContacts::default(),
             updated_frame: None,
             stroke: Vec::new(),
+            stroke_est: Vec::new(),
             times: Vec::new(),
             clock_ms: 0.0,
+            frame_predicted: Vec::with_capacity(8),
+            pending_updates: Vec::with_capacity(16),
         }
     }
 }
@@ -260,9 +399,18 @@ impl Stylus {
     /// pen samples.
     pub fn update_for_frame(&mut self, frame: u64, events: &[egui::Event]) {
         if self.updated_frame.replace(frame) != Some(frame) {
-            // Ephemeral predicted touches must never leak across frames.
-            self.feed.set_predicted(None);
+            // Capture this frame's ephemeral predicted trail and clear feed buffer so predictions never leak.
+            self.feed.take_predicted_into(&mut self.frame_predicted);
+            self.feed.drain_updates_into(&mut self.pending_updates);
             self.update(events);
+        }
+    }
+
+    /// Evaluate the active Preferences › Tools › Pressure Curve on a normalized pressure value.
+    pub(crate) fn apply_pressure_curve(&self, p: f32) -> f32 {
+        match &self.pressure_curve {
+            Some(c) => c.eval(p),
+            None => p,
         }
     }
 
@@ -274,10 +422,12 @@ impl Stylus {
         if let Some(last) = self.frame.last() {
             self.prev = Some(*last);
             self.prev_ts_s = self.frame_ts_s.last().copied().flatten();
+            self.prev_est = self.frame_est.last().copied().unwrap_or((0, 0));
         }
-        self.feed.drain_into_with_timestamps(&mut self.frame, &mut self.frame_ts_s);
+        self.feed.drain_into_with_timestamps_and_est(&mut self.frame, &mut self.frame_ts_s, &mut self.frame_est);
         self.current = None;
         self.current_ts_s = None;
+        self.current_est = (0, 0);
         for e in events {
             if let egui::Event::Touch { id, phase, force, .. } = e {
                 let force = force.filter(|f| f.is_finite()).map(|f| f.clamp(0.0, 1.0));
@@ -310,6 +460,7 @@ impl Stylus {
                             self.touch = Some(f);
                             self.frame.push(PenSample { pressure: f, ..Default::default() });
                             self.frame_ts_s.push(None);
+                            self.frame_est.push((0, 0));
                         }
                     }
                     egui::TouchPhase::End | egui::TouchPhase::Cancel => {
@@ -331,8 +482,10 @@ impl Stylus {
             }
             let new_frame = keep.iter().map(|&i| self.frame[i]).collect();
             let new_ts = keep.iter().map(|&i| self.frame_ts_s.get(i).copied().flatten()).collect();
+            let new_est = keep.iter().map(|&i| self.frame_est.get(i).copied().unwrap_or((0, 0))).collect();
             self.frame = new_frame;
             self.frame_ts_s = new_ts;
+            self.frame_est = new_est;
         }
         self.peak = self.frame.iter().fold(self.peak, |m, s| m.max(s.pressure));
     }
@@ -387,6 +540,7 @@ impl Stylus {
     pub(crate) fn select(&mut self, k: usize, n: usize) {
         self.current = None;
         self.current_ts_s = None;
+        self.current_est = (0, 0);
         if !self.use_pressure || n == 0 || self.frame.is_empty() || self.sample().is_none() {
             return;
         }
@@ -395,9 +549,12 @@ impl Stylus {
         let at = |i: usize| if i == 0 { start } else { self.frame.get(i - 1).copied().unwrap_or(start) };
         let start_ts = self.prev_ts_s.or_else(|| self.frame_ts_s.first().copied().flatten());
         let at_ts = |i: usize| if i == 0 { start_ts } else { self.frame_ts_s.get(i - 1).copied().flatten().or(start_ts) };
+        let at_est = |i: usize| if i == 0 { self.prev_est } else { self.frame_est.get(i - 1).copied().unwrap_or((0, 0)) };
         let pos = (k + 1).min(n) as f32 / n as f32 * m as f32;
         let i = pos.floor() as usize;
         let (a, b, t) = (at(i), at((i + 1).min(m)), pos - pos.floor());
+        let est_b = at_est((i + 1).min(m));
+        self.current_est = if est_b.1 != 0 { est_b } else { at_est(i) };
         let lerp = |x: f32, y: f32| x + (y - x) * t;
         // Rotation takes the shorter way round.
         let dr = (b.rotation - a.rotation + 540.0).rem_euclid(360.0) - 180.0;
@@ -423,6 +580,7 @@ impl Stylus {
     pub(crate) fn clear_selection(&mut self) {
         self.current = None;
         self.current_ts_s = None;
+        self.current_est = (0, 0);
     }
 
     /// Real hardware sample timestamp mapped onto the current stroke's clock (ms), when available.
@@ -496,10 +654,12 @@ impl Stylus {
         // left over from an earlier stroke.
         self.prev = None;
         self.prev_ts_s = None;
+        self.prev_est = (0, 0);
         self.hw_t0_s = self.latest_ts_s();
         self.stroke_t0_ms = self.clock_ms;
         self.peak = self.frame.iter().fold(0.0, |m, s| m.max(s.pressure));
         self.stroke.clear();
+        self.stroke_est.clear();
         self.times.clear();
         self.record_point();
     }
@@ -508,6 +668,12 @@ impl Stylus {
     pub(crate) fn record_point(&mut self) {
         let s = self.sample().unwrap_or_default();
         self.stroke.push([s.tilt_x, s.tilt_y, s.rotation]);
+        let est = if self.current_est != (0, 0) {
+            self.current_est
+        } else {
+            self.frame_est.last().copied().unwrap_or((0, 0))
+        };
+        self.stroke_est.push(est);
         let t = self.last_point_ms().map_or(self.clock_ms, |prev| self.clock_ms.max(prev));
         self.times.push(t);
     }
