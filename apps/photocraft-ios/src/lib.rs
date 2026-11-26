@@ -554,6 +554,7 @@ struct Host {
     inbox: Inbox,
     feed: StylusFeed,
     pen_down: bool,
+    pen_ema_pressure: Option<f32>,
     wants_keyboard: bool,
     /// The Pencil force that counts as full pressure (1.0 is an average touch). Lower is softer.
     pressure_divisor: f32,
@@ -743,6 +744,7 @@ impl Host {
             inbox,
             feed,
             pen_down: false,
+            pen_ema_pressure: None,
             wants_keyboard: false,
             touch: TouchUi::default(),
             hw: egui::Modifiers::NONE,
@@ -1506,10 +1508,34 @@ pub unsafe extern "C" fn pc_pen(
         let pos = h.pt(x, y);
         let m = h.modifiers;
         // The shell sends the Pencil's normalized force (0.0009765625 to 1.0); full pressure is reached
-        // at `pressure_divisor`.
+        // at `pressure_divisor`. Calibrate first, then filter with a baseline EMA (even at smoothing == 0)
+        // so concave curve amplification never turns light-touch force ripple into dark stroke dots.
         let raw_p = (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0);
+        let calibrated = photocraft_paint::calibrate_stylus_pressure(raw_p).clamp(0.0009765625, 1.0);
+        let filtered_p = match phase {
+            0 => {
+                if h.on_canvas(x, y) {
+                    h.pen_ema_pressure = Some(calibrated);
+                }
+                calibrated
+            }
+            1 => {
+                let p = match h.pen_ema_pressure {
+                    Some(prev) => (prev * 0.55 + calibrated * 0.45).clamp(0.0009765625, 1.0),
+                    None => calibrated,
+                };
+                if h.pen_down {
+                    h.pen_ema_pressure = Some(p);
+                }
+                p
+            }
+            _ => match h.pen_ema_pressure.take() {
+                Some(prev) => (prev * 0.55 + calibrated * 0.45).min(prev).clamp(0.0009765625, 1.0),
+                None => calibrated,
+            },
+        };
         let sample = PenSample {
-            pressure: photocraft_paint::calibrate_stylus_pressure(raw_p).clamp(0.0009765625, 1.0),
+            pressure: filtered_p,
             tilt_x,
             tilt_y,
             rotation: rotation.rem_euclid(360.0),
@@ -1623,8 +1649,14 @@ pub unsafe extern "C" fn pc_pen_update_estimate(
     if let Some(h) = unsafe { host(h) } {
         if h.pen_down {
             let raw_p = (pressure / h.pressure_divisor).clamp(0.0009765625, 1.0);
+            let calibrated = photocraft_paint::calibrate_stylus_pressure(raw_p).clamp(0.0009765625, 1.0);
+            let filtered = match h.pen_ema_pressure {
+                Some(prev) => (prev * 0.60 + calibrated * 0.40).clamp(0.0009765625, 1.0),
+                None => calibrated,
+            };
+            h.pen_ema_pressure = Some(filtered);
             let sample = PenSample {
-                pressure: photocraft_paint::calibrate_stylus_pressure(raw_p).clamp(0.0009765625, 1.0),
+                pressure: filtered,
                 tilt_x,
                 tilt_y,
                 rotation: rotation.rem_euclid(360.0),
@@ -1743,6 +1775,7 @@ pub unsafe extern "C" fn pc_long_press(h: *mut c_void, x: f32, y: f32) {
             // releasing Primary, and stage the Secondary click on the next frame so `track_right_press`
             // never sees Primary and Secondary down together.
             h.pen_down = false;
+            h.pen_ema_pressure = None;
             h.quickshape_active = false;
             h.quickshape_kind = None;
             h.quickshape_raw.clear();

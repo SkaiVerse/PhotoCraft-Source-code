@@ -667,3 +667,35 @@ fn layer_thumbnail_context_menu_selects_the_clicked_layers_pixels() {
     assert!(h.query_by_label("Select Pixels").is_none(), "the Background has no pixels to load");
     h.get_by_label("Blending Options…");
 }
+
+#[test]
+fn affinity_popover_preserves_all_photocraft_layer_options() {
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": 32, "height": 32})).unwrap();
+    s.execute("layer.new.layer", json!({"name": "Layer 1"})).unwrap();
+    let app = crate::PhotocraftApp::new(s, Default::default());
+    let l = app.session.active().unwrap().doc.layer(app.session.active().unwrap().active_layer.unwrap()).unwrap().clone();
+    let expected = entries(&l, false, false);
+
+    let mut h = Harness::builder().with_size(egui::vec2(400.0, 1200.0)).build_ui_state(
+        move |ui, app| {
+            let st = app.session.active().unwrap();
+            let layer = st.doc.layer(l.id).unwrap().clone();
+            let mut actions = Vec::new();
+            show_affinity_popover(app, ui, &layer, false, &mut actions);
+        },
+        app,
+    );
+    h.run_steps(3);
+
+    for (label, id) in expected.into_iter().flatten() {
+        if photocraft_engine::commands::find(id).is_some() || crate::menu_catalog::CATALOG.iter().any(|m| m.3 == id) {
+            assert!(h.query_by_label(label).is_some(), "missing PhotoCraft layer option `{label}` ({id}) in Affinity popover");
+        }
+    }
+    for extra in ["Add to Selection", "Hide", "Solo", "Lock", "Rename Layer...", "Expand Selection", "Collapse Selection", "Collapse All Parents"] {
+        assert!(h.query_by_label(extra).is_some(), "missing Affinity touch option `{extra}`");
+    }
+}

@@ -678,8 +678,10 @@ impl PathWalker {
                         }
                         // Cut short: the rest of the segment is skipped, spacing restarts at its end.
                         // Only when the cap held back a step that was still due; a segment that ends right at the cap keeps its carry-over.
+                        // When pressure drops across a segment (shrinking diameter), clamp carry-over so it never skips dabs and leaves detached beads.
                         let cut_short = emitted == MAX_DISTANCE_STEPS_PER_SEGMENT && self.next_at <= len + 1e-9;
-                        self.next_at = if cut_short { step_len(&p).max(0.25) } else { self.next_at - len };
+                        let end_step = step_len(&p).max(0.25);
+                        self.next_at = if cut_short { end_step } else { (self.next_at - len).min(end_step) };
                     }
                 }
                 Some(iv) => {
@@ -2106,5 +2108,26 @@ mod streaming_tests {
         let tip = dabs.last().unwrap();
         assert!(tip.radius < body_last.radius * 0.6, "tip radius {} should taper smoothly below body {}", tip.radius, body_last.radius);
         assert!(tip.opacity < body_last.opacity * 0.6, "tip opacity {} should taper smoothly below body {}", tip.opacity, body_last.opacity);
+    }
+
+    #[test]
+    fn smoothing_zero_with_pressure_on_clamps_shrinking_spacing_carryover() {
+        let mut brush = BrushSettings { size: 40.0, spacing: 0.25, pressure_size: true, pressure_opacity: true, ..BrushSettings::default() };
+        brush.smoothing.amount = 0.0;
+
+        let pts = [
+            StrokePoint::new(0.0, 0.0, 1.0),
+            StrokePoint::new(19.0, 0.0, 0.2),
+            StrokePoint::new(35.0, 0.0, 0.2),
+        ];
+        let (dabs, _) = streamed(&brush, &pts, 1000);
+        // At 19 px -> 35 px, diameter is ~8 px (step_len = 2 px). Carry-over from segment 1 must
+        // stay <= 2 px so dabs do not leave a multi-step blank gap / isolated bead dot on segment 2.
+        for w in dabs.windows(2) {
+            let dx = w[1].center.x - w[0].center.x;
+            if w[0].center.x >= 19.0 {
+                assert!(dx <= 2.5, "excessive carry-over gap {dx} in low-pressure tail");
+            }
+        }
     }
 }

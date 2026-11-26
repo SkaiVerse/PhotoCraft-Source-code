@@ -24,12 +24,13 @@ struct Key {
     hardness: f32,
     flip_x: bool,
     flip_y: bool,
+    square: bool,
     full: bool,
 }
 
 impl Key {
     fn of(b: &BrushSettings, full: bool) -> Self {
-        Self { tip: b.tip.clone(), angle: b.angle, roundness: b.roundness, hardness: b.hardness, flip_x: b.flip_x, flip_y: b.flip_y, full }
+        Self { tip: b.tip.clone(), angle: b.angle, roundness: b.roundness, hardness: b.hardness, flip_x: b.flip_x, flip_y: b.flip_y, square: b.square, full }
     }
     fn matches(&self, b: &BrushSettings, full: bool) -> bool {
         self.tip == b.tip
@@ -38,6 +39,7 @@ impl Key {
             && self.hardness == b.hardness
             && self.flip_x == b.flip_x
             && self.flip_y == b.flip_y
+            && self.square == b.square
             && self.full == full
     }
 }
@@ -50,17 +52,25 @@ pub(crate) fn tip_axes(xf: &crate::canvas::ViewXform, size: f32) -> [Vec2; 2] {
     [xf.map_vec(Vec2::new(r, 0.0)), xf.map_vec(Vec2::new(0.0, r))]
 }
 
-/// Apply pen orientation after the cached tip shape, in document space before the view.
-/// Keeping this outside `rings` avoids retracing a sampled tip on every tablet sample.
+/// Apply pen orientation and live pressure scaling after the cached tip shape, in document space
+/// before the view. Keeping this outside `rings` avoids retracing a sampled tip on every tablet sample.
 pub(crate) fn pen_axes(xf: &crate::canvas::ViewXform, brush: &BrushSettings, pen: Option<crate::stylus::PenSample>) -> [Vec2; 2] {
     use photocraft_paint::brush::Control;
-    use photocraft_paint::dynamics::{StepInput, apply_pose, control_angle};
-    let axes = tip_axes(xf, brush.size);
+    use photocraft_paint::dynamics::{DynamicsLut, StepInput, apply_pose, control_angle};
+    let mut axes = tip_axes(xf, brush.size);
+    let Some(pen) = pen else { return axes };
+    let pen = pen.sanitized();
+    if pen.pressure > 0.0
+        && (brush.pressure_size
+            || brush.dynamics_pressure_size > 0.0
+            || (brush.shape_dynamics.enabled && brush.shape_dynamics.size.control == Control::PenPressure))
+    {
+        let scale = DynamicsLut::eval_pressure_size(brush, pen.pressure).max(0.02);
+        axes = [axes[0] * scale, axes[1] * scale];
+    }
     if !brush.shape_dynamics.enabled {
         return axes;
     }
-    let Some(pen) = pen else { return axes };
-    let pen = pen.sanitized();
     let point = apply_pose(
         brush,
         photocraft_paint::StrokePoint { pressure: pen.pressure, tilt_x: pen.tilt_x, tilt_y: pen.tilt_y, rotation: pen.rotation, ..Default::default() },
@@ -120,7 +130,7 @@ pub(crate) fn cursor(painter: &Painter, at: Pos2, brush: &BrushSettings, radius:
 /// The tip outline in radius units, cached across frames; `None` when the plain circle says it all
 /// (a plain round tip) or the tip has no traceable shape.
 pub(crate) fn rings(ctx: &egui::Context, brush: &BrushSettings, full: bool) -> Option<Arc<Vec<Vec<[f32; 2]>>>> {
-    if matches!(brush.tip, TipShape::Round) && brush.angle == 0.0 && brush.roundness >= 1.0 {
+    if matches!(brush.tip, TipShape::Round) && !brush.square && brush.angle == 0.0 && brush.roundness >= 1.0 {
         return None;
     }
     let id = egui::Id::unique("photocraft-tip-outline");
@@ -257,5 +267,27 @@ mod tests {
             let [ex, ey] = tip_axes(&view(30.0, true, 1.0), size);
             assert!(ex.x.is_finite() && ex.y.is_finite() && ey.x.is_finite() && ey.y.is_finite(), "size {size}");
         }
+    }
+
+    #[test]
+    fn square_or_sampled_pencil_tip_renders_non_circular_outline_and_scales_with_size() {
+        let ctx = egui::Context::default();
+        let square_bitmap = photocraft_paint::tile::GrayTile::from_fn(16, 16, |x, y| {
+            // Styled notched square pattern
+            if (2..=13).contains(&x) && (2..=13).contains(&y) && !((6..=9).contains(&x) && (6..=9).contains(&y)) { 1.0 } else { 0.0 }
+        });
+        let sampled = BrushSettings { size: 20.0, tip: TipShape::Sampled(square_bitmap), aliased: true, ..Default::default() };
+        let outline = rings(&ctx, &sampled, false).expect("styled sampled tip must produce an outline rather than circle fallback");
+        assert!(!outline.is_empty());
+
+        let aliased_sq = BrushSettings { size: 20.0, aliased: true, square: true, ..Default::default() };
+        let sq_rings = rings(&ctx, &aliased_sq, false).expect("square brush must produce square outline");
+        assert_eq!(sq_rings[0].len(), 4);
+
+        let xf = view(0.0, false, 1.0);
+        let small = on_screen(&sq_rings, pen_axes(&xf, &BrushSettings { size: 12.0, ..aliased_sq.clone() }, None));
+        let large = on_screen(&sq_rings, pen_axes(&xf, &BrushSettings { size: 36.0, ..aliased_sq }, None));
+        let ext = |pts: &[Vec<Vec2>]| pts.iter().flatten().fold(0.0f32, |m, p| m.max(p.length()));
+        assert!((ext(&large) / ext(&small) - 3.0).abs() < 1e-4, "tip cursor extent must scale proportionally with brush size");
     }
 }

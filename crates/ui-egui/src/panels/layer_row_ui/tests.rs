@@ -858,3 +858,26 @@ fn row_swipe_offset_animates_both_left_and_right_spring_ease_out() {
     assert_eq!(super::row_swipe_offset(&ctx, 20), 0.0);
     ctx.end_pass().textures_delta.clear();
 }
+
+#[test]
+fn long_press_dragged_layer_row_animates_pop_out() {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": 32, "height": 32})).unwrap();
+    let layer = s.execute("layer.new.layer", json!({"name": "PopTarget"})).unwrap()["layer"].as_u64().unwrap();
+    let mut h = harness(s, 1.0, "pro", 320.0);
+
+    // Before press-and-hold drag: pop-out animation is 0.
+    assert_eq!(h.ctx.animate_bool_with_time(egui::Id::unique(("layer-pop-out", layer)), false, 0.16), 0.0);
+
+    // Simulate press-and-hold layer pickup setting `layer-drag`.
+    h.ctx.data_mut(|d| d.insert_temp(egui::Id::unique("layer-drag"), layer));
+    h.run_steps(12);
+    let pop = h.ctx.animate_bool_with_time(egui::Id::unique(("layer-pop-out", layer)), true, 0.16);
+    assert!(pop > 0.5, "layer pop-out animation should advance toward elevated state (got {pop})");
+
+    // Releasing settles cleanly back down.
+    h.ctx.data_mut(|d| d.remove::<u64>(egui::Id::unique("layer-drag")));
+    h.run_steps(16);
+    let rest = h.ctx.animate_bool_with_time(egui::Id::unique(("layer-pop-out", layer)), false, 0.16);
+    assert!(rest < 0.2, "layer pop-out animation should relax when released (got {rest})");
+}

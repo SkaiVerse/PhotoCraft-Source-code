@@ -248,7 +248,18 @@ pub(super) fn layer_row(
     let live_nudge = ctx.data(|d| d.get_temp::<f32>(egui::Id::unique(("layer-live-nudge", l.id.0)))).unwrap_or(0.0);
     let snap_offset = crate::layer_row_ui::row_swipe_offset(ctx, l.id.0);
     let shift_x = live_nudge + snap_offset;
-    let draw_rect = rect.translate(vec2(shift_x, 0.0));
+    let is_reordering = ctx.data(|d| d.get_temp::<u64>(egui::Id::unique("layer-drag"))).is_some_and(|id| id == l.id.0);
+    let pop = ctx.animate_bool_with_time(egui::Id::unique(("layer-pop-out", l.id.0)), is_reordering, 0.16);
+    let pop_eased = 1.0 - (1.0 - pop) * (1.0 - pop);
+    if pop > 0.0 && pop < 1.0 {
+        ctx.request_repaint();
+    }
+    let base_draw_rect = rect.translate(vec2(shift_x, 0.0));
+    let draw_rect = if pop_eased > 0.001 {
+        base_draw_rect.expand2(vec2(4.5 * pop_eased, 2.5 * pop_eased)).translate(vec2(0.0, -3.0 * pop_eased))
+    } else {
+        base_draw_rect
+    };
     if shift_x.abs() > 0.5 {
         let track = ui.painter_at(rect);
         track.rect_filled(rect, 0.0, Color32::from_rgb(18, 19, 23));
@@ -260,7 +271,13 @@ pub(super) fn layer_row(
             track.rect_filled(slot, 0.0, Color32::from_rgba_unmultiplied(28, 120, 242, 72));
         }
     }
-    let clip_rect = if shift_x.abs() > 0.5 { rect.intersect(draw_rect).expand(1.0) } else { draw_rect.expand(1.0) };
+    let clip_rect = if pop_eased > 0.001 {
+        base_draw_rect.expand(14.0)
+    } else if shift_x.abs() > 0.5 {
+        rect.intersect(draw_rect).expand(1.0)
+    } else {
+        draw_rect.expand(1.0)
+    };
     let painter = ui.painter_at(clip_rect);
     let is_hovered = resp.hovered() || app.canvas_hover_layer == Some(l.id);
     if resp.hovered() {
@@ -269,9 +286,18 @@ pub(super) fn layer_row(
     let is_swipe_sel = ctx.data(|d| d.get_temp::<Vec<u64>>(crate::layer_row_ui::swipe_select_key())).is_some_and(|s| s.contains(&l.id.0));
     let is_blue = selected || is_swipe_sel;
     let blue_fade = ctx.animate_bool_with_time(egui::Id::unique(("layer-blue-fade", l.id.0)), is_blue, 0.20);
+    let corner = if t.pro { 3.0 * pop_eased } else { t.radius + 2.0 * pop_eased };
+    if pop_eased > 0.001 {
+        // Darkened recessed slot left behind when the held layer pops out ready for reordering.
+        painter.rect_filled(base_draw_rect.shrink(1.0), 3.0, Color32::from_rgba_unmultiplied(10, 11, 14, (165.0 * pop_eased) as u8));
+        // Soft floating elevation shadow beneath the lifted layer card.
+        painter.rect_filled(draw_rect.translate(vec2(0.0, 5.0 * pop_eased)).expand(4.0 * pop_eased), corner + 3.0, Color32::from_black_alpha((60.0 * pop_eased) as u8));
+        painter.rect_filled(draw_rect.translate(vec2(0.0, 2.0 * pop_eased)).expand(1.5 * pop_eased), corner + 1.0, Color32::from_black_alpha((80.0 * pop_eased) as u8));
+    }
     paint_row_background(&painter, &t, l, draw_rect, is_blue, is_hovered, blue_fade);
-    if ctx.data(|d| d.get_temp::<u64>(egui::Id::unique("layer-drag"))).is_some_and(|id| id == l.id.0) {
-        painter.rect_filled(draw_rect, if t.pro { 0.0 } else { t.radius }, Color32::from_rgba_unmultiplied(0, 0, 0, 110));
+    if pop_eased > 0.001 {
+        painter.rect_filled(draw_rect, corner, Color32::from_rgba_unmultiplied(64, 128, 255, (38.0 * pop_eased) as u8));
+        painter.rect_stroke(draw_rect, corner, Stroke::new(1.5, Color32::from_rgba_unmultiplied(140, 196, 255, (230.0 * pop_eased) as u8)), egui::StrokeKind::Inside);
     }
     let eye_resp = eye_column(app, ui, l, row, draw_rect, actions);
     let (mut x, ts) = triangle_x_and_thumb_size(l, depth, draw_rect, base);
@@ -641,7 +667,10 @@ fn row_context_menu(app: &mut PhotocraftApp, ui: &mut egui::Ui, rc: &RowCtx<'_>,
     let on_thumb_id = ui.scope_id().with(("thumb-menu", l.id.0));
     let pos = resp.interact_pointer_pos();
     let on_mask = pos.and_then(|p| masks.hit(p)) == Some(crate::mask_thumbs_ui::MaskKind::Pixel);
-    let on_thumb = !on_mask && rc.ts > 0.0 && pos.is_some_and(|p| masks.hit(p).is_none() && rc.thumb.expand(6.0).contains(p));
+    // A pixel layer's thumbnail opens the thumbnail menu; Background, Type, Shape, Smart Object,
+    // Fill, Adjustment and Group thumbnails keep the full layer menu (#12324).
+    let pixels = matches!(l.content, LayerContent::Raster(_)) && l.frame.is_none() && !rc.doc.is_background(l.id);
+    let on_thumb = !on_mask && pixels && rc.ts > 0.0 && pos.is_some_and(|p| masks.hit(p).is_none() && rc.thumb.expand(2.0).contains(p));
 
     let force_open = ctx.data(|d| d.get_temp::<u64>(egui::Id::unique("open-layer-menu")) == Some(l.id.0));
     if force_open {

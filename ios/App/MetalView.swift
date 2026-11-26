@@ -995,24 +995,28 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         for t in touches where t.type == .pencil {
             let maxForce = t.maximumPossibleForce
             let normForce = max(0.0009765625, min(1.0, maxForce > 0 ? (t.force / maxForce) : 0.5))
+            var updatedQueued = false
             if let index = t.estimationUpdateIndex {
                 for i in penQueueHead..<penQueue.count {
                     if penQueue[i].index == index {
                         penQueue[i].force = normForce
                         penQueue[i].altitude = t.altitudeAngle
                         if !t.estimatedPropertiesExpectingUpdates.contains(.force) { penQueue[i].ready = true }
+                        updatedQueued = true
                         break
                     }
                 }
             }
-            if t === pencilTouch {
+            if !updatedQueued && t === pencilTouch {
+                let rawP = Float(normForce)
+                smoothedPressure = smoothedPressure > 0 ? max(0.0009765625, min(1.0, smoothedPressure * 0.6 + rawP * 0.4)) : rawP
                 let (tx, ty) = self.tilt(altitude: t.altitudeAngle, azimuth: t.azimuthUnitVector(in: self))
                 var roll: Float = 0
                 if #available(iOS 17.5, *) { roll = Float(t.rollAngle * 180 / CGFloat.pi) }
-                pc_pen_update_estimate(h, Float(normForce), tx, ty, roll)
+                pc_pen_update_estimate(h, smoothedPressure, tx, ty, roll)
             }
         }
-        flushPen(all: true)
+        flushPen(all: false)
     }
 
     private func flushPen(all: Bool) {
@@ -1030,7 +1034,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 }
                 break
             }
-            if item.ready || all || now - item.time > 0.008 {
+            if item.ready || all || now - item.time > 0.016 {
                 penQueueHead += 1
                 sendPen(item)
             } else {

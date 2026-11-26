@@ -109,18 +109,32 @@ jobs:
           {"info":{"author":"xcode","version":1}}
           JSONEOF
           cat > "$ICONSET/Contents.json" <<'JSONEOF'
-          {"images":[{"filename":"AppIcon-1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}
+          {
+            "images": [
+              {"filename": "AppIcon-20.png", "idiom": "ipad", "scale": "1x", "size": "20x20"},
+              {"filename": "AppIcon-40.png", "idiom": "ipad", "scale": "2x", "size": "20x20"},
+              {"filename": "AppIcon-29.png", "idiom": "ipad", "scale": "1x", "size": "29x29"},
+              {"filename": "AppIcon-58.png", "idiom": "ipad", "scale": "2x", "size": "29x29"},
+              {"filename": "AppIcon-40.png", "idiom": "ipad", "scale": "1x", "size": "40x40"},
+              {"filename": "AppIcon-80.png", "idiom": "ipad", "scale": "2x", "size": "40x40"},
+              {"filename": "AppIcon-76.png", "idiom": "ipad", "scale": "1x", "size": "76x76"},
+              {"filename": "AppIcon-152.png", "idiom": "ipad", "scale": "2x", "size": "76x76"},
+              {"filename": "AppIcon-167.png", "idiom": "ipad", "scale": "2x", "size": "83.5x83.5"},
+              {"filename": "AppIcon-1024.png", "idiom": "ios-marketing", "scale": "1x", "size": "1024x1024"}
+            ],
+            "info": {"author": "xcode", "version": 1}
+          }
           JSONEOF
           cat > /tmp/make-icon.swift <<'SWIFTEOF'
           import Foundation
           import CoreGraphics
           import ImageIO
 
-          // usage: swift make-icon.swift <input.png | none> <output.png> [plain]
+          // usage: swift make-icon.swift <input.png | none> <output.png> [size_px] [plain]
           let args = CommandLine.arguments
           let outPath = args[2]
-          let plain = args.count > 3 && args[3] == "plain"
-          let size = 1024
+          let size = (args.count > 3 ? Int(args[3]) : nil) ?? 1024
+          let plain = args.contains("plain")
           let space = CGColorSpace(name: CGColorSpace.sRGB)!
           guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0, space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { exit(1) }
 
@@ -129,7 +143,7 @@ jobs:
               return CGImageSourceCreateImageAtIndex(src, 0, nil)
           }
 
-          // The colour of one spot of the picture (fractions from the left and from the top).
+          // Sample inside the clean bottom-left background field of the rounded square icon.
           func sample(_ img: CGImage, _ fx: Double, _ fy: Double) -> (Double, Double, Double) {
               let one = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4, space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
               let w = Double(img.width), h = Double(img.height)
@@ -140,24 +154,24 @@ jobs:
           }
 
           if args[1] != "none", let img = readImage(args[1]) {
-              // A desktop icon has transparent margins and rounded corners; iOS rounds the icon
-              // itself, so the picture is enlarged a little over a background of its own edge colour.
-              let bg = plain ? (1.0, 1.0, 1.0) : sample(img, 0.5, 0.14)
+              // Desktop icon PNGs have rounded corners over transparency; iOS applies its own mask,
+              // so expand to full-bleed over the sampled PhotoCraft blue background (#2f7bf5).
+              let bg = plain ? (1.0, 1.0, 1.0) : sample(img, 0.16, 0.84)
               ctx.setFillColor(red: bg.0, green: bg.1, blue: bg.2, alpha: 1)
               ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
-              let scale = plain ? 1.0 : 1.24
+              let scale = plain ? 1.0 : 1.242
               let side = Double(size) * scale
               let offset = -(side - Double(size)) / 2
               ctx.interpolationQuality = .high
               ctx.draw(img, in: CGRect(x: offset, y: offset, width: side, height: side))
           } else {
-              ctx.setFillColor(red: 0.16, green: 0.36, blue: 0.80, alpha: 1)
+              ctx.setFillColor(red: 0.184, green: 0.482, blue: 0.961, alpha: 1)
               ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
               ctx.setStrokeColor(red: 1, green: 1, blue: 1, alpha: 1)
-              ctx.setLineWidth(48)
-              ctx.strokeEllipse(in: CGRect(x: 250, y: 250, width: 524, height: 524))
+              ctx.setLineWidth(Double(size) * 48.0 / 1024.0)
+              ctx.strokeEllipse(in: CGRect(x: Double(size) * 250.0 / 1024.0, y: Double(size) * 250.0 / 1024.0, width: Double(size) * 524.0 / 1024.0, height: Double(size) * 524.0 / 1024.0))
               ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
-              ctx.fillEllipse(in: CGRect(x: 412, y: 412, width: 200, height: 200))
+              ctx.fillEllipse(in: CGRect(x: Double(size) * 412.0 / 1024.0, y: Double(size) * 412.0 / 1024.0, width: Double(size) * 200.0 / 1024.0, height: Double(size) * 200.0 / 1024.0))
           }
 
           guard let result = ctx.makeImage(),
@@ -169,16 +183,21 @@ jobs:
           if [ -z "$OFFICIAL" ]; then
             OFFICIAL=$(find assets -iname '*photocraft*1024*.png' -o -iname '*macos*512*.png' 2>/dev/null | head -1)
           fi
+          SRC="none"
+          EXTRA=""
           if [ -f ios/AppIcon.png ]; then
             echo "Using your own icon: ios/AppIcon.png"
-            swift /tmp/make-icon.swift ios/AppIcon.png "$ICONSET/AppIcon-1024.png" plain
+            SRC="ios/AppIcon.png"
+            EXTRA="plain"
           elif [ -n "$OFFICIAL" ]; then
             echo "Using the icon from the repo: $OFFICIAL"
-            swift /tmp/make-icon.swift "$OFFICIAL" "$ICONSET/AppIcon-1024.png"
+            SRC="$OFFICIAL"
           else
             echo "No icon picture found: using the plain fallback"
-            swift /tmp/make-icon.swift none "$ICONSET/AppIcon-1024.png"
           fi
+          for sz in 20 29 40 58 76 80 152 167 1024; do
+            swift /tmp/make-icon.swift "$SRC" "$ICONSET/AppIcon-${sz}.png" "$sz" $EXTRA
+          done
           ls -la "$ICONSET"
 
       - name: Stamp the version
@@ -189,7 +208,7 @@ jobs:
           p = pathlib.Path("ios/project.yml")
           s = p.read_text().replace("__BUILD__", build)
           p.write_text(s)
-          line = f"PhotoCraft version 0.P.15, build {build}"
+          line = f"PhotoCraft version 0.P.16, build {build}"
           pathlib.Path("logs/version.txt").write_text(line + "\n")
           print(line)
           PYEOF
@@ -218,8 +237,12 @@ jobs:
       - name: Package IPA
         run: |
           cd ios
+          APP=build/Build/Products/Release-iphoneos/PhotoCraft.app
+          ls -la "$APP" | tee ../logs/app-contents.txt
+          plutil -p "$APP/Info.plist" | tee ../logs/info-plist.txt
+          test -f "$APP/Assets.car" || { echo "error: Assets.car missing from bundle"; exit 1; }
           mkdir Payload
-          cp -R build/Build/Products/Release-iphoneos/PhotoCraft.app Payload/
+          cp -R "$APP" Payload/
           zip -qr ../PhotoCraft.ipa Payload
 
       - uses: actions/upload-artifact@v4

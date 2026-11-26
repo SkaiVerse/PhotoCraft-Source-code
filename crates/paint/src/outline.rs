@@ -26,6 +26,17 @@ pub fn tip_outline(b: &BrushSettings, full: bool) -> Option<Vec<Vec<[f32; 2]>>> 
     let (sn, cs) = b.angle.to_radians().sin_cos();
     let (fx, fy) = (if b.flip_x { -1.0 } else { 1.0 }, if b.flip_y { -1.0 } else { 1.0 });
     match &b.tip {
+        TipShape::Round if b.square => {
+            let corners = [[-1.0f32, 1.0], [1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]];
+            let ring = corners
+                .into_iter()
+                .map(|[px, py]| {
+                    let (lx, ly) = (px * fx, py * ro * fy);
+                    [lx * cs - ly * sn, -(lx * sn + ly * cs)]
+                })
+                .collect();
+            Some(vec![ring])
+        }
         TipShape::Round => {
             // The normal cursor is the 50 % contour, matching the plain-circle path (#2744):
             // the soft tip falls off as (1 - t²)⁴, not the old smoothstep midpoint.
@@ -45,9 +56,57 @@ pub fn tip_outline(b: &BrushSettings, full: bool) -> Option<Vec<Vec<[f32; 2]>>> 
             if !t.is_valid() {
                 return None;
             }
-            trace(t, if full { FULL_THRESHOLD } else { HALF_THRESHOLD }, (sn, cs, fx, fy, ro))
+            let xf = (sn, cs, fx, fy, ro);
+            if full {
+                trace(t, FULL_THRESHOLD, xf).or_else(|| nonzero_bounds_ring(t, xf))
+            } else {
+                trace(t, HALF_THRESHOLD, xf)
+                    .or_else(|| trace(t, 0.15, xf))
+                    .or_else(|| trace(t, FULL_THRESHOLD, xf))
+                    .or_else(|| nonzero_bounds_ring(t, xf))
+            }
         }
     }
+}
+
+/// Fallback tight bounding contour of non-zero texels when a styled/textured tip is too faint or
+/// stippled for continuous contour extraction.
+fn nonzero_bounds_ring(t: &GrayTile, xf: (f32, f32, f32, f32, f32)) -> Option<Vec<Vec<[f32; 2]>>> {
+    let (sn, cs, fx, fy, ro) = xf;
+    let (w, h) = (t.width, t.height);
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    let mut any = false;
+    for y in 0..h {
+        for x in 0..w {
+            if t.get(x, y) > FULL_THRESHOLD {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                any = true;
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    let (tw, th) = (w as f32, h as f32);
+    let s = 2.0 / tw.max(th);
+    let corners = [
+        [min_x as f32, min_y as f32],
+        [max_x as f32 + 1.0, min_y as f32],
+        [max_x as f32 + 1.0, max_y as f32 + 1.0],
+        [min_x as f32, max_y as f32 + 1.0],
+    ];
+    let ring = corners
+        .into_iter()
+        .map(|[px, py]| {
+            let (u, v) = ((px - tw / 2.0) * s * fx, -(py - th / 2.0) * s * ro * fy);
+            let (ux, uy) = (u * cs - v * sn, u * sn + v * cs);
+            [ux, -uy]
+        })
+        .collect();
+    Some(vec![ring])
 }
 
 /// Trace the contour(s) above `thr` (resampled ~2x, capped at 160 px a side) and map them with

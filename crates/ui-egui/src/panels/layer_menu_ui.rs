@@ -314,6 +314,7 @@ pub(crate) fn show_affinity_popover(
 
     let menu_row = |ui: &mut egui::Ui, label: &str, enabled: bool, submenu_arrow: bool, active: bool| -> bool {
         let (rect, resp) = ui.allocate_exact_size(vec2(w, row_h), if enabled { Sense::click() } else { Sense::hover() });
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
         if enabled && (resp.hovered() || active) {
             ui.painter().rect_filled(rect, 5.0, hover_bg);
         }
@@ -343,6 +344,33 @@ pub(crate) fn show_affinity_popover(
     };
 
     let mut rename_clicked = false;
+    let has_selection = st.doc.selection.is_some();
+    let is_active = st.active_layer == Some(l.id);
+
+    let dispatch_pc = |ui: &mut egui::Ui, actions: &mut Vec<(String, Value)>, label: &str, id: &str| {
+        if photocraft_engine::commands::find(id).is_none() && !crate::menu_catalog::CATALOG.iter().any(|m| m.3 == id) {
+            return;
+        }
+        let enabled = !(multi && single_layer_only(id))
+            && (id != "layer.delete" || can_delete)
+            && if multi || is_active { crate::menus::is_enabled(app, id) } else { true };
+        if menu_row(ui, label, enabled, false, false) {
+            if !multi {
+                actions.push(("layer.select".into(), json!({"layer": l.id.0})));
+            }
+            let params = if id == "layer.delete" {
+                let alt = ui.input(|i| i.modifiers.alt);
+                if alt {
+                    json!({})
+                } else {
+                    json!({"__trash": true, "layer": l.id.0})
+                }
+            } else {
+                Value::Null
+            };
+            actions.push((id.into(), params));
+        }
+    };
 
     crate::widgets::menu_scroll(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -356,12 +384,10 @@ pub(crate) fn show_affinity_popover(
                 }
             });
         }
-        if menu_row(ui, tl!("Duplicate"), true, false, false) {
-            actions.push(("layer.duplicate".into(), json!({"layer": l.id.0})));
-        }
-        if menu_row(ui, tl!("Delete"), can_delete, false, false) {
-            actions.push(("layer.delete".into(), json!({"layer": l.id.0})));
-        }
+        dispatch_pc(ui, actions, tl!("Blending Options…"), "layer.layerStyle.blendingOptions");
+        dispatch_pc(ui, actions, if multi { tl!("Duplicate Layers…") } else { tl!("Duplicate Layer…") }, "layer.duplicate");
+        dispatch_pc(ui, actions, if multi { tl!("Delete Layers") } else { tl!("Delete Layer") }, "layer.delete");
+        dispatch_pc(ui, actions, tl!("Group from Layers…"), "layer.new.groupFromLayers");
 
         sep(ui);
 
@@ -378,23 +404,110 @@ pub(crate) fn show_affinity_popover(
                 actions.push(("layer.lockLayers".into(), json!({"layer": l.id.0, "all": !l.locks.all})));
             }
         }
-
-        sep(ui);
-
         if menu_row(ui, tl!("Rename Layer..."), true, false, false) {
             rename_clicked = true;
         }
 
         sep(ui);
 
-        if menu_row(ui, tl!("Create Clipping Mask"), can_clip_create, false, false) {
-            actions.push(("layer.createClippingMask".into(), json!({"layer": l.id.0})));
-        }
-        if menu_row(ui, tl!("Release"), can_clip_release, false, false) {
-            actions.push(("layer.releaseClippingMask".into(), json!({"layer": l.id.0})));
+        dispatch_pc(ui, actions, tl!("Quick Export as PNG"), "layer.quickExportAsPng");
+        dispatch_pc(ui, actions, tl!("Export As…"), "layer.exportAs");
+        dispatch_pc(ui, actions, tl!("Artboard from Layers…"), "layer.new.artboardFromLayers");
+        dispatch_pc(ui, actions, tl!("Frame from Layers…"), "layer.new.frameFromLayers");
+        if !multi && matches!(l.content, LayerContent::Shape(_) | LayerContent::Text(_)) {
+            dispatch_pc(ui, actions, tl!("Convert to Frame…"), "layer.frame.convert");
         }
 
         sep(ui);
+
+        dispatch_pc(ui, actions, tl!("Convert to Smart Object"), "layer.smartObjects.convertToSmartObject");
+        if multi {
+            dispatch_pc(ui, actions, tl!("Rasterize Layers"), "layer.rasterize.layer");
+        } else {
+            match &l.content {
+                LayerContent::Text(_) => {
+                    dispatch_pc(ui, actions, tl!("Rasterize Type"), "layer.rasterize.type");
+                    dispatch_pc(ui, actions, tl!("Create Work Path"), "type.createWorkPath");
+                    dispatch_pc(ui, actions, tl!("Convert to Shape"), "type.convertToShape");
+                }
+                LayerContent::Shape(_) => dispatch_pc(ui, actions, tl!("Rasterize Layer"), "layer.rasterize.shape"),
+                LayerContent::Smart(_) => {
+                    dispatch_pc(ui, actions, tl!("Edit Contents"), "layer.smartObjects.editContents");
+                    dispatch_pc(ui, actions, tl!("Reset Transform"), "layer.smartObjects.resetTransform");
+                    dispatch_pc(ui, actions, tl!("Replace Contents…"), "layer.smartObjects.replaceContents");
+                    dispatch_pc(ui, actions, tl!("Relink to File…"), "layer.smartObjects.relinkToFile");
+                    dispatch_pc(ui, actions, tl!("Convert to Layers"), "layer.smartObjects.convertToLayers");
+                    dispatch_pc(ui, actions, tl!("Rasterize Layer"), "layer.rasterize.smartObject");
+                }
+                LayerContent::Fill(_) => dispatch_pc(ui, actions, tl!("Rasterize Layer"), "layer.rasterize.fillContent"),
+                _ => dispatch_pc(ui, actions, tl!("Rasterize Layer"), "layer.rasterize.layer"),
+            }
+        }
+        if multi || !l.effects.items.is_empty() {
+            dispatch_pc(ui, actions, tl!("Rasterize Layer Style"), "layer.rasterize.layerStyle");
+        }
+
+        if menu_row(ui, tl!("Rasterise"), true, true, open_sub == 2) {
+            open_sub = if open_sub == 2 { 0 } else { 2 };
+            ctx.data_mut(|d| d.insert_temp(sub_key, open_sub));
+        }
+        if open_sub == 2 {
+            ui.indent("affinity-rasterise-sub", |ui| {
+                dispatch_pc(ui, actions, tl!("Rasterise Layer"), "layer.rasterize.layer");
+                if !l.effects.items.is_empty() || multi {
+                    dispatch_pc(ui, actions, tl!("Rasterise Layer Style"), "layer.rasterize.layerStyle");
+                }
+                if menu_row(ui, tl!("Rasterise All"), true, false, false) {
+                    actions.push(("layer.rasterize.allLayers".into(), json!({})));
+                }
+            });
+        }
+
+        sep(ui);
+
+        if let Some(mask) = l.mask.as_ref().filter(|_| !multi) {
+            dispatch_pc(ui, actions, tl!(mask_toggle_label(mask.enabled)), "layer.layerMask.enabled");
+            dispatch_pc(ui, actions, tl!("Apply Layer Mask"), "layer.layerMask.apply");
+            dispatch_pc(ui, actions, tl!("Delete Layer Mask"), "layer.layerMask.delete");
+        } else {
+            dispatch_pc(ui, actions, tl!("Add Layer Mask"), add_mask_command(has_selection, false));
+        }
+        if l.clipped {
+            if menu_row(ui, tl!("Release Clipping Mask"), can_clip_release, false, false) {
+                if !multi {
+                    actions.push(("layer.select".into(), json!({"layer": l.id.0})));
+                }
+                actions.push(("layer.releaseClippingMask".into(), Value::Null));
+            }
+        } else if menu_row(ui, tl!("Create Clipping Mask"), can_clip_create || crate::menus::is_enabled(app, "layer.createClippingMask"), false, false) {
+            if !multi {
+                actions.push(("layer.select".into(), json!({"layer": l.id.0})));
+            }
+            actions.push(("layer.createClippingMask".into(), Value::Null));
+        }
+
+        sep(ui);
+
+        dispatch_pc(ui, actions, tl!("Link Layers"), "layer.linkLayers");
+        dispatch_pc(ui, actions, tl!("Select Linked Layers"), "layer.selectLinkedLayers");
+
+        sep(ui);
+
+        dispatch_pc(ui, actions, tl!("Copy Layer Style"), "layer.layerStyle.copyLayerStyle");
+        dispatch_pc(ui, actions, tl!("Paste Layer Style"), "layer.layerStyle.pasteLayerStyle");
+        dispatch_pc(ui, actions, tl!("Clear Layer Style"), "layer.layerStyle.clear");
+
+        sep(ui);
+
+        if multi {
+            dispatch_pc(ui, actions, tl!("Merge Layers"), "layer.mergeLayers");
+        } else if matches!(l.content, LayerContent::Group(_)) {
+            dispatch_pc(ui, actions, tl!("Merge Group"), "layer.mergeGroup");
+        } else {
+            dispatch_pc(ui, actions, tl!("Merge Down"), "layer.mergeDown");
+        }
+        dispatch_pc(ui, actions, tl!("Merge Visible"), "layer.mergeVisible");
+        dispatch_pc(ui, actions, tl!("Flatten Image"), "layer.flattenImage");
 
         if menu_row(ui, tl!("Merge"), true, true, open_sub == 1) {
             open_sub = if open_sub == 1 { 0 } else { 1 };
@@ -418,24 +531,6 @@ pub(crate) fn show_affinity_popover(
                 }
                 if menu_row(ui, tl!("Flatten Image"), true, false, false) {
                     actions.push(("layer.flattenImage".into(), json!({})));
-                }
-            });
-        }
-
-        if menu_row(ui, tl!("Rasterise"), true, true, open_sub == 2) {
-            open_sub = if open_sub == 2 { 0 } else { 2 };
-            ctx.data_mut(|d| d.insert_temp(sub_key, open_sub));
-        }
-        if open_sub == 2 {
-            ui.indent("affinity-rasterise-sub", |ui| {
-                if menu_row(ui, tl!("Rasterise Layer"), true, false, false) {
-                    actions.push(("layer.rasterize.layer".into(), json!({"layer": l.id.0})));
-                }
-                if menu_row(ui, tl!("Rasterise Layer Style"), !l.effects.items.is_empty(), false, false) {
-                    actions.push(("layer.rasterize.layerStyle".into(), json!({"layer": l.id.0})));
-                }
-                if menu_row(ui, tl!("Rasterise All"), true, false, false) {
-                    actions.push(("layer.rasterize.allLayers".into(), json!({})));
                 }
             });
         }

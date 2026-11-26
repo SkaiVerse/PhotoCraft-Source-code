@@ -654,12 +654,12 @@ pub(crate) fn render_layer_popover(
     let ease_out = 1.0 - (1.0 - t) * (1.0 - t);
     let alpha = ease_out;
 
-    let popover_w = 248.0_f32;
+    let popover_w = 256.0_f32;
     let target_x = (panel_left - popover_w - 8.0).max(8.0);
     let row_cy = popover.row_rect.center().y;
     let screen_h = ctx.input(|i| i.viewport_rect()).height();
-    let est_h = 460.0_f32;
-    let target_y = (row_cy - est_h / 2.0).clamp(24.0, (screen_h - est_h - 16.0).max(24.0));
+    let max_h = (screen_h - 48.0).clamp(240.0, 580.0);
+    let target_y = (row_cy - max_h * 0.45).clamp(24.0, (screen_h - max_h - 16.0).max(24.0));
     let popover_pos = pos2(target_x, target_y);
 
     let popover_area = egui::Area::new(egui::Id::unique("layer-context-popover"))
@@ -678,6 +678,7 @@ pub(crate) fn render_layer_popover(
 
         let resp = frame.show(ui, |ui| {
             ui.set_width(popover_w);
+            ui.set_max_height(max_h);
             let mut multi = s.selected_layers().len() > 1 && s.selected_layers().contains(&l.id);
             if let Some(swipe_list) = ctx.data(|d| d.get_temp::<Vec<u64>>(crate::layer_row_ui::swipe_select_key()))
                 && swipe_list.len() > 1

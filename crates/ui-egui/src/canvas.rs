@@ -2082,14 +2082,22 @@ fn draw_default_tool_cursor(app: &mut PhotocraftApp, ui: &mut egui::Ui, input: &
                     PaintingCursor::Standard => egui::CursorIcon::Default,
                     PaintingCursor::Precise => crate::tool_cursor::crosshair(painter, p, 6.0, 0.0),
                     _ if painting && cur.show_only_crosshair_while_painting => crate::tool_cursor::crosshair(painter, p, 5.0, 0.0),
-                    // The Pencil (and the Eraser in Pencil mode): the outline of the
-                    // whole pixels its dab fills, on the pixel grid. A round tip is a
-                    // disc, a tiny one the whole square (#2662). The Block-mode Eraser:
-                    // its square, 16 screen pixels at any zoom (#2770).
-                    _ if tool == Tool::Pencil || crate::eraser_ui::pencil_mode(app, tool) || crate::eraser_ui::block_mode(app, tool) => {
-                        let block = crate::eraser_ui::block_mode(app, tool);
-                        let size = if block { crate::eraser_ui::block_size(app) } else { brush.size };
-                        pencil_outline_cursor(painter, xf, p, size, block, cur.show_crosshair_in_brush_tip)
+                    // The Pencil (and the Eraser in Pencil mode) uses the pixel-grid square/disc for
+                    // plain unstyled round tips (#2662); shaped, sampled, square or rotated tips show
+                    // their real traced silhouette scaled by `brush.size`. Block-mode Eraser always
+                    // draws its 16 px screen square (#2770).
+                    _ if crate::eraser_ui::block_mode(app, tool) => {
+                        let size = crate::eraser_ui::block_size(app);
+                        pencil_outline_cursor(painter, xf, p, size, true, cur.show_crosshair_in_brush_tip)
+                    }
+                    _ if (tool == Tool::Pencil || crate::eraser_ui::pencil_mode(app, tool))
+                        && matches!(brush.tip, photocraft_paint::brush::TipShape::Round)
+                        && !brush.square
+                        && brush.angle == 0.0
+                        && brush.roundness >= 1.0
+                        && !brush.shape_dynamics.enabled =>
+                    {
+                        pencil_outline_cursor(painter, xf, p, brush.size, false, cur.show_crosshair_in_brush_tip)
                     }
                     // The Healing Brush's ⌥ (source point): the reference's fixed target at any tip
                     // size (#12113). Unmeasured cases keep the tip with its centre mark below.
