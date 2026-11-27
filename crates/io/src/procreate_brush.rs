@@ -24,7 +24,7 @@ use photocraft_paint::{
 };
 use photocraft_raster::Interrupt;
 
-use crate::abr_map::{AbrImport, MAX_PATTERN_EDGE, MAX_TIP_EDGE, fit};
+use crate::abr_map::{AbrImport, fit};
 
 /// Archive resource limits for untrusted `.brush` / `.brushset` files.
 const MAX_ARCHIVE_ENTRIES: u64 = 4096;
@@ -34,6 +34,9 @@ const MAX_IMAGE_FILE_BYTES: u64 = 64 << 20;
 const MAX_IMAGE_EDGE: u32 = 4096;
 const MAX_NSARCHIVE_DEPTH: usize = 20;
 const MAX_BRUSHES_IN_SET: usize = 1024;
+/// Cap imported Procreate shape/grain rasters to keep CPU mip/pattern caches fast.
+const PROCREATE_MAX_TIP_EDGE: u32 = 512;
+const PROCREATE_MAX_GRAIN_EDGE: u32 = 512;
 
 /// Output of reading a `.brush` or `.brushset` file (shares [`AbrImport`] shape for UI/command reuse).
 pub type ProcreateImport = AbrImport;
@@ -91,7 +94,7 @@ pub fn read_procreate_with(bytes: &[u8], group: &str, ctl: &Interrupt) -> Result
     }
 
     let _pack_label = pack_name;
-    let total = folders.len().min(MAX_BRUSHES_IN_SET).max(1) as f32;
+    let total = folders.len().clamp(1, MAX_BRUSHES_IN_SET) as f32;
     for (idx, folder) in folders.into_iter().take(MAX_BRUSHES_IN_SET).enumerate() {
         ctl.check().map_err(|_| "cancelled".to_string())?;
         ctl.progress(0.1 + 0.85 * (idx as f32 / total));
@@ -209,27 +212,29 @@ fn decode_brush_folder(
 
     // Optional Dual Brush in `<prefix>Sub01/Brush.archive`.
     let sub_prefix = format!("{prefix}Sub01/");
-    if let Some(sub_archive) = find_entry(names, &format!("{sub_prefix}Brush.archive")).map(str::to_string) {
-        if let Ok(Some(sub_bytes)) = zip.read(&sub_archive, MAX_PLIST_BYTES)
-            && let Ok(sub_dict) = parse_keyed_archive(&sub_bytes)
-        {
-            let (sub_tip, _) = load_folder_textures(zip, names, &sub_prefix, &sub_dict, &raw_name, warnings);
-            let sub_brush = map_brush_dict(&sub_dict, &raw_name, sub_tip, None, warnings);
-            let blend_code = dict.get_i64("dualBlendModeExtended").or_else(|| dict.get_i64("dualBlendMode")).unwrap_or(0);
-            brush.dual_brush = DualBrush {
-                enabled: true,
-                mode: map_mask_mode(blend_code),
-                tip: sub_brush.tip,
-                size: sub_brush.size,
-                hardness: sub_brush.hardness,
-                roundness: sub_brush.roundness,
-                angle: sub_brush.angle,
-                spacing: sub_brush.spacing,
-                scatter: sub_brush.shape_scatter,
-                both_axes: true,
-                count: sub_brush.scattering.count.max(1),
-                flip: sub_brush.flip_x || sub_brush.flip_y,
-            };
+    if let Some(sub_archive) = find_entry(names, &format!("{sub_prefix}Brush.archive")).map(str::to_string)
+        && let Ok(Some(sub_bytes)) = zip.read(&sub_archive, MAX_PLIST_BYTES)
+        && let Ok(sub_dict) = parse_keyed_archive(&sub_bytes)
+    {
+        let (sub_tip, _) = load_folder_textures(zip, names, &sub_prefix, &sub_dict, &raw_name, warnings);
+        let sub_brush = map_brush_dict(&sub_dict, &raw_name, sub_tip, None, warnings);
+        let blend_code = dict.get_i64("dualBlendModeExtended").or_else(|| dict.get_i64("dualBlendMode")).unwrap_or(0);
+        brush.dual_brush = DualBrush {
+            enabled: true,
+            mode: map_mask_mode(blend_code),
+            tip: sub_brush.tip,
+            size: sub_brush.size,
+            hardness: sub_brush.hardness,
+            roundness: sub_brush.roundness,
+            angle: sub_brush.angle,
+            spacing: sub_brush.spacing.max(0.15),
+            scatter: sub_brush.shape_scatter,
+            both_axes: true,
+            count: sub_brush.scattering.count.max(1),
+            flip: sub_brush.flip_x || sub_brush.flip_y,
+        };
+        if brush.spacing < 0.12 {
+            brush.spacing = 0.12;
         }
     }
 
@@ -248,9 +253,9 @@ fn load_folder_textures(
     let grain_entry = find_texture_entry(names, prefix, dict.get_str("bundledGrainPath"), &["grain.png", "grain.jpg", "grain.jpeg"]);
 
     let tip_tile = match shape_entry {
-        Some(entry) => decode_gray_entry(zip, entry, MAX_TIP_EDGE, brush_name, "shape", warnings),
+        Some(entry) => decode_gray_entry(zip, entry, PROCREATE_MAX_TIP_EDGE, brush_name, "shape", warnings),
         None => {
-            if let Some(bundled) = dict.get_str("bundledShapePath").filter(|s| !s.is_empty() && *s != "$null") {
+            if let Some(bundled) = dict.get_str("bundledShapePath").filter(|s| !s.is_empty() && *s != "$null" && !s.to_ascii_lowercase().contains("blank")) {
                 warnings.insert(format!(
                     "\"{brush_name}\": Procreate built-in shape \"{bundled}\" is not embedded in the file; a round tip stands in"
                 ));
@@ -259,9 +264,9 @@ fn load_folder_textures(
         }
     };
     let grain_tile = match grain_entry {
-        Some(entry) => decode_gray_entry(zip, entry, MAX_PATTERN_EDGE, brush_name, "grain", warnings),
+        Some(entry) => decode_gray_entry(zip, entry, PROCREATE_MAX_GRAIN_EDGE, brush_name, "grain", warnings),
         None => {
-            if let Some(bundled) = dict.get_str("bundledGrainPath").filter(|s| !s.is_empty() && *s != "$null") {
+            if let Some(bundled) = dict.get_str("bundledGrainPath").filter(|s| !s.is_empty() && *s != "$null" && !s.to_ascii_lowercase().contains("blank")) {
                 warnings.insert(format!(
                     "\"{brush_name}\": Procreate built-in grain \"{bundled}\" is not embedded in the file; a procedural grain stands in"
                 ));
@@ -343,7 +348,7 @@ fn decode_gray_entry(
     let samples = ga.to_u16_samples().unwrap_or_default();
     let n = (w as usize).saturating_mul(h as usize);
     let mut unit = Vec::with_capacity(n);
-    for pair in samples.chunks_exact(2).take(n) {
+    for pair in samples.as_chunks::<2>().0.iter().take(n) {
         let lum = f32::from(pair[0]) / 65535.0;
         let alpha = f32::from(pair[1]) / 65535.0;
         unit.push((lum * alpha).clamp(0.0, 1.0));
@@ -358,6 +363,10 @@ fn decode_gray_entry(
     Some(GrayTile::from_f32(fw, fh, &fitted))
 }
 
+fn is_uniform_white(tile: &GrayTile) -> bool {
+    !tile.data.is_empty() && tile.data.iter().all(|&px| px >= 65200)
+}
+
 fn map_brush_dict(
     d: &ArchiveDict,
     name: &str,
@@ -366,9 +375,22 @@ fn map_brush_dict(
     warnings: &mut BTreeSet<String>,
 ) -> BrushSettings {
     let mut b = BrushSettings::default();
-    // Procreate stores normalized `paintSize` (0..1; often ~0.1..1.0). Scale into PhotoCraft pixel sizes cleanly.
-    let norm_size = d.get_f32("paintSize").unwrap_or(0.25).clamp(0.01, 4.0);
-    b.size = (norm_size * 120.0).clamp(2.0, 2000.0);
+    // Procreate stores normalized `paintSize` (0..1 slider between `minSize` and `maxSize`, where
+    // `maxSize = 1.0` maps around ~250 px). Ignoring `maxSize` turns 3 px fine-liners into 100+ px blobs.
+    let paint_size = d.get_f32("paintSize").unwrap_or(0.25).clamp(0.01, 4.0);
+    let min_s = d.get_f32("minSize").unwrap_or(0.0).clamp(0.0, 2.0);
+    let max_size_opt = d.get_f32("maxSize");
+    b.size = if let Some(raw_max) = max_size_opt {
+        let max_s = raw_max.clamp(0.004, 16.0);
+        let eff = if max_s > min_s {
+            min_s + paint_size.clamp(0.0, 1.0) * (max_s - min_s)
+        } else {
+            paint_size.clamp(0.0, 1.0) * max_s
+        };
+        (eff * 250.0).clamp(2.0, 400.0)
+    } else {
+        (paint_size * 120.0).clamp(2.0, 400.0)
+    };
 
     // Hardness / blur (`dynamicsBlur` 0..1 softens computed round tips).
     let blur = d.get_f32("dynamicsBlur").unwrap_or(0.0).clamp(0.0, 1.0);
@@ -386,10 +408,6 @@ fn map_brush_dict(
 
     b.opacity = d.get_f32("paintOpacity").unwrap_or(1.0).clamp(0.01, 1.0);
     b.flow = d.get_f32("dynamicsGlazedFlow").unwrap_or(1.0).clamp(0.01, 1.0);
-
-    // Procreate `plotSpacing = 0.0` produces continuous ultra-dense strokes -> floor at `0.05`.
-    b.spacing = d.get_f32("plotSpacing").unwrap_or(0.08).max(0.05).clamp(0.01, 10.0);
-    b.spacing_enabled = true;
 
     // Shape properties.
     b.angle = (d.get_f32("shapeRotation").unwrap_or(0.0) + d.get_f32("shapeAngle").unwrap_or(0.0)).rem_euclid(360.0);
@@ -417,9 +435,13 @@ fn map_brush_dict(
     }
 
     if jitter_size > 0.0 || jitter_roundness > 0.0 || flip_x || flip_y || angle_jitter > 0.0 {
+        let min_size_ratio = match max_size_opt {
+            Some(raw_max) if raw_max > 0.0 => (min_s / raw_max.max(min_s)).clamp(0.0, 1.0),
+            _ => min_s.clamp(0.0, 1.0),
+        };
         b.shape_dynamics = ShapeDynamics {
             enabled: true,
-            size: Dynamic { jitter: jitter_size, minimum: d.get_f32("minSize").unwrap_or(0.0).clamp(0.0, 1.0), ..Dynamic::default() },
+            size: Dynamic { jitter: jitter_size, minimum: min_size_ratio, ..Dynamic::default() },
             angle: Dynamic { jitter: angle_jitter, control: if b.shape_azimuth { Control::Rotation } else { Control::Off }, ..Dynamic::default() },
             roundness: Dynamic {
                 jitter: jitter_roundness,
@@ -475,20 +497,26 @@ fn map_brush_dict(
     b.taper_size = d.get_f32("taperSize").unwrap_or(0.0).clamp(0.0, 1.0);
     b.taper_opacity = d.get_f32("taperOpacity").unwrap_or(0.0).clamp(0.0, 1.0);
 
-    // Grain / Texture.
+    // Grain / Texture (skip Procreate's `Brush-Preset-Blank.png` white placeholder tiles so smooth
+    // pens/inkers stay on the fast round rasterizer instead of forcing per-pixel texture wrapping).
     let grain_depth = d.get_f32("grainDepth").unwrap_or(1.0).clamp(0.0, 1.0);
-    let has_bundled_grain = d.get_str("bundledGrainPath").is_some_and(|s| !s.is_empty() && s != "$null");
-    if let Some(tile) = grain_tile {
+    let bundled_grain = d.get_str("bundledGrainPath").unwrap_or("");
+    let grain_is_blank = bundled_grain.to_ascii_lowercase().contains("blank");
+    let has_bundled_grain = !bundled_grain.is_empty() && bundled_grain != "$null" && !grain_is_blank;
+    let grain_inverted = d.get_bool("textureInverted").unwrap_or(false);
+    let effective_grain = grain_tile.filter(|tile| grain_inverted || (!grain_is_blank && !is_uniform_white(tile)));
+    if let Some(tile) = effective_grain {
         let scale = d.get_f32("textureScale").unwrap_or(1.0).clamp(0.01, 10.0);
         let tex_mode = map_mask_mode(d.get_i64("grainBlendModeExtended").or_else(|| d.get_i64("grainBlendMode")).unwrap_or(0));
+        let grain_enabled = grain_depth > 0.0;
         b.grain_depth = grain_depth;
         b.texture_scale = scale;
-        b.stroke_space_grain = d.get_f32("textureMovement").unwrap_or(1.0) > 0.05;
+        b.stroke_space_grain = grain_enabled && d.get_f32("textureMovement").unwrap_or(1.0) > 0.05;
         b.grain_softness = (1.0 - d.get_f32("textureContrast").unwrap_or(0.0).abs()).clamp(0.15, 1.0);
         b.texture = Texture {
-            enabled: grain_depth > 0.0,
+            enabled: grain_enabled,
             pattern: Pattern::Tile(tile),
-            invert: d.get_bool("textureInverted").unwrap_or(false),
+            invert: grain_inverted,
             scale,
             brightness: d.get_f32("textureBrightness").unwrap_or(0.0).clamp(-1.0, 1.0),
             contrast: d.get_f32("textureContrast").unwrap_or(0.0).clamp(-1.0, 1.0),
@@ -498,7 +526,7 @@ fn map_brush_dict(
             depth_jitter: Dynamic::jitter(d.get_f32("grainDepthJitter").unwrap_or(0.0).clamp(0.0, 1.0)),
         };
     } else if has_bundled_grain && grain_depth > 0.01 {
-        let style = match d.get_str("bundledGrainPath").unwrap_or("").to_ascii_lowercase() {
+        let style = match bundled_grain.to_ascii_lowercase() {
             s if s.contains("canvas") => PatternStyle::Canvas,
             s if s.contains("dot") => PatternStyle::Dots,
             s if s.contains("cloud") || s.contains("noise") => PatternStyle::Noise,
@@ -510,12 +538,28 @@ fn map_brush_dict(
         b.texture = Texture {
             enabled: true,
             pattern: Pattern::Procedural { style, size: 128, seed: 1 },
-            invert: d.get_bool("textureInverted").unwrap_or(false),
+            invert: grain_inverted,
             scale,
             depth: grain_depth,
             ..Default::default()
         };
+    } else {
+        b.grain_depth = 0.0;
     }
+
+    // Procreate `plotSpacing = 0.0` produces ultra-dense continuous dabs; use a responsive CPU floor
+    // based on whether the brush runs sampled tips or texture wrapping.
+    let raw_spacing = d.get_f32("plotSpacing").unwrap_or(0.08);
+    let textured_or_sampled = matches!(b.tip, TipShape::Sampled(_)) || b.texture.enabled;
+    let min_spacing = if textured_or_sampled && b.size > 40.0 {
+        0.15
+    } else if textured_or_sampled {
+        0.10
+    } else {
+        0.06
+    };
+    b.spacing = raw_spacing.max(min_spacing).clamp(0.01, 10.0);
+    b.spacing_enabled = true;
 
     // Stabilization / StreamLine & Wet Edges / Wet Mix.
     let streamline = d.get_f32("plotSmoothing").unwrap_or(0.0).clamp(0.0, 1.0);
@@ -978,5 +1022,59 @@ mod tests {
         assert!(read_procreate(&empty_zip, "X").is_err());
         let bad_plist = zip_bytes(&[("Brush.archive", b"bplist00corrupt")]);
         assert!(read_procreate(&bad_plist, "X").is_err());
+    }
+
+    #[test]
+    fn respects_max_size_skips_blank_grain_and_floors_spacing() {
+        let fine_archive = write_bplist_objects(
+            &[
+                PlistValue::String("$null".into()),
+                PlistValue::Dict(vec![
+                    ("name".into(), PlistValue::String("Fine Tip".into())),
+                    ("paintSize".into(), PlistValue::Real(0.5)),
+                    ("minSize".into(), PlistValue::Real(0.0)),
+                    ("maxSize".into(), PlistValue::Real(0.010)),
+                    ("plotSpacing".into(), PlistValue::Real(0.0)),
+                    ("grainDepth".into(), PlistValue::Real(1.0)),
+                    ("textureMovement".into(), PlistValue::Real(1.0)),
+                    ("bundledGrainPath".into(), PlistValue::String("Brush-Preset-Blank.png".into())),
+                ]),
+            ],
+            1,
+        );
+        let wide_archive = write_bplist_objects(
+            &[
+                PlistValue::String("$null".into()),
+                PlistValue::Dict(vec![
+                    ("name".into(), PlistValue::String("Textured Roller".into())),
+                    ("paintSize".into(), PlistValue::Real(1.0)),
+                    ("maxSize".into(), PlistValue::Real(0.32)),
+                    ("plotSpacing".into(), PlistValue::Real(0.0)),
+                ]),
+            ],
+            1,
+        );
+        let blank_grain = png_gray(8, 8, 255);
+        let real_shape = png_gray(32, 32, 200);
+        let bytes = zip_bytes(&[
+            ("F/Brush.archive", &fine_archive),
+            ("F/Brush-Preset-Blank.png", &blank_grain),
+            ("W/Brush.archive", &wide_archive),
+            ("W/Shape.png", &real_shape),
+        ]);
+
+        let imp = read_procreate(&bytes, "Set").unwrap();
+        assert_eq!(imp.presets.len(), 2);
+
+        let fine = &imp.presets[0];
+        assert!(fine.brush.size <= 3.0, "expected fine tip scaled via maxSize, got {}", fine.brush.size);
+        assert!(!fine.brush.texture.enabled, "uniform white blank grain should stay disabled");
+        assert_eq!(fine.brush.grain_depth, 0.0);
+        assert!(!fine.brush.stroke_space_grain);
+        assert!((fine.brush.spacing - 0.06).abs() < 1e-4);
+
+        let roller = &imp.presets[1];
+        assert!((roller.brush.size - 80.0).abs() < 1e-4);
+        assert!(roller.brush.spacing >= 0.15, "large sampled tip should floor spacing >= 0.15, got {}", roller.brush.spacing);
     }
 }

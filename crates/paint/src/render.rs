@@ -224,14 +224,8 @@ fn prepare_pattern(b: &BrushSettings) -> Option<Arc<PatternImage>> {
     if let Pattern::Procedural { style, size, seed } = &t.pattern {
         return Some(crate::pattern_cache::procedural_pattern(*style, *size, *seed, t));
     }
-    let mut img = match t.pattern.bitmap() {
-        Some(g) if g.is_valid() => PatternImage { width: g.width as usize, height: g.height as usize, data: g.to_f32() },
-        _ => return None,
-    };
-    for v in &mut img.data {
-        *v = t.level(*v);
-    }
-    Some(Arc::new(img))
+    let g = t.pattern.bitmap().filter(|g| g.is_valid())?;
+    Some(crate::pattern_cache::tile_pattern(g, t))
 }
 
 /// The pixel rectangle `reach` (plus 1 px of anti-aliasing slack) around a dab's centre. The casts
@@ -2079,11 +2073,14 @@ impl SplitStroke {
                 let dy0 = p1.y - p0.y;
                 let dx2 = p3.x - p2.x;
                 let dy2 = p3.y - p2.y;
+                let seg_len_sq = dx1 * dx1 + dy1 * dy1;
                 let curved = (dx0 * dy1 - dy0 * dx1).abs() + (dx1 * dy2 - dy1 * dx2).abs() > 0.05;
-                if curved {
+                if curved && seg_len_sq > 16.0 {
+                    let steps: u8 = if seg_len_sq > 324.0 { 4 } else { 3 };
+                    let inv = 1.0 / f32::from(steps);
                     let ctrl = [p0, p1, p2, p3];
-                    for s in 1..4 {
-                        let u = s as f32 * 0.25;
+                    for s in 1..steps {
+                        let u = f32::from(s) * inv;
                         self.subdiv_scratch.push(crate::dynamics::eval_trig_spline(&ctrl, u));
                     }
                 }
