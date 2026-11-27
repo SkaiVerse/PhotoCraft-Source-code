@@ -16,7 +16,7 @@ use crate::PhotocraftApp;
 /// the Swatches panel through [`crate::swatches_ui::import_bytes`]).
 /// `.psp` is Photoshop's live `Keyboard Shortcuts.psp` (the same XML as a `.kys`); other `.psp`
 /// settings files are refused with a clear message.
-pub const PRESET_EXTS: &[&str] = &["abr", "grd", "asl", "pat", "aco", "act", "ase", "kys", "psp"];
+pub const PRESET_EXTS: &[&str] = &["abr", "brush", "brushset", "grd", "asl", "pat", "aco", "act", "ase", "kys", "psp"];
 
 fn ext(name: &str) -> String {
     std::path::Path::new(name).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
@@ -30,10 +30,11 @@ pub fn is_preset_file(name: &str) -> bool {
 /// Image files Import Brushes… offers besides `.abr`: each becomes a sampled brush tip.
 pub const BRUSH_IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "tif", "tiff", "psd", "psb", "bmp", "gif", "webp", "tga"];
 
-/// Brushes panel / brush preset picker › Import Brushes…: an `.abr` joins the brush library as a
-/// group (as File › Open does), an image file becomes a new brush preset with that image as its tip.
+/// Brushes panel / brush preset picker › Import Brushes…: an `.abr` or Procreate
+/// `.brush`/`.brushset` joins the brush library as a group (as File › Open does); an image file
+/// becomes a new brush preset with that image as its tip.
 pub fn import_brushes(app: &mut PhotocraftApp) -> Result<Value, String> {
-    let exts: Vec<&str> = std::iter::once("abr").chain(BRUSH_IMAGE_EXTS.iter().copied()).collect();
+    let exts: Vec<&str> = ["abr", "brush", "brushset"].into_iter().chain(BRUSH_IMAGE_EXTS.iter().copied()).collect();
     app.pick_file_bytes_filtered(&exts, |app, name, bytes| match open(app, &name, &bytes) {
         Some(r) => r.map(|()| Value::Null),
         None => import_brush_image(app, &name, &bytes),
@@ -88,6 +89,7 @@ fn source(name: &str, bytes: &[u8]) -> Value {
 pub fn open(app: &mut PhotocraftApp, name: &str, bytes: &[u8]) -> Option<Result<(), String>> {
     let (cmd, what) = match ext(name).as_str() {
         "abr" => ("brush.presets.importAbr", "brushes"),
+        "brush" | "brushset" => ("brush.presets.importProcreate", "brushes"),
         "grd" => ("gradient.presets.importGrd", "gradients"),
         "asl" => ("style.presets.importAsl", "styles"),
         "pat" => ("pattern.import", "patterns"),
@@ -168,6 +170,8 @@ mod tests {
     #[test]
     fn recognises_preset_files() {
         assert!(is_preset_file("/a/b/Set.ABR"));
+        assert!(is_preset_file("/a/b/Inker.brush"));
+        assert!(is_preset_file("/a/b/Studio.BRUSHSET"));
         assert!(is_preset_file("sunsets.grd"));
         assert!(is_preset_file("Comic Styles.ASL"));
         assert!(is_preset_file("Brand.ACO"));

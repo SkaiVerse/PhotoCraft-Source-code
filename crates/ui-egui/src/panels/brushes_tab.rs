@@ -1063,7 +1063,7 @@ pub fn show(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             if crate::brush_picker::named(new, "Create new brush from the current settings").clicked() {
                 crate::brush_preset_dialog::open(app, None);
             }
-            if icons::button(ui, "folder-open", 24.0, false, "Import Brushes… (.abr or image)").clicked() {
+            if icons::button(ui, "folder-open", 24.0, false, "Import Brushes… (.abr, .brush, .brushset, or image)").clicked() {
                 let _ = crate::preset_files_ui::import_brushes(app);
             }
         });

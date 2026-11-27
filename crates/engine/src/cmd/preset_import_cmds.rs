@@ -112,12 +112,33 @@ impl UniqueNames {
 }
 
 fn import_abr(s: &mut Session, p: &Value) -> Result<Value> {
-    let cmd = "brush.presets.importAbr";
+    run_brush_import(s, p, "brush.presets.importAbr", ".abr file", MAX_ABR_FILE_BYTES, photocraft_io::abr_map::read_abr_with)
+}
+
+fn import_procreate(s: &mut Session, p: &Value) -> Result<Value> {
+    run_brush_import(
+        s,
+        p,
+        "brush.presets.importProcreate",
+        ".brush / .brushset file",
+        MAX_FILE_BYTES,
+        photocraft_io::procreate_brush::read_procreate_with,
+    )
+}
+
+fn run_brush_import(
+    s: &mut Session,
+    p: &Value,
+    cmd: &'static str,
+    what: &'static str,
+    max_bytes: u64,
+    reader: fn(&[u8], &str, &photocraft_raster::Interrupt) -> std::result::Result<photocraft_io::abr_map::AbrImport, String>,
+) -> Result<Value> {
     let label = "Import Brushes";
     // A background job when started with `Session::start` (#210): reading and decoding the
     // file run on a worker, cancellable before each brush; the library changes on apply.
     let params = p.clone();
-    // Only the keys the apply step reads: `data` can be a ~1.3 GiB base64 string.
+    // Only the keys the apply step reads: `data` can be a large base64 string.
     let params_apply = json!({ "replace": p.get("replace"), "select": p.get("select") });
     crate::jobs::run(
         s,
@@ -126,7 +147,7 @@ fn import_abr(s: &mut Session, p: &Value) -> Result<Value> {
         move |ctx| {
             ctx.progress(0.0, "Importing brushes");
             let p = &params;
-            let (bytes, stem) = file_bytes_limited(p, cmd, ".abr file", MAX_ABR_FILE_BYTES)?;
+            let (bytes, stem) = file_bytes_limited(p, cmd, what, max_bytes)?;
             let group = match p.get("group") {
                 Some(v) => v.as_str().map(str::trim).filter(|g| !g.is_empty()).ok_or_else(|| bad(cmd, "`group` must be a non-empty string"))?.to_string(),
                 None if !stem.is_empty() => stem,
@@ -134,11 +155,11 @@ fn import_abr(s: &mut Session, p: &Value) -> Result<Value> {
             };
             ctx.check()?;
             let imp = ctx
-                .stage(0.05, 1.0, "Importing brushes", |ctl| photocraft_io::abr_map::read_abr_with(&bytes, &group, ctl))
+                .stage(0.05, 1.0, "Importing brushes", |ctl| reader(&bytes, &group, ctl))
                 .map_err(|e| if ctx.cancelled() { EngineError::Cancelled } else { bad(cmd, e) })?;
             Ok((group, imp))
         },
-        move |s, (group, imp)| add_abr_presets(s, &params_apply, group, imp),
+        move |s, (group, imp)| add_brush_presets(s, cmd, &params_apply, group, imp),
     )
 }
 
@@ -150,7 +171,7 @@ fn free_group(name: &str, taken: impl Fn(&str) -> bool) -> String {
     (2..=u32::MAX).map(|i| format!("{name} ({i})")).find(|g| !taken(g)).unwrap_or_else(|| name.to_string())
 }
 
-fn add_abr_presets(s: &mut Session, p: &Value, group: String, imp: photocraft_io::abr_map::AbrImport) -> Result<Value> {
+fn add_brush_presets(s: &mut Session, cmd: &str, p: &Value, group: String, imp: photocraft_io::abr_map::AbrImport) -> Result<Value> {
     // A file whose name matches a group already in the library becomes a new group beside it, as
     // in Photoshop, unless `replace` asks to drop that group's own presets first: the group name
     // is only the file name, and the library is outside document history (#10640).
@@ -179,7 +200,7 @@ fn add_abr_presets(s: &mut Session, p: &Value, group: String, imp: photocraft_io
         // Opacity takes 1-100 %, as `tools.setBrush` floors it: a preset saved at 0 % would show
         // 1 % but paint nothing (#11812).
         b.opacity = b.opacity.max(0.01);
-        s.load_brush_tips(&mut b).map_err(|e| bad("brush.presets.importAbr", e))?;
+        s.load_brush_tips(&mut b).map_err(|e| bad(cmd, e))?;
         s.tools.brush = b;
         s.tools.brush_changed();
     }
@@ -290,6 +311,16 @@ pub fn specs() -> Vec<CommandSpec> {
             params: r##"{"path":".abr file"?,"data":base64 bytes?,"group":string?=file name,"replace":bool=false (first delete the non-built-in presets of a group of the same name; false imports beside it as <group> (2)),"select":bool=false (make the first imported preset current)} → {group, imported, count, folders (nested folders kept from the file), version, warnings}"##,
             enabled: always,
             run: import_abr,
+            journal: true,
+        },
+        CommandSpec {
+            id: "brush.presets.importProcreate",
+            label: "Import Procreate Brushes…",
+            menu: &[],
+            shortcut: None,
+            params: r##"{"path":".brush or .brushset file"?,"data":base64 bytes?,"group":string?=file name,"replace":bool=false (first delete the non-built-in presets of a group of the same name; false imports beside it as <group> (2)),"select":bool=false (make the first imported preset current)} → {group, imported, count, folders, version, warnings}"##,
+            enabled: always,
+            run: import_procreate,
             journal: true,
         },
         CommandSpec {
@@ -875,5 +906,15 @@ mod tests {
         let mut taken = UniqueNames::new(["A", "a 2"]);
         assert_eq!(taken.unique("a"), "a 3");
         assert_eq!(taken.unique("B"), "B");
+    }
+
+    #[test]
+    fn import_procreate_rejects_bad_params_and_fails_cleanly_on_invalid_archive() {
+        let mut s = Session::new();
+        for bad_param in [json!({}), json!({"data": "!!!not-base64"}), json!({"data": "AA==", "group": ""}), json!({"path": ""})] {
+            assert!(s.execute("brush.presets.importProcreate", bad_param).is_err());
+        }
+        let err = s.execute("brush.presets.importProcreate", json!({"data": photocraft_paint::tile::b64_encode(b"not a zip")})).unwrap_err();
+        assert!(err.to_string().contains("Procreate"), "{err}");
     }
 }
