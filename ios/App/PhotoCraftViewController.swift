@@ -49,7 +49,9 @@ final class PhotoCraftViewController: UIViewController, UIDocumentPickerDelegate
             metal.trailingAnchor.constraint(equalTo: guide.trailingAnchor)
         ])
 
-        metal.onOpenDialog = { [weak self] multiple, pictures in self?.showImportChooser(multiple: multiple, pictures: pictures) }
+        metal.onOpenDialog = { [weak self] multiple, pictures, asCopy in
+            self?.showImportChooser(multiple: multiple, pictures: pictures, asCopy: asCopy)
+        }
         metal.onSaveDialog = { [weak self] name in self?.showSaveSheet(name: name) }
         metal.onOpenURL = { url in
             guard let u = URL(string: url), let scheme = u.scheme?.lowercased(),
@@ -127,19 +129,19 @@ final class PhotoCraftViewController: UIViewController, UIDocumentPickerDelegate
     // MARK: Importing: Photos or Files
 
     /// Asks where to import from (Photos or Files), then opens the matching Apple sheet.
-    private func showImportChooser(multiple: Bool, pictures: Bool) {
-        pcLog("import requested; several: \(multiple); pictures: \(pictures); already presenting: \(presentedViewController != nil)")
+    private func showImportChooser(multiple: Bool, pictures: Bool, asCopy: Bool) {
+        pcLog("import requested; several: \(multiple); pictures: \(pictures); asCopy: \(asCopy); already presenting: \(presentedViewController != nil)")
         guard presentedViewController == nil else {
             metal.deliverDialog(files: [], paths: [], ok: false)
             return
         }
         if !pictures {
-            showFilesOpen(multiple: multiple)
+            showFilesOpen(multiple: multiple, asCopy: asCopy)
             return
         }
         let sheet = UIAlertController(title: "Import from", message: nil, preferredStyle: .actionSheet)
         sheet.addAction(UIAlertAction(title: "Photos", style: .default) { [weak self] _ in self?.showPhotos(multiple: multiple) })
-        sheet.addAction(UIAlertAction(title: "Files", style: .default) { [weak self] _ in self?.showFilesOpen(multiple: multiple) })
+        sheet.addAction(UIAlertAction(title: "Files", style: .default) { [weak self] _ in self?.showFilesOpen(multiple: multiple, asCopy: asCopy) })
         sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel) { [weak self] _ in
             self?.metal.suspendFocus = false
             self?.metal.deliverDialog(files: [], paths: [], ok: false)
@@ -153,15 +155,24 @@ final class PhotoCraftViewController: UIViewController, UIDocumentPickerDelegate
         present(sheet, animated: true)
     }
 
-    /// Apple's Open sheet. One file is opened where it is (no copy); several are copied in.
-    private func showFilesOpen(multiple: Bool) {
+    /// Apple's Open sheet. Opening a document directly passes `asCopy: false` so saves go back in place;
+    /// multi-select and preset/brush imports pass `asCopy: true` so Files.app lets users pick `.abr`, `.brush`,
+    /// `.brushset`, cloud-stored files, and non-writable assets cleanly.
+    private func showFilesOpen(multiple: Bool, asCopy: Bool) {
         mode = .open
-        openAsCopy = multiple
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: multiple)
+        let copy = multiple || asCopy
+        openAsCopy = copy
+        var types: [UTType] = [.item, .data, .archive, .zip, .package]
+        for ext in ["abr", "brush", "brushset", "grd", "asl", "pat", "aco", "act", "ase", "kys", "pcraft", "psd", "psb"] {
+            if let t = UTType(filenameExtension: ext), !types.contains(t) {
+                types.append(t)
+            }
+        }
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: copy)
         picker.allowsMultipleSelection = multiple
         picker.delegate = self
         metal.suspendFocus = true
-        present(picker, animated: true) { pcLog("open sheet is on screen") }
+        present(picker, animated: true) { pcLog("open sheet is on screen (asCopy: \(copy))") }
     }
 
     private func showPhotos(multiple: Bool) {
@@ -326,9 +337,26 @@ final class PhotoCraftViewController: UIViewController, UIDocumentPickerDelegate
                     let scoped = url.startAccessingSecurityScopedResource()
                     defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                     do {
-                        let data = try Data(contentsOf: url)
-                        pcLog("read \(data.count) bytes from \(url.lastPathComponent)")
-                        files.append((url.lastPathComponent, data))
+                        var isDir: ObjCBool = false
+                        var data: Data?
+                        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                            var coordErr: NSError?
+                            var readErr: Error?
+                            NSFileCoordinator().coordinate(readingItemAt: url, options: .forUploading, error: &coordErr) { zipURL in
+                                do {
+                                    data = try Data(contentsOf: zipURL)
+                                } catch {
+                                    readErr = error
+                                }
+                            }
+                            if let err = coordErr ?? readErr { throw err }
+                        } else {
+                            data = try Data(contentsOf: url)
+                        }
+                        if let bytes = data {
+                            pcLog("read \(bytes.count) bytes from \(url.lastPathComponent)")
+                            files.append((url.lastPathComponent, bytes))
+                        }
                     } catch {
                         pcLog("read failed: \(error.localizedDescription)")
                         message("Couldn’t open the file", error.localizedDescription)

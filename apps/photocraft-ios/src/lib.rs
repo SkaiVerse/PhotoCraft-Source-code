@@ -195,10 +195,14 @@ fn build_services(cb: PCCallbacks, inbox: &Inbox, place_inbox: &PlaceInbox) -> S
                 // Pictures make sense unless the app asks for specific other kinds of file only.
                 let kinds = format!("{extensions:?}").to_lowercase();
                 let pictures = kinds == "none" || kinds.contains("png") || kinds.contains("jpg") || kinds.contains("jpeg");
-                note(&format!("the app asked to open a file (several: {multiple}, pictures: {pictures})"));
+                // Preset/filtered imports only read bytes and never save back in-place, so open as copy
+                // (`asCopy: true` on iPadOS) to stop Files.app from greying out .abr / .brush / .brushset.
+                let as_copy = extensions.is_some();
+                let flags = (pictures as c_int) | ((as_copy as c_int) << 1);
+                note(&format!("the app asked to open a file (several: {multiple}, pictures: {pictures}, as_copy: {as_copy})"));
                 DIALOG.with(|d| *d.borrow_mut() = Some(PendingOpen { reply, multiple, files: Vec::new(), paths: Vec::new() }));
                 if let Some(f) = cb.open_dialog {
-                    unsafe { f(cb.user, multiple as c_int, pictures as c_int) }
+                    unsafe { f(cb.user, multiple as c_int, flags) }
                 }
             }
             FileDialogRequest::Folder { .. } => reply.send(None),

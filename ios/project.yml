@@ -40,6 +40,52 @@ targets:
             LSItemContentTypes:
               - public.image
               - com.adobe.photoshop-image
+          - CFBundleTypeName: PhotoCraft Document
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - ai.storyteller.photocraft.document
+          - CFBundleTypeName: Brush Library
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - com.adobe.photoshop-brush
+              - ai.storyteller.photocraft.procreate-brush
+              - ai.storyteller.photocraft.procreate-brushset
+              - public.data
+              - public.zip-archive
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: ai.storyteller.photocraft.document
+            UTTypeDescription: PhotoCraft Document
+            UTTypeConformsTo:
+              - public.data
+              - public.zip-archive
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - pcraft
+          - UTTypeIdentifier: com.adobe.photoshop-brush
+            UTTypeDescription: Photoshop Brush Set
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - abr
+          - UTTypeIdentifier: ai.storyteller.photocraft.procreate-brush
+            UTTypeDescription: Procreate Brush
+            UTTypeConformsTo:
+              - public.data
+              - public.zip-archive
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - brush
+          - UTTypeIdentifier: ai.storyteller.photocraft.procreate-brushset
+            UTTypeDescription: Procreate Brush Set
+            UTTypeConformsTo:
+              - public.data
+              - public.zip-archive
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - brushset
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: true
         UISupportedInterfaceOrientations~ipad:

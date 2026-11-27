@@ -18,7 +18,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
 
     // Hooks the view controller fills in.
-    var onOpenDialog: ((_ multiple: Bool, _ pictures: Bool) -> Void)?
+    var onOpenDialog: ((_ multiple: Bool, _ pictures: Bool, _ asCopy: Bool) -> Void)?
     var onSaveDialog: ((String) -> Void)?
     var onOpenURL: ((String) -> Void)?
     var onCopyText: ((String) -> Void)?
@@ -249,9 +249,11 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         let me = Unmanaged.passUnretained(self).toOpaque()
         return PCCallbacks(
             user: me,
-            open_dialog: { u, multiple, pictures in
+            open_dialog: { u, multiple, flags in
                 guard let v = MetalView.from(u) else { return }
-                DispatchQueue.main.async { v.onOpenDialog?(multiple != 0, pictures != 0) }
+                let pictures = (flags & 1) != 0
+                let asCopy = (flags & 2) != 0
+                DispatchQueue.main.async { v.onOpenDialog?(multiple != 0, pictures, asCopy) }
             },
             save_dialog: { u, name in
                 guard let v = MetalView.from(u), let name = name else { return }
